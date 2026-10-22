@@ -430,10 +430,6 @@ impl ElectronRuntime {
       args.push("--tauri-identifier".to_string());
       args.push(identifier.clone());
     }
-    if let Ok(app_exe) = std::env::current_exe() {
-      args.push("--tauri-app-exe".to_string());
-      args.push(app_exe.display().to_string());
-    }
     let (ipc, event_rx) = Ipc::launch(
       &binary,
       &main_script,
@@ -441,7 +437,13 @@ impl ElectronRuntime {
       attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
     )
     .map_err(|message| Error::CreateWindow(io_err(message)))?;
-    let icon = attrs.resolve_icon();
+    let icon = attrs.resolve_icon().or_else(|| {
+      // A packaged app has no icon file beside it: the bundler embedded the
+      // icon in the executable, so copy it back out for Electron.
+      std::env::current_exe()
+        .ok()
+        .and_then(|exe| crate::app_icon::extract(&exe))
+    });
     Ok(Self::init(ipc, event_rx, attrs.dev_url, icon))
   }
 }
@@ -608,8 +610,15 @@ impl Electron {
   fn resolve_icon(&self) -> Option<PathBuf> {
     let icon = self.icon.as_ref()?;
     // Electron resolves a relative icon path against its own cwd, so hand it an
-    // absolute one.
-    let absolute = |path: &PathBuf| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+    // absolute one. Windows canonicalization yields a verbatim `\\?\` path that
+    // Electron's image loader cannot open, so strip that prefix again.
+    let absolute = |path: &PathBuf| {
+      let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+      match path.to_string_lossy().strip_prefix(r"\\?\") {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+      }
+    };
     if icon.exists() {
       return Some(absolute(icon));
     }

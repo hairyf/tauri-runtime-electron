@@ -21,6 +21,7 @@
 //! [`electron_impl`].
 
 mod acquisition;
+mod app_icon;
 mod devtools;
 mod electron_impl;
 mod environment;

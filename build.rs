@@ -66,12 +66,12 @@ fn stage(source: &Path) -> Result<PathBuf, String> {
     .join("electron")
     .join(format!("{}-{}", platform(), arch()));
   let marker = target.join(format!(".version-{VERSION}"));
-  if marker.exists() {
-    return Ok(target);
+  if !marker.exists() {
+    let _ = fs::remove_dir_all(&target);
+    copy_dir(source, &target)?;
   }
-  let _ = fs::remove_dir_all(&target);
-  copy_dir(source, &target)?;
-  // Our main-process scripts ship next to the runtime in packaged layouts.
+  // The main-process scripts change far more often than the distribution, so
+  // they are refreshed on every build instead of only with a fresh stage.
   let scripts = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("electron");
   for name in ["main.cjs", "preload.cjs"] {
     let from = scripts.join(name);

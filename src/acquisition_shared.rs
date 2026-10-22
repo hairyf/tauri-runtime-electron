@@ -258,11 +258,11 @@ pub(crate) fn install(main_cjs: &str, preload_cjs: &str) -> Result<PathBuf, Stri
     Some(dist) => dist,
     None => download()?,
   };
+  // The scripts are ours and change with the crate, so they are refreshed on
+  // every run rather than only when missing.
   for (name, contents) in [("main.cjs", main_cjs), ("preload.cjs", preload_cjs)] {
     let script = dist.join(name);
-    if !script.exists() {
-      fs::write(&script, contents).map_err(|error| format!("{}: {error}", script.display()))?;
-    }
+    fs::write(&script, contents).map_err(|error| format!("{}: {error}", script.display()))?;
   }
   Ok(dist.join(executable()))
 }
