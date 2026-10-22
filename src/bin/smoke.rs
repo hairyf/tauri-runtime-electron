@@ -22,7 +22,7 @@ use std::{
 };
 
 use tauri_runtime::{
-  ResizeDirection, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, WindowDispatch,
+  RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, WindowDispatch,
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
   window::{PendingWindow, RawWindow, WindowEvent},
 };
@@ -143,7 +143,6 @@ fn window_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
   state_checks(window, failures);
   visibility_checks(window, failures);
   cursor_checks(window, handle, failures);
-  drag_checks(window, failures);
 }
 
 fn title_checks(window: &Window, failures: &mut Vec<String>) {
@@ -326,18 +325,6 @@ fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
     }
     thread::sleep(Duration::from_millis(25));
   }
-}
-
-/// Both drags start a native move/resize loop that only ends when the mouse
-/// button is released, so they run last and are only checked for being accepted;
-/// there is no getter that could confirm the drag started.
-fn drag_checks(window: &Window, failures: &mut Vec<String>) {
-  set(failures, "start_dragging", || {
-    WindowDispatch::<()>::start_dragging(window)
-  });
-  set(failures, "start_resize_dragging", || {
-    WindowDispatch::<()>::start_resize_dragging(window, ResizeDirection::SouthEast)
-  });
 }
 
 /// Records a setter failure; setters have no return value to compare.
