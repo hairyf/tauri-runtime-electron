@@ -110,9 +110,8 @@ upstream workspace normally supplies, and launches it — so any of Tauri's
 examples can be poked at by hand. Examples with a Vite frontend (`api`) get the
 dev server on port 1420; the rest keep their `frontendDist` assets.
 
-`--clean` wipes the staged copy first, `--no-install` skips the frontend
-install, `--keep` leaves everything staged after exit. Ctrl+C stops the app,
-cargo and Vite.
+`--clean` wipes the staged copy first and `--no-install` skips the frontend
+install. Ctrl+C stops the app, cargo and Vite.
 
 ---
 

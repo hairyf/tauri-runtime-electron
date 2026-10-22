@@ -465,8 +465,11 @@ function applyWindowConfig(window, config, params) {
         .setVisualZoomLevelLimits(1, 1)
         .catch((error) => log('window.zoom error', params.label ?? params.windowId, serializeError(error)))
     }
-    if (window.webContents.isLoading()) window.webContents.once('dom-ready', disableZoom)
-    else disableZoom()
+    if (window.webContents.getURL() && !window.webContents.isLoading()) {
+      disableZoom()
+    } else {
+      window.webContents.once('dom-ready', disableZoom)
+    }
     window.webContents.on('before-input-event', (event, input) => {
       if (!(input.control || input.meta)) return
       if (input.key === '+' || input.key === '-' || input.key === '=' || input.key === '0') {

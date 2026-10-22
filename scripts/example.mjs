@@ -27,6 +27,7 @@ let viteProc = null
 let cargoProc = null
 let shuttingDown = false
 let tauriFeatures = ['unstable', 'tray-icon', 'image-png', 'image-ico', 'devtools']
+let exampleResources = []
 
 function listExamples() {
   const names = fs
@@ -99,6 +100,11 @@ function stageConf(confPath, useVite) {
       ?.map((icon) => path.basename(icon))
       .filter((icon) => fs.existsSync(path.join(path.dirname(confPath), '..', '.icons', icon))) ??
     []
+  // Remember what the example bundles so it can be staged next to the binary,
+  // then keep only the mapping this runtime needs to find Electron.
+  exampleResources = Array.isArray(conf.bundle.resources)
+    ? conf.bundle.resources
+    : Object.keys(conf.bundle.resources ?? {}).map((key) => key)
   conf.bundle.resources = { 'target/electron': 'runtime' }
   write(confPath, JSON.stringify(conf, null, 2) + '\n')
   // tauri-build refuses features the config does not allow, so follow the config.
@@ -161,11 +167,14 @@ const BUILD_RS = `fn main() {
 `
 
 function copyCrateIcons(crateDir) {
-  // tauri-build looks for these next to the manifest when it makes the Windows
-  // resource file / macOS bundle; the examples keep them one level up.
+  // tauri-build looks for these next to the manifest (and under `icons/`) when
+  // it makes the Windows resource file or the macOS bundle; the examples keep
+  // them one level up in `examples/.icons`.
   for (const icon of ['icon.ico', 'icon.icns', '32x32.png', '128x128.png', '128x128@2x.png']) {
     const from = path.join(examplesDir, '.icons', icon)
-    if (fs.existsSync(from)) copyTree(from, path.join(crateDir, icon))
+    if (!fs.existsSync(from)) continue
+    copyTree(from, path.join(crateDir, icon))
+    copyTree(from, path.join(crateDir, 'icons', icon))
   }
 }
 
@@ -179,6 +188,7 @@ function stageFlat(dir, dst) {
   copyCrateIcons(dst)
   write(path.join(dst, 'build.rs'), BUILD_RS)
   write(path.join(dst, 'Cargo.toml'), manifest([mainRs], [], 'main.rs'))
+  return dst
 }
 
 function stageApp(dir, dst) {
@@ -222,6 +232,7 @@ function stageApp(dir, dst) {
   copyCrateIcons(tauriDir)
   stageConf(path.join(tauriDir, 'tauri.conf.json'), hasVite(dst))
   write(path.join(tauriDir, 'Cargo.toml'), manifest(rustSources, extra, 'src/main.rs'))
+  return tauriDir
 }
 
 function hasVite(dir) {
@@ -243,9 +254,8 @@ function stage() {
   // Examples reference the shared icon set through `../.icons`.
   copyTree(path.join(examplesDir, '.icons'), path.join(cacheRoot, '.icons'))
 
-  if (fs.existsSync(path.join(source, 'main.rs'))) stageFlat(source, dst)
-  else stageApp(source, dst)
-  return dst
+  if (fs.existsSync(path.join(source, 'main.rs'))) return { crate: stageFlat(source, dst), frontend: dst }
+  return { crate: stageApp(source, dst), frontend: dst }
 }
 
 function installDeps(dir) {
@@ -324,17 +334,39 @@ async function waitForVite() {
   fail(`vite did not answer on port ${PORT} within 60s`)
 }
 
-function runApp(cwd) {
+function stageResources(crate, binDir) {
+  // `cargo run` leaves bundle resources alone (the CLI copies them), so put them
+  // beside the binary the way `tauri dev` would.
+  for (const pattern of exampleResources) {
+    const relative = pattern.replace(/[*?].*$/, '').replace(/\/+$/, '')
+    const from = path.join(crate, relative)
+    if (!fs.existsSync(from)) continue
+    const to = path.join(binDir, relative)
+    if (fs.statSync(from).isDirectory()) {
+      copyTree(from, to)
+    } else {
+      fs.mkdirSync(path.dirname(to), { recursive: true })
+      fs.copyFileSync(from, to)
+    }
+  }
+}
+
+function runApp(crate) {
   console.log(`\n[example] Tauri ${name} example on the Electron runtime\n`)
-  cargoProc = spawn('cargo', ['run'], {
-    cwd,
+  const build = spawnSync('cargo', ['build'], { cwd: crate, stdio: 'inherit' })
+  if (build.status !== 0) fail('cargo build failed')
+  const binDir = path.join(crate, 'target', 'debug')
+  stageResources(crate, binDir)
+  const binary = path.join(binDir, crateName() + (process.platform === 'win32' ? '.exe' : ''))
+  cargoProc = spawn(binary, [], {
+    cwd: crate,
     stdio: 'inherit',
     detached: process.platform !== 'win32',
   })
-  cargoProc.on('error', (error) => fail(`could not start cargo: ${error.message}`))
+  cargoProc.on('error', (error) => fail(`could not start the app: ${error.message}`))
   cargoProc.on('exit', (code, signal) => {
     if (!shuttingDown) {
-      console.log(`[example] cargo run exited (${signal ?? code})`)
+      console.log(`[example] app exited (${signal ?? code})`)
       shutdown(code ?? 0)
     }
   })
@@ -345,15 +377,14 @@ async function main() {
     listExamples()
     return
   }
-  const dst = stage()
-  const vite = hasVite(dst)
-  if (vite) {
-    if (!flags.has('--no-install')) installDeps(dst)
+  const { crate, frontend } = stage()
+  if (hasVite(frontend)) {
+    if (!flags.has('--no-install')) installDeps(frontend)
     await assertPortFree()
-    startVite(dst)
+    startVite(frontend)
     await waitForVite()
   }
-  runApp(vite ? path.join(dst, 'src-tauri') : dst)
+  runApp(crate)
 }
 
 process.on('SIGINT', () => shutdown(0))
@@ -364,4 +395,7 @@ process.on('exit', () => {
   kill(cargoProc)
 })
 
-main().catch((error) => fail(error.message))
+main().catch((error) => {
+  if (flags.has('--debug')) console.error(error)
+  fail(error.message)
+})
