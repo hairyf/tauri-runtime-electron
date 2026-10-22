@@ -339,12 +339,18 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
         }
         ConvertTo-Json -InputObject $result -Depth 8 -Compress; return
     }
-    function Menu-Name([string]$rawName, [string]$accelerator) {
-        $name = ($rawName -split "`t")[0]
-        if ($accelerator -and $name.EndsWith(" $accelerator", [StringComparison]::Ordinal)) {
-            $name = $name.Substring(0, $name.Length-$accelerator.Length-1)
+    function Menu-Label([string]$rawName, [string]$shortcut) {
+        $parts = $rawName -split "`t", 2
+        $name = $parts[0]; $accelerator = ''; $accessKey = ''
+        $chord = '(?:(?:Ctrl|Alt|Shift|Win)\+)+(?:[A-Z0-9]|F(?:[1-9]|1[0-9]|2[0-4])|Backspace|Delete|Insert|Home|End|PageUp|PageDown|Tab|Enter|Escape|Space|Up|Down|Left|Right|Plus|Minus)'
+        if ($parts.Count -eq 2) { $accelerator = $parts[1] }
+        elseif ($name -cmatch "^(?<label>.+) (?<chord>$chord)$") {
+            $name = $Matches.label; $accelerator = $Matches.chord
         }
-        $name
+        if ($shortcut -cmatch "^$chord$") {
+            if (!$accelerator) { $accelerator = $shortcut }
+        } else { $accessKey = $shortcut }
+        @{ name=$name; accelerator=$accelerator; accessKey=$accessKey }
     }
     function Get-Popups {
         $menuRole = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Menu)
@@ -357,8 +363,8 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
                 if ($nativeWindow.className -ceq '#32768') {
                     # The displayed muda popup has no UIA menu provider on CI.
                     $items = @(foreach ($item in [NativeVerify]::NativeMenuItems($popupHandle)) {
-                        $parts = $item.rawName -split "`t", 2
-                        @{ name=(Menu-Name ($parts[0] -replace '&(.)', '$1') ''); rawName=$item.rawName; accelerator=$parts[1]; enabled=($item.state -band 3) -eq 0; offscreen=($item.width -le 0 -or $item.height -le 0); checked=$(if ($item.state -band 8) { 'On' } else { 'Off' }); bounds=@{ x=$item.x; y=$item.y; width=$item.width; height=$item.height } }
+                        $label = Menu-Label ($item.rawName -replace '&(.)', '$1') ''
+                        @{ name=$label.name; rawName=$item.rawName; accelerator=$label.accelerator; accessKey=$label.accessKey; enabled=($item.state -band 3) -eq 0; offscreen=($item.width -le 0 -or $item.height -le 0); checked=$(if ($item.state -band 8) { 'On' } else { 'Off' }); bounds=@{ x=$item.x; y=$item.y; width=$item.width; height=$item.height } }
                     })
                     if ($items.Count) { @{ handle=$nativeWindow.handle; bounds=@{ x=$nativeWindow.x; y=$nativeWindow.y; width=$nativeWindow.width; height=$nativeWindow.height }; items=$items } }
                     continue
@@ -378,7 +384,8 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
                     $accessible = [NativeVerify]::AccessibleMenuState($popupHandle, $rect.x, $rect.y, $rect.width, $rect.height)
                     if ($item.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) { $checked = $pattern.Current.ToggleState.ToString() }
                     else { $checked = $accessible.checkedState }
-                    @{ name=(Menu-Name $accessible.name $accessible.shortcut); rawName=$info.Name; accelerator=$info.AcceleratorKey; accessibleName=$accessible.name; shortcut=$accessible.shortcut; accessibleState=$accessible.state; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=$rect }
+                    $label = Menu-Label $accessible.name $accessible.shortcut
+                    @{ name=$label.name; rawName=$info.Name; accelerator=$label.accelerator; accessKey=$label.accessKey; uiaAccelerator=$info.AcceleratorKey; accessibleName=$accessible.name; shortcut=$accessible.shortcut; accessibleState=$accessible.state; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=$rect }
                 })
                 if ($items.Count) { @{ handle=$nativeWindow.handle; bounds=(Bounds $element.Current.BoundingRectangle); items=$items } }
             } catch [System.Windows.Automation.ElementNotAvailableException] { continue }

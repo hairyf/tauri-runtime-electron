@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { verifyStartupTray } from './verify-native-cases.mjs'
+import { observer } from './verify-embedded.mjs'
 const json = JSON.stringify
 const consoleRows = `Array.from(document.querySelectorAll('#console pre'), e => e.textContent.replace(/^\\[[^\\]]+\\]:\\s*/, '').trim())`
 const currentWindow = 'window.__TAURI__.window.getCurrentWindow()'
@@ -23,7 +24,23 @@ if (process.argv.includes('--self-check')) {
   if (json(rows) !== json(['{"message":"ok"}', '1000'])) throw new Error('Console timestamp parsing failed: ' + json(rows))
   const bounds = { x:-1020, y:160, width:800, height:600, workArea:{ position:{ x:-1580, y:40 }, size:{ width:1920, height:840 } } }
   if (!centered(bounds) || centered({ ...bounds, y:180 }) || centered({ ...bounds, workArea:null })) throw new Error('Window centering geometry check failed')
-  console.log('API console and window geometry self-check passed (no UI verification performed)')
+  const viewport = { left:300, right:1000, top:107, bottom:535 }
+  const source = { getBoundingClientRect: () => ({ left:320, right:560, top:90, bottom:125 }) }
+  let scrolled = false, obscured = false
+  const dest = { scrollIntoView: () => { scrolled = true }, getBoundingClientRect: () => ({ left:320, right:968, top:518, bottom:614 }), contains: element => element === dest }
+  const placeholder = { children:[], textContent:'Drag and drop the menu items above to start building', parentElement:dest }
+  const document = {
+    querySelector: selector => selector === 'main h1' ? { nextElementSibling:{ getBoundingClientRect:() => viewport } } : selector.includes(':not') ? source : null,
+    querySelectorAll: () => [{ children:[placeholder], textContent:placeholder.textContent }, placeholder],
+    elementFromPoint: (x, y) => obscured ? null : y < 125 ? source : dest,
+  }
+  const points = Function('document', `return (${menuDragPoints})('Normal', ${menuDragPoint})`)(document)
+  if (!scrolled || points.from.y <= 107 || points.to.y !== 534) throw new Error('Menu drag must use the leaf placeholder dropzone and visible content bounds')
+  obscured = true
+  let rejected = false
+  try { Function('document', `return (${menuDragPoints})('Normal', ${menuDragPoint})`)(document) } catch { rejected = true }
+  if (!rejected) throw new Error('Menu drag must reject obscured points')
+  console.log('API console, geometry and menu drag self-check passed (no UI verification performed)')
 }
 // Resolve existing, text-labelled controls without adding attributes or replacing DOM.
 async function selector(t, target, expression) {
@@ -261,23 +278,47 @@ async function popup(t, target, item) {
   await t.wait(target, 'true', () => (menus = t.native('popup')).some(menu => menu.items.some(entry => entry.name === item)))
   return menus.find(menu => menu.items.some(entry => entry.name === item))
 }
+function menuDragPoint(rect, viewport, end = false) {
+  const x = Math.max(rect.left + 12, viewport.left + 1)
+  const top = Math.max(rect.top + 1, viewport.top + 1)
+  const bottom = Math.min(rect.bottom - 8, viewport.bottom - 1)
+  if (x >= Math.min(rect.right, viewport.right) || top > bottom) throw new Error('MenuBuilder drag control is outside content viewport')
+  return { x, y: end ? bottom : (top + bottom) / 2 }
+}
+function menuDragPoints(kind, point) {
+  const item = document.querySelector(`.menu-item[data-kind="${kind}"]:not([data-id])`)
+  const dest = document.querySelector('.menu-item[data-id]')?.parentElement ?? [...document.querySelectorAll('main div')].find(e => !e.children.length && e.textContent.trim() === 'Drag and drop the menu items above to start building')?.parentElement
+  if (!item || !dest) throw new Error('MenuBuilder drag controls missing')
+  dest.scrollIntoView({ block: 'nearest' })
+  const viewport = document.querySelector('main h1').nextElementSibling.getBoundingClientRect()
+  const from = point(item.getBoundingClientRect(), viewport), to = point(dest.getBoundingClientRect(), viewport, true)
+  if (document.elementFromPoint(from.x, from.y) !== item || !dest.contains(document.elementFromPoint(to.x, to.y))) throw new Error('MenuBuilder drag point is obscured')
+  return { from, to }
+}
 async function addMenuItems(t, target) {
   for (const kind of ['Normal', 'Check']) {
-    const source = `.menu-item[data-kind="${kind}"]:not([data-id])`
-    const points = await t.evaluate(target, `(() => {
-      const item = document.querySelector(${json(source)})
-      const dest = document.querySelector('.menu-item[data-id]')?.parentElement ?? [...document.querySelectorAll('main div')].find(e => e.textContent.trim() === 'Drag and drop the menu items above to start building')?.parentElement
-      if (!item || !dest) throw new Error('MenuBuilder drag controls missing')
-      dest.scrollIntoView({ block: 'nearest' })
-      const a = item.getBoundingClientRect(), b = dest.getBoundingClientRect()
-      if (a.top < 0 || a.bottom > innerHeight || b.bottom > innerHeight) throw new Error('MenuBuilder drag controls are outside viewport')
-      return { from: { x:a.x+12, y:a.y+a.height/2 }, to: { x:b.x+16, y:b.bottom-8 } }
-    })()`)
-    await t.command(target, 'Input.dispatchMouseEvent', { type:'mouseMoved', ...points.from })
-    await t.command(target, 'Input.dispatchMouseEvent', { type:'mousePressed', button:'left', clickCount:1, ...points.from })
-    for (let step=1; step<=12; step++) await t.command(target, 'Input.dispatchMouseEvent', { type:'mouseMoved', button:'left', buttons:1, x:points.from.x+(points.to.x-points.from.x)*step/12, y:points.from.y+(points.to.y-points.from.y)*step/12 })
-    await t.command(target, 'Input.dispatchMouseEvent', { type:'mouseReleased', button:'left', clickCount:1, ...points.to })
-    await t.wait(target, `Boolean(document.querySelector('.menu-item[data-id][data-kind="${kind}"]'))`, Boolean)
+    const points = await t.evaluate(target, `(${menuDragPoints})(${json(kind)}, ${menuDragPoint})`)
+    let drag
+    const cdp = await observer(target, event => { if (event.method === 'Input.dragIntercepted') drag = event.params.data })
+    try {
+      await cdp.send('Input.setInterceptDrags', { enabled:true })
+      await cdp.send('Input.dispatchMouseEvent', { type:'mouseMoved', ...points.from })
+      await cdp.send('Input.dispatchMouseEvent', { type:'mousePressed', button:'left', buttons:1, clickCount:1, ...points.from })
+      for (let step=1; step<=12 && !drag; step++) await cdp.send('Input.dispatchMouseEvent', { type:'mouseMoved', button:'left', buttons:1, x:points.from.x+(points.to.x-points.from.x)*step/12, y:points.from.y+(points.to.y-points.from.y)*step/12 })
+      await t.wait(target, 'true', () => Boolean(drag))
+      // Replay Chromium's real DragData, not synthetic DOM events or builder mutations.
+      for (const type of ['dragEnter', 'dragOver', 'drop']) await cdp.send('Input.dispatchDragEvent', { type, ...points.to, data:drag })
+      await t.wait(target, `Boolean(document.querySelector('.menu-item[data-id][data-kind="${kind}"]'))`, Boolean)
+    } finally {
+      try { await cdp.send('Input.cancelDragging') }
+      finally {
+        try { await cdp.send('Input.dispatchMouseEvent', { type:'mouseReleased', button:'left', clickCount:1, ...points.to }) }
+        finally {
+          try { await cdp.send('Input.setInterceptDrags', { enabled:false }) }
+          finally { cdp.close() }
+        }
+      }
+    }
   }
 }
 async function verifyNative(t, main) {

@@ -362,6 +362,19 @@ export const cases = {
     // The driver must enter this case before its generic initial screenshot:
     // the source's main document closes the splash 2000 ms after DOMContentLoaded.
     const splash = await t.target((target) => target.type === 'page' && target.url.includes('splashscreen.html'), 20000)
+    const graphic = await t.wait(splash, String.raw`(async () => {
+      const element = document.querySelector('.splashscreen-image')
+      if (!element) return null
+      const background = getComputedStyle(element).backgroundImage
+      const url = background.match(/^url\(["']?(.*?)["']?\)$/)?.[1]
+      if (!url) return null
+      const image = new Image()
+      image.src = url
+      await image.decode()
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      return { width: image.naturalWidth, height: image.naturalHeight, url: image.src }
+    })()`, value => value?.width > 0 && value?.height > 0, 10000)
+    t.check('splashscreen graphic is decoded before capture', graphic.width > 0 && graphic.height > 0 && new URL(graphic.url).pathname.endsWith('/icon.png'), true)
     await t.capture(splash, 'splashscreen-early')
     // The driver starts this read-only watcher before launch; cold PowerShell
     // compilation here would consume the source's two-second display interval.
@@ -427,19 +440,24 @@ export const cases = {
         try { await element.play() }
         catch (error) { throw new Error('streaming play failed: ' + error.message + '; ' + JSON.stringify(state())) }
         const deadline = performance.now() + 10000
-        while (performance.now() < deadline && (element.currentTime <= before || frames < 1)) {
+        // The fixture opens on black: let playback reach a meaningful scene.
+        const visibleTime = Math.min(5, element.duration / 2)
+        while (performance.now() < deadline && (element.currentTime < visibleTime || element.currentTime <= before || frames < 3)) {
           if (element.error) throw new Error('streaming media failed: ' + JSON.stringify(state()))
           await new Promise((resolve) => setTimeout(resolve, 50))
         }
         if (element.error) throw new Error('streaming media failed: ' + JSON.stringify(state()))
-        return { ...state(), src: element.currentSrc, before, after: element.currentTime, frames }
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        return { ...state(), src: element.currentSrc, before, after: element.currentTime, frames, visibleTime, paused: element.paused }
       })()`,
-      (value) => value && value.duration > 0 && value.after > value.before && value.frames > 0,
+      (value) => value && value.duration > 0 && value.after >= value.visibleTime && value.after > value.before && value.frames >= 3 && !value.paused,
       90000,
     )
+    fs.writeFileSync(path.join(t.dir, 'streaming-playback.json'), JSON.stringify(video, null, 2))
     t.check('streaming duration is positive', video.duration > 0, true)
     t.check('streaming playback currentTime increases', video.after > video.before, true)
-    t.check('streaming has decoded video frames', video.frames > 0, true)
+    t.check('streaming reaches a scene beyond the opening fade', video.after >= video.visibleTime, true)
+    t.check('streaming has decoded video frames', video.frames >= 3, true)
     t.check('streaming is playing at capture', await t.evaluate(target, 'document.querySelector("#video_source").paused'), false)
     await t.capture(target, 'streaming-playing')
 
@@ -535,7 +553,13 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
     target: async (predicate) => { for (const target of [splash, main]) if (await predicate(target)) return target; throw new Error('missing test target') },
     targets: async () => { closed = true; return [main] },
     evaluate: async (target, expression) => expression.includes('currentWindow') ? target.id : 'This is the main window!',
-    wait: async () => {},
+    wait: async (_target, expression, accepts) => {
+      if (!expression.includes('image.decode')) return
+      new Function(`return ${expression}`)
+      const value = { width: 128, height: 128, url: 'tauri://localhost/icon.png' }
+      assert(accepts(value) && !accepts({ width: 0, height: 0 }), 'splash capture waits for a decoded graphic')
+      return value
+    },
     capture: async (_target, label) => { steps.push(label) },
     splashBefore: async () => { steps.push('before'); return [{ handle: 1, visible: true, clientWidth: 400, clientHeight: 200 }, { handle: 2, visible: false, clientWidth: 800, clientHeight: 600 }] },
     native: async (action) => { assert(closed, 'native helper must not delay the early keyframe'); return action === 'state' ? [{ handle: 2, visible: true, clientWidth: 800, clientHeight: 600 }] : undefined },

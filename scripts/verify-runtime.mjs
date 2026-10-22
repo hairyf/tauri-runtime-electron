@@ -196,13 +196,29 @@ try {
       if ($null -ne (Bounds ([System.Windows.Rect]::Empty))) { throw 'Empty menu bounds must remain null' }
       $rect = Bounds ([System.Windows.Rect]::new(20,30,40,50))
       if ($rect.x -ne 20 -or $rect.y -ne 30 -or $rect.width -ne 40 -or $rect.height -ne 50) { throw 'Finite menu bounds must remain unchanged' }
-      $menuName = $menuAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Menu-Name' }, $true)
-      if (!$menuName) { throw 'Missing exact menu accelerator normalizer' }
-      Invoke-Expression $menuName.Extent.Text
-      foreach ($case in @(@('Close Alt+F4','Alt+F4','Close'), @('Close Alt+F4','','Close Alt+F4'), @('Save Alt+F4 copy','Alt+F4','Save Alt+F4 copy'), @("Copy\`tCtrl+C",'Ctrl+C','Copy'))) {
-        if ((Menu-Name $case[0] $case[1]) -cne $case[2]) { throw "Incorrect menu name normalization: $case" }
+      $menuLabel = $menuAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Menu-Label' }, $true)
+      if (!$menuLabel) { throw 'Missing menu label/accelerator parser' }
+      Invoke-Expression $menuLabel.Extent.Text
+      foreach ($case in @(
+        @('Close Alt+F4','','Close','Alt+F4',''), @('Exit','e','Exit','','e'),
+        @('Undo Ctrl+Z','','Undo','Ctrl+Z',''), @('Redo Ctrl+Shift+Z','','Redo','Ctrl+Shift+Z',''),
+        @('Cut Ctrl+X','','Cut','Ctrl+X',''), @('Copy Ctrl+C','','Copy','Ctrl+C',''),
+        @('Paste Ctrl+V','','Paste','Ctrl+V',''), @('Select All Ctrl+A','','Select All','Ctrl+A',''),
+        @('Show','','Show','',''), @('Hide','h','Hide','','h'),
+        @('Save Ctrl+K','s','Save','Ctrl+K','s'), @('Save: copy Ctrl+K','','Save: copy','Ctrl+K',''),
+        @('Save Ctrl+K copy','s','Save Ctrl+K copy','','s'), @('Save e','e','Save e','','e'),
+        @('Save Ctrl+K!','','Save Ctrl+K!','',''), @('Save Ctrl+F25','','Save Ctrl+F25','',''),
+        @('Tauri is awesome!','','Tauri is awesome!','',''), @('A check menu','','A check menu','',''),
+        @("Select All\`tCtrl+A",'a','Select All','Ctrl+A','a'), @("Save Ctrl+K\`tCtrl+S",'s','Save Ctrl+K','Ctrl+S','s')
+      )) {
+        $parsed = Menu-Label $case[0] $case[1]
+        if ($parsed.name -cne $case[2] -or $parsed.accelerator -cne $case[3] -or $parsed.accessKey -cne $case[4]) { throw "Incorrect menu label/accelerator/access key: $case" }
       }
-      'PASS native menu selector, exact accelerator labels and finite bounds (offline; no UI proof)'
+      foreach ($name in @('File','Edit','Window','Help','Minimize','Maximize','About','Toggle','New window','Switch Menu','Quit','Remove Tray icon')) {
+        $parsed = Menu-Label $name ''
+        if ($parsed.name -cne $name -or $parsed.accelerator -or $parsed.accessKey) { throw "Plain native label changed: $name" }
+      }
+      'PASS native menu selector, strict accelerator/access keys and finite bounds (offline; no UI proof)'
     `], { cwd: root, stdio: 'inherit', timeout: 10000 })
     assert.equal(menuCheck.status, 0, menuCheck.error?.message ?? 'native menu selector regression')
   }
