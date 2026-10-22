@@ -27,10 +27,9 @@ mod electron_impl;
 mod environment;
 mod locale;
 mod platform;
-mod popup;
+
 mod runtime;
 mod switches;
-mod tauri_ext;
 mod webview;
 mod window;
 mod window_builder;

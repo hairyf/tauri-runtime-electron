@@ -73,14 +73,6 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     self.context.send_message(Message::Exit)
   }
 
-  fn custom_scheme_url(&self, scheme: &str, _https: bool) -> String {
-    format!("{scheme}://localhost")
-  }
-
-  fn webview_version(&self) -> Result<String> {
-    Ok(self.context.ipc.version.clone())
-  }
-
   /// Create a new webview window.
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &self,

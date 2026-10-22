@@ -10,8 +10,8 @@ exclude = ["CHANGELOG.md", "source/", "/target"]
 publish = false
 
 [dependencies]
-tauri-runtime = "3.0.0-alpha.4"
-tauri-utils = { version = "~3.0.0-alpha.4", features = ["resources"] }
+tauri-runtime = "2.12"
+tauri-utils = { version = "2.10", features = ["resources"] }
 http = "1"
 cookie = "0.18"
 base64 = "0.22"

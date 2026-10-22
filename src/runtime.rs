@@ -10,19 +10,28 @@ use crate::{
 use serde_json::{json, Value};
 use tauri_runtime::{
   DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
-  RuntimeInitArgs, RuntimeInitAttrs, UserEvent, WindowEventId,
+  RuntimeInitArgs, UserEvent, WindowEventId,
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
   monitor::Monitor,
   webview::{
-    DetachedWebview, DownloadEvent, DownloadHandler, NewWindowFeatures, NewWindowResponse,
-    PageLoadEvent, PendingWebview, PermissionKind, PermissionResponse, UriSchemeProtocolHandler,
-    WebContentProcessTermination, WebContentProcessTerminationReason, WebviewIpcHandler,
+    DetachedWebview, DownloadEvent,
+    PageLoadEvent, PendingWebview, PermissionKind, PermissionResponse, WebviewIpcHandler,
   },
   window::{
     DetachedWindow, DetachedWindowWebview, PendingWindow, RawWindow, WindowEvent, WindowId,
   },
 };
 use tauri_utils::{Theme, config::WebviewUrl};
+
+/// The `tauri-runtime` handler aliases are private in the 2.x line, so these
+/// restate the same signatures locally.
+type DownloadHandler = dyn Fn(DownloadEvent<'_>) -> bool + Send + Sync;
+type UriSchemeProtocolHandler = dyn Fn(
+    &str,
+    http::Request<Vec<u8>>,
+    Box<dyn FnOnce(http::Response<std::borrow::Cow<'static, [u8]>>) + Send>,
+  ) + Send
+  + Sync;
 
 use http::{Request, Response};
 use std::{
@@ -42,6 +51,11 @@ use std::{
 
 
 /// Timeout for a single IPC round trip with the Electron process.
+/// Tauri 2 does not hand runtimes the configured schemes, and Electron can
+/// only register privileged schemes before `ready`, so the well-known ones are
+/// fixed. Custom schemes are still registered per webview below.
+pub(crate) const DEFAULT_SCHEMES: &[&str] = &["ipc", "tauri", "asset"];
+
 pub(crate) const IPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Default time the Electron process gets to start and connect back.
@@ -52,7 +66,9 @@ fn io_err(message: String) -> Box<dyn std::error::Error + Send + Sync> {
 }
 
 pub(crate) fn create_window_err(message: String) -> Error {
-  Error::CreateWindow(io_err(message))
+  // Tauri 2.s `CreateWindow` carries no payload, so keep the reason on stderr.
+  eprintln!("[electron] {message}");
+  Error::CreateWindow
 }
 
 pub(crate) fn create_webview_err(message: String) -> Error {
@@ -426,14 +442,14 @@ impl ElectronRuntime {
     }
   }
 
-  fn start(attrs: Electron, custom_schemes: &[String]) -> Result<Self> {
+  fn start(attrs: Electron, custom_schemes: &[&str]) -> Result<Self> {
     let binary = attrs.resolve_binary();
     let main_script = attrs.resolve_main_script(&binary);
     if !main_script.exists() {
-      return Err(Error::CreateWindow(io_err(format!(
+      return Err(create_window_err(format!(
         "Electron main script not found at {}; configure it with Electron::default().main_script(..)",
         main_script.display()
-      ))));
+      )));
     }
     eprintln!(
       "[electron] launching {} {}",
@@ -460,7 +476,7 @@ impl ElectronRuntime {
       .collect();
     for scheme in custom_schemes {
       if !schemes.iter().any(|known| known == scheme) {
-        schemes.push(scheme.clone());
+        schemes.push((*scheme).to_string());
       }
     }
     args.push("--tauri-schemes".to_string());
@@ -475,7 +491,7 @@ impl ElectronRuntime {
       &args,
       attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
     )
-    .map_err(|message| Error::CreateWindow(io_err(message)))?;
+    .map_err(create_window_err)?;
     let icon = attrs.resolve_icon().or_else(|| {
       // A packaged app has no icon file beside it: the bundler embedded the
       // icon in the executable, so copy it back out for Electron.
@@ -508,6 +524,25 @@ pub struct Electron {
 impl Electron {
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Reads the knobs the build supplies as environment variables.
+  ///
+  /// Tauri 2 has no runtime init attributes, so this is how a v2 app configures
+  /// the runtime without editing its own code: `TAURI_DEV_URL`,
+  /// `TAURI_RUNTIME_ELECTRON_ICON` and `TAURI_RUNTIME_ELECTRON_IDENTIFIER`.
+  pub fn from_env() -> Self {
+    let mut electron = Self::default();
+    if let Ok(dev_url) = std::env::var("TAURI_DEV_URL") {
+      electron.dev_url = Some(dev_url.trim_end_matches('/').to_string());
+    }
+    if let Some(icon) = std::env::var_os("TAURI_RUNTIME_ELECTRON_ICON") {
+      electron.icon = Some(PathBuf::from(icon));
+    }
+    if let Ok(identifier) = std::env::var("TAURI_RUNTIME_ELECTRON_IDENTIFIER") {
+      electron.identifier = Some(identifier);
+    }
+    electron
   }
 
   pub fn binary(mut self, binary: impl Into<PathBuf>) -> Self {
@@ -675,57 +710,14 @@ impl Electron {
   }
 }
 
-impl<T: UserEvent> RuntimeInitAttrs<T> for Electron {
-  type Runtime = ElectronRuntime;
-
-  fn apply_config(&mut self, config: &tauri_utils::config::Config) -> Result<()> {
-    // Debug builds are what `tauri dev` drives (the same condition Tauri's own
-    // `cfg(dev)` uses), so `tauri://localhost` must resolve to the dev server:
-    // the embedded assets are not bundled in that mode.
-    if self.dev_url.is_none() && cfg!(debug_assertions) {
-      self.dev_url = config
-        .build
-        .dev_url
-        .as_ref()
-        .map(|url| url.as_str().trim_end_matches('/').to_string());
-    }
-    if self.identifier.is_none() {
-      self.identifier = Some(config.identifier.clone());
-    }
-    if self.icon.is_some() {
-      return Ok(());
-    }
-    // Prefer the `.ico` on Windows (crisp at every size), otherwise whatever the
-    // bundle list points at first.
-    let prefer_ico = cfg!(windows);
-    let icon = config
-      .bundle
-      .icon
-      .iter()
-      .find(|icon| prefer_ico && icon.ends_with(".ico"))
-      .or_else(|| config.bundle.icon.iter().find(|icon| icon.ends_with(".png")))
-      .or_else(|| config.bundle.icon.first());
-    if let Some(icon) = icon {
-      // Keep it relative: it is relative to the app's `src-tauri`, not to this
-      // crate, so `resolve_icon` searches upward from the working directory.
-      self.icon = Some(PathBuf::from(icon));
-    }
-    Ok(())
-  }
-}
-
 impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type WindowDispatcher = ElectronWindowDispatcher;
   type WebviewDispatcher = ElectronWebviewDispatcher;
   type Handle = ElectronRuntimeHandle;
   type EventLoopProxy = EventProxy;
-  type RuntimeWebviewAttributes = ();
-  type RuntimeInitAttrs = Electron;
-  type WindowOpener = ();
-  type Webview = ();
-
-  fn new(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    Self::start(args.runtime_init_attrs, &args.custom_schemes)
+  
+  fn new(args: RuntimeInitArgs) -> Result<Self> {
+    Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
   }
 
   #[cfg(any(
@@ -736,8 +728,8 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn new_any_thread(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    Self::start(args.runtime_init_attrs, &args.custom_schemes)
+  fn new_any_thread(args: RuntimeInitArgs) -> Result<Self> {
+    Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
   }
 
   fn create_proxy(&self) -> EventProxy {
@@ -979,79 +971,23 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             }
           }
           Some("webview.newWindow") => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
-              continue;
-            };
-            let features = params["features"].as_str().unwrap_or_default();
-            // Electron always denies the popup: the answer may create a Tauri
-            // window (whose URL is loaded into it), allow a bare popup, or deny.
-            let response = {
-              let handlers = self.context.webview_handlers.borrow();
-              handlers
-                .get(&(serial as u32))
-                .and_then(|handlers| handlers.new_window.as_ref())
-                .map(|handler| handler(url.clone(), features))
-            };
-            match response {
-              Some(NewWindowResponse::Create { window_id }) => {
-                let target = self.context.serial_for_window(window_id);
-                match target {
-                  Some(window_serial) => {
-                    if let Err(error) = self.context.ipc.call(
-                      "webview.navigate",
-                      json!({ "webviewId": window_serial, "url": url.as_str() }),
-                      IPC_TIMEOUT,
-                    ) {
-                      eprintln!("[electron] failed to open {url} in window: {error}");
-                    }
-                  }
-                  None => eprintln!("[electron] new window requested for a closed window: {url}"),
-                }
-              }
-              Some(NewWindowResponse::Allow) => {
-                let (size, _position) = crate::popup::window_features(features);
-                if let Err(error) = self.context.ipc.call(
-                  "webview.openUrl",
-                  json!({
-                    "url": url.as_str(),
-                    "width": size.map(|size| size.width),
-                    "height": size.map(|size| size.height),
-                  }),
-                  IPC_TIMEOUT,
-                ) {
-                  eprintln!("[electron] failed to open popup {url}: {error}");
-                }
-              }
-              Some(NewWindowResponse::Deny) | None => {
-                eprintln!("[electron] denied new window request for {url}");
-              }
-            }
+            // Tauri 2's new-window features are WebView2/webkit handles that do
+            // not exist here, so the request is reported and Electron keeps its
+            // deny answer.
+            let serial = event["params"]["webviewId"].as_u64().unwrap_or_default();
+            eprintln!(
+              "[electron] denied new window request for {url} (webview {serial})",
+              url = event["params"]["url"].as_str().unwrap_or("")
+            );
           }
           Some("webview.processGone") => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let termination = WebContentProcessTermination {
-              reason: termination_reason(params["reason"].as_str().unwrap_or_default()),
-              error_code: params["exitCode"].as_i64().map(|code| code as i32),
-              error_string: params["reason"].as_str().map(str::to_string),
-            };
+            // Tauri 2 only exposes process termination on macOS/iOS, so this is
+            // reported on the console instead of through a handler.
+            let serial = event["params"]["webviewId"].as_u64().unwrap_or_default();
             eprintln!(
-              "[electron] webview {serial} process gone: {reason}",
-              reason = termination.error_string.as_deref().unwrap_or("unknown")
+              "[electron] webview {serial} process gone: {}",
+              event["params"]["reason"].as_str().unwrap_or("unknown")
             );
-            let handlers = self.context.webview_handlers.borrow();
-            if let Some(handler) = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.process_gone.as_ref())
-            {
-              handler(termination);
-            }
           }
           Some("download.requested") => {
             let params = &event["params"];
@@ -1542,9 +1478,6 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       },
     },
     use_https_scheme: false,
-    devtools: webview
-      .as_ref()
-      .and_then(|webview| webview.webview_attributes.devtools),
   });
 
   Ok(DetachedWindow {
@@ -1699,9 +1632,6 @@ fn origin_of(url: &str) -> Option<String> {
 pub(crate) struct WebviewHandlers {
   pub(crate) page_load: Option<Rc<dyn Fn(url::Url, PageLoadEvent) + Send>>,
   pub(crate) title: Option<Rc<dyn Fn(String) + Send>>,
-  pub(crate) new_window:
-    Option<Rc<dyn Fn(url::Url, &str) -> NewWindowResponse + Send + Sync>>,
-  pub(crate) process_gone: Option<Rc<dyn Fn(WebContentProcessTermination) + Send>>,
 }
 
 /// The callbacks Electron asks about out of band: a download question and
@@ -1756,29 +1686,11 @@ fn register_webview_handlers<T: UserEvent>(
     .document_title_changed_handler
     .take()
     .map(|handler| Rc::new(move |title: String| handler(title)) as Rc<dyn Fn(String) + Send>);
-  let process_gone = pending
-    .on_web_content_process_terminate_handler
-    .take()
-    .map(|handler| {
-      Rc::new(move |termination: WebContentProcessTermination| handler(termination))
-        as Rc<dyn Fn(WebContentProcessTermination) + Send>
-    });
-  let new_window = pending.new_window_handler.take().map(|handler| {
-    Rc::new(move |url: url::Url, features: &str| {
-      let (size, position) = crate::popup::window_features(features);
-      handler(
-        url,
-        NewWindowFeatures::<T, ElectronRuntime>::new(size, position, ()),
-      )
-    }) as Rc<dyn Fn(url::Url, &str) -> NewWindowResponse + Send + Sync>
-  });
   context.webview_handlers.borrow_mut().insert(
     webview_id,
     WebviewHandlers {
       page_load,
       title,
-      new_window,
-      process_gone,
     },
   );
 }
@@ -1804,31 +1716,9 @@ fn register_policy_handlers<T: UserEvent>(
   wired
 }
 
-/// Maps Electron's `render-process-gone` reason onto Tauri's classification.
-fn termination_reason(reason: &str) -> WebContentProcessTerminationReason {
-  match reason {
-    "clean-exit" => WebContentProcessTerminationReason::Normal,
-    "abnormal-exit" => WebContentProcessTerminationReason::Abnormal,
-    "killed" => WebContentProcessTerminationReason::Killed,
-    "crashed" => WebContentProcessTerminationReason::Crashed,
-    "oom" => WebContentProcessTerminationReason::OutOfMemory,
-    "launch-failed" => WebContentProcessTerminationReason::LaunchFailed,
-    "integrity-failure" => WebContentProcessTerminationReason::IntegrityFailure,
-    _ => WebContentProcessTerminationReason::Unknown,
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn maps_electron_termination_reasons() {
-    assert_eq!(termination_reason("crashed"), WebContentProcessTerminationReason::Crashed);
-    assert_eq!(termination_reason("oom"), WebContentProcessTerminationReason::OutOfMemory);
-    assert_eq!(termination_reason("clean-exit"), WebContentProcessTerminationReason::Normal);
-    assert_eq!(termination_reason("nonsense"), WebContentProcessTerminationReason::Unknown);
-  }
 
   #[test]
   fn maps_permission_names_both_ways() {

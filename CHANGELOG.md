@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## \[0.1.0] - 2026-10-22
 
+### Notes
+
+- `main` targets the Tauri 2 line (`tauri-runtime` 2.x) and is selected with
+  `tauri::Builder::<ElectronRuntime>::new()`; Tauri 2 has no runtime init
+  attributes, so configuration is read from `TAURI_DEV_URL`,
+  `TAURI_RUNTIME_ELECTRON_ICON` and `TAURI_RUNTIME_ELECTRON_IDENTIFIER`.
+  New-window requests and renderer process termination are logged rather than
+  handed to a Tauri callback, because Tauri 2 only exposes them through
+  WebView2/webkit handles (or on macOS/iOS). The `next` branch keeps the
+  Tauri 3.0.0-alpha port with those hooks wired.
+
 ### New Features
 
 - `build.rs` acquires an Electron runtime without a Node toolchain, following

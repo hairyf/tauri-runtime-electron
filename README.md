@@ -1,15 +1,15 @@
-以下是经过精简、优化和重构后的 README 文档。去除了冗余的官方简介，将 `bundle` 配置与 `tauri::Builder::default()` 的使用示例紧密结合在一起，使整个文档更加紧凑、直观且易于维护：
-
----
-
 # tauri-runtime-electron
 
 A `tauri-runtime` implementation backed by Electron instead of the system webview. The Rust process keeps the Tauri event loop and `invoke` handler, spawning an Electron main process as a child and driving it over a loopback JSON-RPC socket.
 
+> **Branches:** `main` targets the Tauri 2 line (`tauri-runtime` 2.x). `next` tracks
+> Tauri 3.0.0-alpha and additionally wires the runtime-init attributes, new-window
+> decisions, download/permission handlers and process-termination events.
+
 | Component | Version |
 | --- | --- |
 | `tauri-runtime-electron` | `0.1.0` |
-| `tauri-runtime` | [3.0.0-alpha.4](https://crates.io/crates/tauri-runtime) |
+| `tauri-runtime` | [2.12](https://crates.io/crates/tauri-runtime) |
 | Electron | [45](https://www.electronjs.org/docs/latest/api/app) |
 
 ---
@@ -18,14 +18,18 @@ A `tauri-runtime` implementation backed by Electron instead of the system webvie
 
 ### 1. Rust Integration
 
-Initialize the runtime with `tauri::Builder::default()`:
+Tauri 2 selects the runtime through the builder's type parameter:
 
 ```rust
-tauri::Builder::default()
-    .runtime(tauri_runtime_electron::Electron::default())
+tauri::Builder::<tauri_runtime_electron::ElectronRuntime>::new()
     .run(tauri::generate_context!())
-
 ```
+
+Because Tauri 2 has no runtime init attributes, the knobs travel as environment
+variables: `TAURI_DEV_URL` (dev-server origin), `TAURI_RUNTIME_ELECTRON_ICON`
+(window icon) and `TAURI_RUNTIME_ELECTRON_IDENTIFIER` (AppUserModelID). Everything
+else (Electron binary, main script, IPC port) is auto-detected or defaults.
+
 
 ### 2. Tauri Bundle Configuration
 

@@ -50,6 +50,32 @@ impl ElectronWebviewDispatcher {
   }
 }
 
+impl ElectronWebviewDispatcher {
+  // Tauri 2's `WebviewDispatch` has no history methods (the webview plugin drives
+  // them through `eval`), so these stay inherent for direct use.
+  pub fn go_back(&self) -> Result<()> {
+    self.webview_call("webview.goBack", json!({})).map(|_| ())
+  }
+
+  pub fn can_go_back(&self) -> Result<bool> {
+    Ok(self
+      .webview_call("webview.canGoBack", json!({}))?
+      .as_bool()
+      .unwrap_or(false))
+  }
+
+  pub fn go_forward(&self) -> Result<()> {
+    self.webview_call("webview.goForward", json!({})).map(|_| ())
+  }
+
+  pub fn can_go_forward(&self) -> Result<bool> {
+    Ok(self
+      .webview_call("webview.canGoForward", json!({}))?
+      .as_bool()
+      .unwrap_or(false))
+  }
+}
+
 impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   type Runtime = ElectronRuntime;
 
@@ -67,9 +93,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   /// Electron guests have no native handle to hand out: they are `<webview>`
-  /// elements composited by the renderer, so callers get `()`.
-  fn with_webview<F: FnOnce(()) + Send + 'static>(&self, f: F) -> Result<()> {
-    f(());
+  /// elements composited by the renderer, so callers get `()` boxed.
+  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
+    f(Box::new(()));
     Ok(())
   }
 
@@ -174,28 +200,6 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
 
   fn reload(&self) -> Result<()> {
     self.webview_call("webview.reload", json!({})).map(|_| ())
-  }
-
-  fn go_back(&self) -> Result<()> {
-    self.webview_call("webview.goBack", json!({})).map(|_| ())
-  }
-
-  fn can_go_back(&self) -> Result<bool> {
-    Ok(self
-      .webview_call("webview.canGoBack", json!({}))?
-      .as_bool()
-      .unwrap_or(false))
-  }
-
-  fn go_forward(&self) -> Result<()> {
-    self.webview_call("webview.goForward", json!({})).map(|_| ())
-  }
-
-  fn can_go_forward(&self) -> Result<bool> {
-    Ok(self
-      .webview_call("webview.canGoForward", json!({}))?
-      .as_bool()
-      .unwrap_or(false))
   }
 
   fn print(&self) -> Result<()> {
