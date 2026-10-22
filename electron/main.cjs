@@ -110,6 +110,31 @@ protocol.registerSchemesAsPrivileged(
   }))
 )
 
+let localhostRedirectInstalled = false
+
+/**
+ * On Windows Tauri's frontend reaches custom protocols as
+ * `http://<scheme>.localhost/<...>` (the WebView2 form of `convertFileSrc`),
+ * but Electron only routes `<scheme>://localhost/<...>`. Rewrite the former
+ * onto the registered scheme so IPC uses the custom protocol instead of
+ * falling back to `postMessage`. Electron keeps a single `onBeforeRequest`
+ * listener per session, so it is installed once and consults `registeredSchemes`.
+ */
+function installLocalhostRedirect() {
+  if (localhostRedirectInstalled) return
+  localhostRedirectInstalled = true
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    const match = /^https?:\/\/([A-Za-z0-9-]+)\.localhost(?::\d+)?(\/.*)?$/.exec(
+      details.url
+    )
+    if (!match || !registeredSchemes.has(match[1])) {
+      callback({})
+      return
+    }
+    callback({ redirectURL: `${match[1]}://localhost${match[2] ?? '/'}` })
+  })
+}
+
 /** id -> resolve(Response); a `protocol.request` awaiting `protocol.respond`. */
 const protocolRequests = new Map()
 let nextProtocolId = 1
@@ -372,6 +397,14 @@ function wireWebviewEvents(contents, webviewId) {
   // `setWindowOpenHandler` can only answer synchronously, but the Rust run loop
   // is what decides — so deny here and let Tauri open its own window.
   contents.setWindowOpenHandler(({ url, features }) => {
+    // Web pages open in the system browser, like they do under wry. Doing it
+    // here rather than from the Tauri process keeps the launch in the process
+    // that owns the window: Windows only lets a foreground app hand the
+    // foreground to the browser it opens.
+    if (/^(https?|mailto|tel):/i.test(url)) {
+      shell.openExternal(url)
+      return { action: 'deny' }
+    }
     send({ event: 'webview.newWindow', params: { webviewId, url, features: features ?? '' } })
     return { action: 'deny' }
   })
@@ -1040,6 +1073,7 @@ function handle(method, params) {
       if (registeredSchemes.has(scheme)) return null
       registeredSchemes.add(scheme)
       protocol.handle(scheme, (request) => dispatchProtocol(scheme, request))
+      installLocalhostRedirect()
       return null
     }
     case 'protocol.respond': {

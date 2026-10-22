@@ -21,7 +21,7 @@ use tauri_runtime::{
     DetachedWindow, DetachedWindowWebview, PendingWindow, RawWindow, WindowEvent, WindowId,
   },
 };
-use tauri_utils::{Theme, config::WebviewUrl};
+use tauri_utils::Theme;
 
 /// The `tauri-runtime` handler aliases are private in the 2.x line, so these
 /// restate the same signatures locally.
@@ -263,22 +263,14 @@ impl RuntimeContext {
     Ok(handle)
   }
 
-  /// Tauri hands us `tauri://localhost/...` in production builds; when a dev
-  /// server URL is configured we rewrite to it so the probe can load Vite.
-  fn resolve_url(&self, url: &WebviewUrl) -> String {
-    let raw = match url {
-      WebviewUrl::External(url) => url.to_string(),
-      WebviewUrl::App(path) => format!(
-        "tauri://localhost/{}",
-        path.to_string_lossy().trim_start_matches('/')
-      ),
-      WebviewUrl::CustomProtocol(url) => url.to_string(),
-      // `WebviewUrl` is non-exhaustive.
-      _ => String::new(),
-    };
+  /// Tauri resolves [`WebviewUrl::App`] against the dev server (`devUrl`) or the
+  /// `tauri://localhost` protocol and hands the result over as
+  /// [`PendingWebview::url`](tauri_runtime::webview::PendingWebview::url), so the
+  /// runtime only has to honour an explicit [`Electron::dev_url`] override.
+  fn resolve_url(&self, raw: &str) -> String {
     match (&self.dev_url, raw.strip_prefix("tauri://localhost")) {
       (Some(dev), Some(rest)) => format!("{dev}{rest}"),
-      _ => raw,
+      _ => raw.to_string(),
     }
   }
 
@@ -1217,8 +1209,10 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
 
     self.is_running.store(false, Ordering::Relaxed);
     eprintln!("[electron] run loop finished, shutting the runtime down");
-    self.context.ipc.shutdown();
+    // Tauri's exit cleanup still calls into the windows (hide/close), so it has
+    // to run while Electron is alive; only then can the channel be torn down.
     callback(RunEvent::Exit);
+    self.context.ipc.shutdown();
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
@@ -1357,6 +1351,10 @@ pub(crate) fn create_window_impl<T: UserEvent>(
   let id = context.next_window_id();
   let serial = context.next_serial();
   let webview_id = webview.as_ref().map(|_| context.next_webview_id());
+  let webview_url = webview
+    .as_ref()
+    .map(|webview| context.resolve_url(&webview.url))
+    .unwrap_or_default();
 
   if let Some(webview) = webview.as_mut() {
     for (scheme, handler) in webview.uri_scheme_protocols.drain() {
@@ -1413,7 +1411,7 @@ pub(crate) fn create_window_impl<T: UserEvent>(
   if let (Some(webview), Some(webview_id)) = (&webview, webview_id) {
     payload["webview"] = json!({
       "webviewId": webview_id,
-      "url": context.resolve_url(&webview.webview_attributes.url),
+      "url": webview_url.clone(),
       "initScripts": initialization_scripts(webview),
       "policy": policy,
     });
@@ -1443,8 +1441,7 @@ pub(crate) fn create_window_impl<T: UserEvent>(
   );
 
   if let (Some(pending_webview), Some(webview_serial)) = (webview.as_mut(), webview_id) {
-    let url = context.resolve_url(&pending_webview.webview_attributes.url);
-    if let Some(origin) = origin_of(&url) {
+    if let Some(origin) = origin_of(&webview_url) {
       context
         .webview_origins
         .borrow_mut()
@@ -1455,7 +1452,7 @@ pub(crate) fn create_window_impl<T: UserEvent>(
         context,
         webview_serial,
         label.clone(),
-        url,
+        webview_url.clone(),
         handler,
       );
     }
@@ -1468,12 +1465,7 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       dispatcher: ElectronWebviewDispatcher {
         id: webview_id,
         context: context.clone(),
-        url: Arc::new(Mutex::new(
-          webview
-            .as_ref()
-            .map(|webview| context.resolve_url(&webview.webview_attributes.url))
-            .unwrap_or_default(),
-        )),
+        url: Arc::new(Mutex::new(webview_url)),
         last_evaluated_script: Default::default(),
       },
     },
@@ -1501,7 +1493,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     .ok_or_else(|| create_webview_err("window does not exist".into()))?;
   let webview_id = context.next_webview_id();
 
-  let url = context.resolve_url(&pending.webview_attributes.url);
+  let url = context.resolve_url(&pending.url);
   if let Some(origin) = origin_of(&url) {
     context
       .webview_origins
@@ -1531,7 +1523,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   let payload = json!({
     "windowId": serial,
     "webviewId": webview_id,
-    "url": url,
+    "url": url.clone(),
     "initScripts": initialization_scripts(&pending),
     "policy": { "download": download, "permission": permission },
   });
@@ -1564,9 +1556,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     dispatcher: ElectronWebviewDispatcher {
       id: webview_id,
       context: context.clone(),
-      url: Arc::new(Mutex::new(
-        context.resolve_url(&pending.webview_attributes.url),
-      )),
+      url: Arc::new(Mutex::new(url.clone())),
       last_evaluated_script: Default::default(),
     },
   })

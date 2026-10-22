@@ -26,9 +26,10 @@ tauri::Builder::<tauri_runtime_electron::ElectronRuntime>::new()
 ```
 
 Because Tauri 2 has no runtime init attributes, the knobs travel as environment
-variables: `TAURI_DEV_URL` (dev-server origin), `TAURI_RUNTIME_ELECTRON_ICON`
-(window icon) and `TAURI_RUNTIME_ELECTRON_IDENTIFIER` (AppUserModelID). Everything
-else (Electron binary, main script, IPC port) is auto-detected or defaults.
+variables: `TAURI_DEV_URL` (dev-server origin override; the runtime already uses
+the URL Tauri resolves from `devUrl`), `TAURI_RUNTIME_ELECTRON_ICON` (window icon)
+and `TAURI_RUNTIME_ELECTRON_IDENTIFIER` (AppUserModelID). Everything else (Electron
+binary, main script, IPC port) is auto-detected or defaults.
 
 
 ### 2. Tauri Bundle Configuration
