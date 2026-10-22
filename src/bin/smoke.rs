@@ -254,52 +254,66 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::is_always_on_top(window),
   );
 
-  set(failures, "set_decorations", || {
-    WindowDispatch::<()>::set_decorations(window, false)
-  });
-  expect(failures, "is_decorated", false, || {
-    WindowDispatch::<()>::is_decorated(window)
-  });
-  set(failures, "set_decorations back", || {
-    WindowDispatch::<()>::set_decorations(window, true)
-  });
-  expect(failures, "is_decorated back", true, || {
-    WindowDispatch::<()>::is_decorated(window)
-  });
+  // Electron can only change the frame through Win32, and it documents the
+  // three "izable" getters for macOS and Windows only.
+  if cfg!(windows) {
+    set(failures, "set_decorations", || {
+      WindowDispatch::<()>::set_decorations(window, false)
+    });
+    expect(failures, "is_decorated", false, || {
+      WindowDispatch::<()>::is_decorated(window)
+    });
+    set(failures, "set_decorations back", || {
+      WindowDispatch::<()>::set_decorations(window, true)
+    });
+    expect(failures, "is_decorated back", true, || {
+      WindowDispatch::<()>::is_decorated(window)
+    });
+  } else {
+    println!("skip decorations: Electron cannot change the frame after creation");
+  }
 
-  set(failures, "maximize", || WindowDispatch::<()>::maximize(window));
-  expect(failures, "is_maximized", true, || {
-    WindowDispatch::<()>::is_maximized(window)
-  });
-  set(failures, "unmaximize", || {
-    WindowDispatch::<()>::unmaximize(window)
-  });
-  expect(failures, "is_maximized off", false, || {
-    WindowDispatch::<()>::is_maximized(window)
-  });
+  expect_applied(
+    failures,
+    "is_maximized",
+    true,
+    || WindowDispatch::<()>::maximize(window),
+    || WindowDispatch::<()>::is_maximized(window),
+  );
+  expect_applied(
+    failures,
+    "is_maximized off",
+    false,
+    || WindowDispatch::<()>::unmaximize(window),
+    || WindowDispatch::<()>::is_maximized(window),
+  );
 
-  set(failures, "set_maximizable", || {
-    WindowDispatch::<()>::set_maximizable(window, false)
-  });
-  expect(failures, "is_maximizable", false, || {
-    WindowDispatch::<()>::is_maximizable(window)
-  });
-  set(failures, "set_minimizable", || {
-    WindowDispatch::<()>::set_minimizable(window, false)
-  });
-  expect(failures, "is_minimizable", false, || {
-    WindowDispatch::<()>::is_minimizable(window)
-  });
-  set(failures, "set_closable", || {
-    WindowDispatch::<()>::set_closable(window, false)
-  });
-  expect(failures, "is_closable", false, || {
-    WindowDispatch::<()>::is_closable(window)
-  });
-  // Restore, otherwise the window cannot be closed by the checks below.
-  set(failures, "set_closable back", || {
-    WindowDispatch::<()>::set_closable(window, true)
-  });
+  if cfg!(any(windows, target_os = "macos")) {
+    set(failures, "set_maximizable", || {
+      WindowDispatch::<()>::set_maximizable(window, false)
+    });
+    expect(failures, "is_maximizable", false, || {
+      WindowDispatch::<()>::is_maximizable(window)
+    });
+    set(failures, "set_minimizable", || {
+      WindowDispatch::<()>::set_minimizable(window, false)
+    });
+    expect(failures, "is_minimizable", false, || {
+      WindowDispatch::<()>::is_minimizable(window)
+    });
+    set(failures, "set_closable", || {
+      WindowDispatch::<()>::set_closable(window, false)
+    });
+    expect(failures, "is_closable", false, || {
+      WindowDispatch::<()>::is_closable(window)
+    });
+    // Restore, otherwise the window cannot be closed by the checks below.
+    set(failures, "set_closable back", || {
+      WindowDispatch::<()>::set_closable(window, true)
+    });
+  } else {
+    println!("skip maximizable/minimizable/closable: macOS and Windows only");
+  }
 
   set(failures, "set_theme", || {
     WindowDispatch::<()>::set_theme(window, Some(Theme::Dark))
