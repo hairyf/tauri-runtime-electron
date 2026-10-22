@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 # Non-interactive compile/state check: & ./scripts/verify-native.ps1 -Action state -RootPid $PID
 # Title matches exactly; Clicks is reserved, and doubleclick always sends two clicks.
 if ($RootPid -le 0) { throw 'RootPid must be a positive process ID.' }
-if ($Action -notin @('state','raise','place','drag','doubleclick','capture','resize','popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click','watch-splash')) { throw "Unknown action: $Action" }
+if ($Action -notin @('state','raise','restore','place','drag','doubleclick','capture','resize','popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click','watch-splash')) { throw "Unknown action: $Action" }
 if ($Action -in @('menu-click','tray-state','tray-click','menubar-click') -and !$ItemText) { throw "$Action requires exact ItemText." }
 if ($Action -eq 'resize' -and ($Width -le 0 -or $Height -le 0)) { throw 'Width and Height must be positive physical client pixel sizes.' }
 if (-not ('NativeVerify' -as [type])) {
@@ -120,6 +120,7 @@ public static class NativeVerify {
         }
         if (GetForegroundWindow() != window) throw new InvalidOperationException("Windows denied foreground activation.");
     }
+    public static void Restore(IntPtr window) { Require(window); ShowWindow(window, 9); }
     public static void Place(IntPtr window) { Require(window); Check(SetWindowPos(window, IntPtr.Zero, 120, 80, 0, 0, 0x15)); }
     public static void Resize(IntPtr window, int width, int height) {
         var state = Read(window);
@@ -294,6 +295,7 @@ if ($Action -in @('raise','drag','doubleclick','capture')) { [NativeVerify]::Rai
 $before = [NativeVerify]::Read($handle)
 $result = switch ($Action) {
     'raise' { $before }
+    'restore' { [NativeVerify]::Restore($handle); Start-Sleep -Milliseconds 120; [NativeVerify]::Read($handle) }
     'place' { [NativeVerify]::Place($handle); Start-Sleep -Milliseconds 100; [NativeVerify]::Read($handle) }
     'resize' { [NativeVerify]::Resize($handle, $Width, $Height); Start-Sleep -Milliseconds 100; @{ before=$before; after=[NativeVerify]::Read($handle) } }
     { $_ -in @('drag','doubleclick') } {

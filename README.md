@@ -61,6 +61,17 @@ Win32 effects using that handle affect the helper; effects declared in
 `tauri.conf.json` and the runtime's window operations use the Electron window.
 Parent and owner options translate helper handles back to their visible window.
 
+Window theme overrides apply to that window's Chromium pages and guests; Windows
+also updates the visible DWM caption. macOS/Linux native chrome remains app-wide.
+App theme changes still follow Electron's app-wide `nativeTheme` behavior.
+
+Tauri 3 alpha does not pass builder-registered custom protocols in its startup
+arguments. Privilege them before Electron starts, alongside their Tauri handler:
+
+```rust
+.runtime(tauri_runtime_electron::Electron::default().custom_scheme("stream"))
+```
+
 ---
 
 ## Layout & Architecture
@@ -124,7 +135,9 @@ windows, and `--no-install` skips the frontend install. Pass application argumen
 after `--`, for example `pnpm example file-associations -- "C:/files/hello world.txt"`.
 Ctrl+C stops the app, cargo and Vite. The original isolation pattern, CSP,
 capabilities and resource declarations are retained; the streaming fixture is
-fetched over HTTPS and checked for an MP4 header before use.
+fetched over HTTPS and checked for an MP4 header before use. The staged API
+example fixes upstream delayed hide/disable/minimize handlers to retain their
+original target and method receiver; reference submodule files are unchanged.
 
 For reproducible actions and keyframes on a Windows desktop:
 

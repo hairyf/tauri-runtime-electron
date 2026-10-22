@@ -233,5 +233,26 @@ fn read_line(stream: &TcpStream, timeout: Duration) -> std::result::Result<Strin
   if line.trim().is_empty() {
     return Err("electron closed the socket during the handshake".into());
   }
+  // Only the handshake has a read deadline; idle apps keep this socket open.
+  stream.set_read_timeout(None).map_err(|e| e.to_string())?;
   Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn handshake_does_not_leave_an_idle_read_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    peer.write_all(b"{\"event\":\"ready\"}\n").unwrap();
+    assert_eq!(
+      read_line(&stream, Duration::from_secs(1)).unwrap(),
+      "{\"event\":\"ready\"}\n"
+    );
+    assert_eq!(stream.read_timeout().unwrap(), None);
+    assert_eq!(stream.try_clone().unwrap().read_timeout().unwrap(), None);
+  }
 }

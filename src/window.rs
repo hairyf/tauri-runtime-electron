@@ -395,11 +395,11 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_min_size(&self, size: Option<Size>) -> Result<()> {
-    self.window_call("window.minSize", size.map(size_payload).unwrap_or(json!(null)))
+    self.window_call("window.minSize", size.map(size_payload).unwrap_or(json!({})))
   }
 
   fn set_max_size(&self, size: Option<Size>) -> Result<()> {
-    self.window_call("window.maxSize", size.map(size_payload).unwrap_or(json!(null)))
+    self.window_call("window.maxSize", size.map(size_payload).unwrap_or(json!({})))
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
@@ -485,8 +485,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn start_dragging(&self) -> Result<()> {
     #[cfg(windows)]
     {
-      imp::start_dragging(self.context.native_handle(self.id)?);
-      Ok(())
+      imp::start_dragging(self.context.native_handle(self.id)?)
     }
     #[cfg(not(windows))]
     Ok(())
@@ -495,8 +494,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn start_resize_dragging(&self, direction: tauri_runtime::ResizeDirection) -> Result<()> {
     #[cfg(windows)]
     {
-      imp::start_resize_dragging(self.context.native_handle(self.id)?, direction);
-      Ok(())
+      imp::start_resize_dragging(self.context.native_handle(self.id)?, direction)
     }
     #[cfg(not(windows))]
     {
@@ -675,9 +673,8 @@ pub(crate) mod imp {
   use tauri_runtime::{ResizeDirection, dpi::PhysicalPosition};
   use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
   use windows::Win32::Graphics::Gdi::ClientToScreen;
-  use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
   use windows::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, CreateWindowExW, GWLP_HWNDPARENT, GetClientRect,
+    ClipCursor, CreateWindowExW, GWLP_HWNDPARENT, GetClientRect, GetCursorPos, PostMessageW, WM_CANCELMODE,
     GetWindowLongPtrW, HTCAPTION, WINDOW_EX_STYLE, WS_POPUP,
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
@@ -688,6 +685,20 @@ pub(crate) mod imp {
 
   fn hwnd(handle: isize) -> HWND {
     HWND(handle as *mut std::ffi::c_void)
+  }
+
+  /// DWM owns the native caption; Chromium media emulation only changes content.
+  pub(crate) fn set_theme(handle: isize, dark: bool) -> std::result::Result<(), String> {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    let dark = windows::core::BOOL::from(dark);
+    // SAFETY: the live Electron HWND is borrowed; DWM copies this BOOL synchronously.
+    unsafe {
+      DwmSetWindowAttribute(
+        hwnd(handle), DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const _ as *const std::ffi::c_void,
+        std::mem::size_of_val(&dark) as u32,
+      )
+    }.map_err(|error| error.to_string())
   }
 
   pub(crate) fn send_to_bottom(handle: isize) {
@@ -712,18 +723,97 @@ pub(crate) mod imp {
     pub(crate) mirrored: serde_json::Value,
   }
 
+  thread_local! {
+    static MENU_ACTIONS: std::cell::RefCell<Vec<(isize, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
+  }
+
+  unsafe extern "system" fn menu_owner_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::{Foundation::LRESULT, UI::WindowsAndMessaging::{
+      DefWindowProcW, SIZE_MAXIMIZED, SIZE_MINIMIZED, SWP_SHOWWINDOW, WINDOWPOS,
+      WM_CLOSE, WM_SIZE, WM_WINDOWPOSCHANGING,
+    }};
+    let action = match message {
+      WM_CLOSE => Some("window.close"),
+      WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => Some("window.minimize"),
+      WM_SIZE if wparam.0 == SIZE_MAXIMIZED as usize => Some("window.maximize"),
+      _ => None,
+    };
+    if let Some(action) = action {
+      MENU_ACTIONS.with(|actions| actions.borrow_mut().push((window.0 as isize, action)));
+    }
+    if message == WM_CLOSE { return LRESULT(0); }
+    if message == WM_WINDOWPOSCHANGING {
+      // Muda's predefined items call ShowWindow on their owner. Observe that
+      // native operation, but keep the proxy invisible and unable to take focus.
+      if let Some(position) = unsafe { (lparam.0 as *mut WINDOWPOS).as_mut() } {
+        position.flags = (position.flags & !SWP_SHOWWINDOW) | SWP_NOACTIVATE;
+      }
+    }
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+  }
+
   impl MenuOwner {
     pub(crate) fn new() -> Option<Self> {
-      // SAFETY: predefined class, never shown. The origin preserves the popup
-      // positioning behavior of the previous hidden owner.
+      use windows::Win32::{Foundation::HINSTANCE, System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{RegisterClassW, WNDCLASSW}};
+      static CLASS: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+      let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.ok()?.0);
+      let class = windows::core::w!("TauriElectronMenuOwner");
+      if *CLASS.get_or_init(|| unsafe { RegisterClassW(&WNDCLASSW {
+        lpfnWndProc: Some(menu_owner_proc), hInstance: instance, lpszClassName: class,
+        ..Default::default()
+      }) }) == 0 { return None; }
+      // The origin preserves the existing popup positioning behavior.
       let window = unsafe {
         CreateWindowExW(
-          WINDOW_EX_STYLE(0), windows::core::w!("STATIC"), windows::core::w!(""),
-          WS_POPUP, 0, 0, 1, 1, None, None, None, None,
+          WINDOW_EX_STYLE(0), class, windows::core::w!(""),
+          WS_POPUP, 0, 0, 1, 1, None, None, Some(instance), None,
         )
       }.ok()?;
       Some(Self { handle: window.0 as isize, mirrored: serde_json::Value::Null })
     }
+  }
+
+  pub(crate) fn take_menu_actions() -> Vec<(isize, &'static str)> {
+    let actions = MENU_ACTIONS.with(|actions| std::mem::take(&mut *actions.borrow_mut()));
+    // Reset the proxy's min/max state so selecting the same predefined command
+    // repeatedly still produces WM_SIZE. SWP_SHOWWINDOW is suppressed above.
+    for (owner, action) in &actions {
+      if *action != "window.close" {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+        unsafe {
+          let _ = ShowWindow(hwnd(*owner), SW_SHOWNOACTIVATE);
+          let _ = SetWindowPos(hwnd(*owner), None, 0, 0, 1, 1, SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+      }
+    }
+    actions
+  }
+
+  #[cfg(test)]
+  #[test]
+  fn predefined_menu_actions_keep_owner_hidden_and_repeatable() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      DestroyWindow, GetWindowRect, IsWindow, IsWindowVisible, ShowWindow, SW_MAXIMIZE, SW_MINIMIZE, WM_CLOSE,
+    };
+    let owner = MenuOwner::new().unwrap();
+    let _ = take_menu_actions();
+    for (command, method) in [(SW_MINIMIZE, "window.minimize"), (SW_MAXIMIZE, "window.maximize")] {
+      for _ in 0..2 {
+        unsafe { let _ = ShowWindow(hwnd(owner.handle), command); }
+        assert_eq!(take_menu_actions(), vec![(owner.handle, method)]);
+        assert!(!unsafe { IsWindowVisible(hwnd(owner.handle)) }.as_bool());
+        let mut bounds = RECT::default();
+        unsafe { GetWindowRect(hwnd(owner.handle), &mut bounds) }.unwrap();
+        assert_eq!((bounds.left, bounds.top, bounds.right, bounds.bottom), (0, 0, 1, 1));
+      }
+    }
+    unsafe { SendMessageW(hwnd(owner.handle), WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))); }
+    assert_eq!(take_menu_actions(), vec![(owner.handle, "window.close")]);
+    assert!(unsafe { IsWindow(Some(hwnd(owner.handle))) }.as_bool());
+    assert!(!unsafe { IsWindowVisible(hwnd(owner.handle)) }.as_bool());
+    // No muda menu references this test owner, so it can be destroyed safely.
+    unsafe { DestroyWindow(hwnd(owner.handle)) }.unwrap();
   }
 
   // ponytail: retain one hidden HWND per closed window until process exit.
@@ -810,23 +900,31 @@ pub(crate) mod imp {
     }
   }
 
-  pub(super) fn start_dragging(handle: isize) {
+  fn cursor_lparam(point: POINT) -> LPARAM {
+    LPARAM(((point.x as u16 as u32) | ((point.y as u16 as u32) << 16)) as isize)
+  }
+
+  fn start_non_client_drag(handle: isize, hit: i32) -> tauri_runtime::Result<()> {
     let window = hwnd(handle);
-    // SAFETY: the canonical frameless-drag trick; the message is handled by the
-    // window's non-client path and only starts a move loop.
+    let mut point = POINT::default();
+    // SAFETY: only read the cursor and post scalar messages to our own HWND.
+    // Capture belongs to Electron's UI thread. WM_CANCELMODE releases it there;
+    // ReleaseCapture on this Rust thread cannot do that. Posting the move also
+    // leaves the Rust IPC loop free while Electron runs its modal move loop.
     unsafe {
-      let _ = ReleaseCapture();
-      SendMessageW(
-        window,
-        WM_NCLBUTTONDOWN,
-        Some(WPARAM(HTCAPTION as usize)),
-        Some(LPARAM(0)),
-      );
+      GetCursorPos(&mut point)
+        .and_then(|_| PostMessageW(Some(window), WM_CANCELMODE, WPARAM(0), LPARAM(0)))
+        .and_then(|_| PostMessageW(Some(window), WM_NCLBUTTONDOWN, WPARAM(hit as usize), cursor_lparam(point)))
+        .map_err(|error| crate::runtime::create_window_err(error.to_string()))
     }
   }
 
-  /// Same trick as `start_dragging`, for the resize borders.
-  pub(crate) fn start_resize_dragging(handle: isize, direction: ResizeDirection) {
+  pub(super) fn start_dragging(handle: isize) -> tauri_runtime::Result<()> {
+    start_non_client_drag(handle, HTCAPTION as i32)
+  }
+
+  /// Same owner-thread message path as `start_dragging`, for resize borders.
+  pub(crate) fn start_resize_dragging(handle: isize, direction: ResizeDirection) -> tauri_runtime::Result<()> {
     let hit = match direction {
       ResizeDirection::East => HTRIGHT,
       ResizeDirection::North => HTTOP,
@@ -837,10 +935,16 @@ pub(crate) mod imp {
       ResizeDirection::SouthWest => HTBOTTOMLEFT,
       ResizeDirection::West => HTLEFT,
     };
-    // SAFETY: same non-client message path as the caption drag above.
-    unsafe {
-      let _ = ReleaseCapture();
-      SendMessageW(hwnd(handle), WM_NCLBUTTONDOWN, Some(WPARAM(hit as usize)), Some(LPARAM(0)));
+    start_non_client_drag(handle, hit as i32)
+  }
+
+  #[cfg(test)]
+  #[test]
+  fn drag_cursor_coordinates_preserve_signed_screen_positions() {
+    for point in [POINT { x: 175, y: 385 }, POINT { x: -1920, y: -1080 }] {
+      let packed = cursor_lparam(point).0 as u32;
+      assert_eq!(packed as u16 as i16 as i32, point.x);
+      assert_eq!((packed >> 16) as u16 as i16 as i32, point.y);
     }
   }
 

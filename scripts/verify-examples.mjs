@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createInterface } from 'node:readline'
 import { exampleNames } from './example.mjs'
 import { cases } from './verify-cases.mjs'
+import { verifyDefaultMenu } from './verify-native-cases.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
@@ -127,7 +128,7 @@ async function run(name, index) {
   ], {
     cwd: root,
     stdio: ['ignore', logFd, logFd],
-    env: { ...process.env, TAURI_RUNTIME_ELECTRON_DEBUG_PORT: String(port) },
+    env: { ...process.env, TAURI_RUNTIME_ELECTRON_DEBUG_PORT: String(port), TAURI_RUNTIME_ELECTRON_LOG: path.join(dir, 'runtime.log') },
     detached: process.platform !== 'win32',
   })
   fs.closeSync(logFd)
@@ -234,6 +235,7 @@ async function run(name, index) {
       await t.capture(t.main, `${name}-initial`)
     }
     await cases[name](t)
+    if (['helloworld', 'splashscreen'].includes(name)) await verifyDefaultMenu(t, t.main, { close: true })
     assert(result.checks.length > 0, 'a case without assertions cannot pass')
     result.status = result.notes.length ? 'assertions-passed-with-unverified-scope' : 'assertions-passed-awaiting-visual-review'
   } catch (error) {

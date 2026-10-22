@@ -34,7 +34,7 @@ Do not edit by hand — re-run the script.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1361` |
+| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1416` |
 
 ## RuntimeHandle
 
@@ -69,8 +69,8 @@ Every member is implemented.
 | `set_decorations` | ⚠️ only some platforms | `src/window.rs:342` |
 | `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:442` |
 | `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:464` |
-| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:495` |
-| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:547` |
+| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:494` |
+| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:545` |
 
 ## WebviewDispatch
 

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { appManifest, configure, parseArgs } from './example.mjs'
+import { appManifest, configure, parseArgs, patchWindowTimers, replaceRuntime } from './example.mjs'
 
 const read = (relative) => fs.readFileSync(new URL(`../source/tauri/examples/${relative}`, import.meta.url), 'utf8').replaceAll('\r\n', '\n')
 const json = (relative) => JSON.parse(read(relative))
@@ -64,6 +64,25 @@ for (const name of ['api', 'resources', 'file-associations']) {
   assert(output.endsWith('\n[[bin]]\nname = "runner_check"\npath = "src/main.rs"\n'))
 }
 assert(appManifest(read('resources/src-tauri/Cargo.toml'), 'resources', []).includes('features = ["codegen"]'))
+assert(replaceRuntime(read('streaming/main.rs')).includes('Electron::default().custom_scheme("stream")'))
+const originalWindow = read('api/src/views/Window.svelte')
+const patchedWindow = patchWindowTimers(originalWindow)
+const handlers = patchedWindow.match(/^  (?:async )?function (?:hide|disable|minimize)\(\) \{[^]*?^  \}/gm)
+assert.equal(handlers.length, 3)
+assert.equal(patchedWindow.replaceAll(/(^  (?:async )?function (?:hide|disable|minimize)\(\) \{)[^]*?^  \}/gm, '$1'), originalWindow.replaceAll(/(^  (?:async )?function (?:hide|disable|minimize)\(\) \{)[^]*?^  \}/gm, '$1'), 'leave every other control intact')
+for (const handler of handlers) {
+  const timers = []
+  const calls = []
+  const selected = Object.fromEntries(['isVisible', 'hide', 'show', 'isEnabled', 'setEnabled', 'minimize', 'unminimize']
+    .map(method => [method, function () { assert.equal(this, selected); calls.push(method); return true }]))
+  const context = vm.createContext({ selectedWebview: selected, onMessage() {}, setTimeout(fn) { timers.push(fn) } })
+  const name = handler.match(/function (\w+)/)[1]
+  await vm.runInContext(`${handler}\n${name}()`, context)
+  context.selectedWebview = new Proxy({}, { get() { assert.fail('timer must not affect a newly selected sibling') } })
+  assert.equal(timers.length, 1)
+  await timers[0]()
+  assert.deepEqual(calls, { hide: ['isVisible', 'hide', 'isVisible', 'show', 'isVisible'], disable: ['isEnabled', 'setEnabled', 'isEnabled', 'setEnabled', 'isEnabled'], minimize: ['minimize', 'unminimize'] }[name])
+}
 // Exercise the real fixture helper with offline curl/file responses, never real media or app proof.
 const runner = fs.readFileSync(new URL('./example.mjs', import.meta.url), 'utf8')
 const prepareVideo = runner.match(/^function prepareVideo\([^]*?^\}/m)?.[0]

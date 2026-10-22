@@ -502,9 +502,13 @@ impl ElectronRuntime {
       .iter()
       .map(|scheme| scheme.to_string())
       .collect();
-    for scheme in custom_schemes {
-      if !schemes.iter().any(|known| known == scheme) {
-        schemes.push(scheme.clone());
+    for scheme in custom_schemes.iter().chain(&attrs.schemes) {
+      let scheme = scheme.to_ascii_lowercase();
+      if !valid_scheme(&scheme) {
+        return Err(create_window_err(format!("invalid custom URL scheme: {scheme:?}")));
+      }
+      if !schemes.contains(&scheme) {
+        schemes.push(scheme);
       }
     }
     args.push("--tauri-schemes".to_string());
@@ -538,6 +542,8 @@ pub struct Electron {
   binary: Option<PathBuf>,
   main_script: Option<PathBuf>,
   args: Vec<String>,
+  /// Extra application protocols that must be privileged before Electron starts.
+  schemes: Vec<String>,
   /// Dev server origin; `tauri://localhost` URLs are rewritten to it.
   dev_url: Option<String>,
   /// Window icon sent to Electron; defaults to the bundle icon.
@@ -567,6 +573,15 @@ impl Electron {
   /// Appended to the Electron command line (after the main script).
   pub fn arg(mut self, arg: impl Into<String>) -> Self {
     self.args.push(arg.into());
+    self
+  }
+
+  /// Privileges an application protocol before Electron starts.
+  ///
+  /// Tauri 3 alpha does not yet include builder-registered protocols in
+  /// `RuntimeInitArgs::custom_schemes`; name each of those here too.
+  pub fn custom_scheme(mut self, scheme: impl Into<String>) -> Self {
+    self.schemes.push(scheme.into());
     self
   }
 
@@ -797,6 +812,30 @@ impl ElectronRuntime {
               if crate::window::imp::menu_snapshot(owner).is_ok_and(|menu| menu_command_enabled(&menu, command)) {
                 crate::window::imp::dispatch_menu_command(owner, command);
               }
+            }
+          }
+          Some("window.themeChanged") => {
+            let params = &event["params"];
+            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
+            let Some(id) = self.context.window_for_serial(serial) else { continue };
+            let theme = match params["theme"].as_str() {
+              Some("dark") => Theme::Dark,
+              Some("light") => Theme::Light,
+              _ => continue,
+            };
+            #[cfg(windows)]
+            if let Some(dark) = params["dark"].as_bool() {
+              match self.context.native_handle(id).map_err(|error| error.to_string())
+                .and_then(|handle| crate::window::imp::set_theme(handle, dark))
+              {
+                Ok(()) => {},
+                Err(error) => eprintln!("[electron] native window theme failed: {error}"),
+              }
+            }
+            let label = self.context.windows.borrow().get(&id).map(|window| window.label.clone());
+            if let Some(label) = label {
+              self.context.emit_window_event(id, &WindowEvent::ThemeChanged(theme));
+              callback(RunEvent::WindowEvent { label, event: WindowEvent::ThemeChanged(theme) });
             }
           }
           Some("window.closeRequested") => {
@@ -1173,7 +1212,23 @@ impl ElectronRuntime {
       // messages here; Electron owns its own process, so nothing else pumps them.
       pump_thread_messages();
       #[cfg(windows)]
-      self.context.sync_window_menus();
+      {
+        for (owner, method) in crate::window::imp::take_menu_actions() {
+          let target = self.context.windows.borrow().iter().find_map(|(id, window)| {
+            window.menu_owner.as_ref().filter(|menu| menu.handle == owner)
+              .map(|_| (*id, window.serial))
+          });
+          let Some((id, serial)) = target else { continue };
+          if method == "window.close" {
+            if close_window(&self.context, id, &mut callback) {
+              break 'event_loop;
+            }
+          } else if let Err(error) = self.context.ipc.call(method, json!({ "windowId": serial }), IPC_TIMEOUT) {
+            eprintln!("[electron] native menu action failed: {error}");
+          }
+        }
+        self.context.sync_window_menus();
+      }
 
       if once {
         break;
@@ -1868,6 +1923,12 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   })
 }
 
+fn valid_scheme(scheme: &str) -> bool {
+  let mut bytes = scheme.bytes();
+  bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+    && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
 /// Extra Electron switches, e.g. `TAURI_RUNTIME_ELECTRON_ARGS="--remote-debugging-port=9222"`.
 fn extra_args(args: &[String]) -> Vec<String> {
   let mut all = args.to_vec();
@@ -2093,6 +2154,16 @@ fn menu_command_enabled(menu: &Value, command: u32) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn validates_custom_scheme_names() {
+    for scheme in ["stream", "test+v1", "a-b.c", "UPPER", "x1"] {
+      assert!(valid_scheme(scheme), "{scheme:?}");
+    }
+    for scheme in ["", "1stream", "stream,ipc", "a b", "https://", "a\n", "中文"] {
+      assert!(!valid_scheme(scheme), "{scheme:?}");
+    }
+  }
 
   #[test]
   fn selects_native_ipc_without_changing_user_scripts() {

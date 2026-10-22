@@ -166,7 +166,6 @@ export const cases = {
     await t.wait(target, `document.querySelector('#message')?.textContent ?? ''`, (value) => value.length > 0)
     t.check('helloworld greeting', await text(t, target, '#message'), 'Hello Ferris, You have been greeted from Rust!')
     await t.capture(target, 'helloworld-greeting')
-    t.note('helloworld native menu', 'The default native menu is not exposed through page CDP.')
   },
 
   async commands(t) {
@@ -229,8 +228,13 @@ export const cases = {
     const third = await targetByLabel(t, 'Third')
     t.check('multiwindow initial labels', (await Promise.all([main, secondary, third].map((target) => labelOf(t, target)))).sort(), ['Main', 'Secondary', 'Third'])
     t.check('multiwindow initial page count', (await t.targets()).filter((target) => target.type === 'page').length, 3)
+    const nativeTitles = () => t.native('state').filter(window => window.visible && window.clientWidth > 0 && window.clientHeight > 0).map(window => window.title).sort()
+    const initialTitles = ['Tauri - Main', 'Tauri - Secondary', 'Tauri - Third']
+    if (process.platform === 'win32') t.check('multiwindow native titles match configuration and Rust builder', nativeTitles(), initialTitles)
+    else t.note('multiwindow native titles', 'Native title observation requires the Windows helper on this platform.')
     await t.capture(main, 'multiwindow-main-initial')
     await t.capture(secondary, 'multiwindow-secondary-initial')
+    await t.capture(third, 'multiwindow-third-initial')
 
     const mainBefore = await text(t, main, '#messages-view')
     await sendMessage(t, main, 'Secondary', 'from Main')
@@ -253,6 +257,10 @@ export const cases = {
     await sendMessage(t, main, 'Fourth', 'from Main to Fourth')
     await t.wait(fourth, `document.querySelector('#messages-view')?.textContent ?? ''`, (value) => value.includes('from Main to Fourth'))
     t.check('multiwindow Fourth receives', (await text(t, fourth, '#messages-view')).includes('from Main to Fourth'), true)
+    if (process.platform === 'win32') {
+      t.check('multiwindow Fourth applies form title without changing sibling titles', nativeTitles(), [...initialTitles, 'QA Fourth'].sort())
+      t.native('capture', { Title: 'QA Fourth', OutputPath: path.join(t.dir, 'multiwindow-fourth-native-title.png') })
+    }
     await t.capture(fourth, 'multiwindow-fourth-received')
 
     await t.command(fourth, 'Page.close', {})
@@ -262,7 +270,7 @@ export const cases = {
       return remaining.length === 3 && !remaining.some((target) => target.id === fourth.id)
     }, 15000)
     t.check('multiwindow Fourth target closes', (await t.targets()).some((target) => target.id === fourth.id), false)
-    t.note('multiwindow native titles', 'Configured titles are native-window properties; page CDP cannot inspect them.')
+    if (process.platform === 'win32') t.check('multiwindow closing Fourth preserves native sibling windows', nativeTitles(), initialTitles)
   },
 
   async resources(t) {
@@ -336,16 +344,32 @@ export const cases = {
       target,
       `(async () => {
         const element = document.querySelector('#video_source')
-        if (!element || !element.currentSrc || !Number.isFinite(element.duration) || element.duration <= 0 || element.readyState < 2) return null
+        const state = () => ({
+          url: location.href, src: element?.getAttribute('src'),
+          sources: [...(element?.querySelectorAll('source') ?? [])].map(source => source.src),
+          currentSrc: element?.currentSrc, duration: element?.duration,
+          readyState: element?.readyState, networkState: element?.networkState,
+          decodedFrames: element?.getVideoPlaybackQuality?.().totalVideoFrames ?? element?.webkitDecodedFrameCount,
+          canPlayType: element?.canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"'),
+          error: element?.error && { code: element.error.code, message: element.error.message },
+          resources: performance.getEntriesByType('resource').filter(entry => entry.initiatorType === 'video' || entry.name.startsWith('stream:')).map(entry => ({ url: entry.name, status: entry.responseStatus, duration: entry.duration, bytes: entry.transferSize })),
+        })
+        if (element?.error) throw new Error('streaming media failed: ' + JSON.stringify(state()))
+        if (!element || !element.currentSrc || !Number.isFinite(element.duration) || element.duration <= 0 || element.readyState < 2) return state()
         element.muted = true
         let frames = 0
         const frame = () => { frames += 1; if (frames < 3 && element.requestVideoFrameCallback) element.requestVideoFrameCallback(frame) }
         if (element.requestVideoFrameCallback) element.requestVideoFrameCallback(frame)
         const before = element.currentTime
-        await element.play()
+        try { await element.play() }
+        catch (error) { throw new Error('streaming play failed: ' + error.message + '; ' + JSON.stringify(state())) }
         const deadline = performance.now() + 10000
-        while (performance.now() < deadline && (element.currentTime <= before || frames < 1)) await new Promise((resolve) => setTimeout(resolve, 50))
-        return { src: element.currentSrc, duration: element.duration, before, after: element.currentTime, frames, readyState: element.readyState }
+        while (performance.now() < deadline && (element.currentTime <= before || frames < 1)) {
+          if (element.error) throw new Error('streaming media failed: ' + JSON.stringify(state()))
+          await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+        if (element.error) throw new Error('streaming media failed: ' + JSON.stringify(state()))
+        return { ...state(), src: element.currentSrc, before, after: element.currentTime, frames }
       })()`,
       (value) => value && value.duration > 0 && value.after > value.before && value.frames > 0,
       90000,

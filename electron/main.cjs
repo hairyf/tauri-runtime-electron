@@ -21,7 +21,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
-const logFile = path.join(os.tmpdir(), 'tauri-runtime-electron.log')
+const logFile = process.env.TAURI_RUNTIME_ELECTRON_LOG ?? path.join(os.tmpdir(), 'tauri-runtime-electron.log')
 function log(...args) {
   fs.appendFileSync(logFile, `${new Date().toISOString()} ${args.join(' ')}\n`)
 }
@@ -184,6 +184,8 @@ const maximizableState = new WeakMap()
 const minimizableState = new WeakMap()
 /** BrowserWindow -> `{ css, key }` of the injected page-wide `cursor` rule. */
 const cursorCssKey = new WeakMap()
+// Tauri constrains the content area; Electron's public min/max APIs include the frame.
+const sizeConstraints = new WeakMap()
 /** webviewId -> BrowserWindow */
 const webviews = new Map()
 /** webContents id -> webviewId (for routing `tauri-ipc` messages) */
@@ -319,7 +321,6 @@ function serializeError(error) {
 const UNSUPPORTED_WINDOW_OPTIONS = [
   ['windowClassname', undefined], // Electron creates its own Win32 window class
   ['noRedirectionBitmap', false], // creation-time DWM style Electron does not expose
-  ['theme', undefined], // nativeTheme is app-wide, not per window
   ['additionalBrowserArgs', undefined], // would need a process relaunch
   ['browserExtensionsEnabled', false], // session-wide launch flags
   ['dataStoreIdentifier', undefined], // Electron partitions are string-keyed
@@ -404,10 +405,6 @@ function browserWindowOptions(config, params, iconImage, iconPath) {
   set('alwaysOnTop', config.alwaysOnTop === true)
   set('skipTaskbar', config.skipTaskbar === true)
   set('autoHideMenuBar', true)
-  set('minWidth', config.minWidth && Math.round(config.minWidth))
-  set('minHeight', config.minHeight && Math.round(config.minHeight))
-  set('maxWidth', config.maxWidth && Math.round(config.maxWidth))
-  set('maxHeight', config.maxHeight && Math.round(config.maxHeight))
   set('backgroundColor', cssColor(config.backgroundColor))
   set('hasShadow', config.shadow !== false)
   set('titleBarStyle', titleBarStyleOf(config))
@@ -440,13 +437,15 @@ function browserWindowOptions(config, params, iconImage, iconPath) {
 
 /** Config Electron can only apply once the window exists. */
 function applyWindowConfig(window, config, params) {
-  // Creating the window can pad the content area by a frame border; Tauri's
-  // `inner_size` must be exact, so state it once more as the content size.
+  const constraints = {}
+  for (const key of ['minWidth', 'minHeight', 'maxWidth', 'maxHeight']) {
+    if (typeof config[key] === 'number') constraints[key] = Math.max(0, Math.round(config[key]))
+  }
+  sizeConstraints.set(window, constraints)
+  applySizeConstraints(window)
+  // Tauri's size and constraints both describe the content area.
   if (typeof config.width === 'number' && typeof config.height === 'number') {
-    window.setContentSize(
-      Math.max(1, Math.round(config.width)),
-      Math.max(1, Math.round(config.height)),
-    )
+    setWindowSize(window, { width: config.width, height: config.height })
   }
   if (config.maximized && config.fullscreen !== true) window.maximize()
   if (config.focus && config.focusable !== false && config.visible !== false) window.focus()
@@ -534,6 +533,112 @@ async function setWindowCursorCss(window, css) {
   await applyWindowCursorCss(window)
 }
 
+// Electron's nativeTheme is app-wide. CDP changes Chromium's real media queries
+// per WebContents, including CSS and matchMedia; no page APIs are replaced.
+const windowThemeState = new WeakMap()
+const themeDebuggers = new WeakSet()
+
+function windowThemeOverride(theme) {
+  if (theme === 'dark' || theme === 'light') return theme
+  if (theme == null || theme === 'system') return null
+  throw new Error(`invalid window theme ${theme}`)
+}
+
+async function readWindowTheme(window) {
+  const contents = window.webContents
+  // Before the first document commits there is no renderer preference to query.
+  // Do not wait on it: Rust may still be servicing creation/menu callbacks.
+  const dark = contents.getURL()
+    ? await contents.mainFrame.executeJavaScript("matchMedia('(prefers-color-scheme: dark)').matches")
+    : nativeTheme.shouldUseDarkColors
+  return { theme: dark ? 'dark' : 'light' }
+}
+
+async function notifyWindowTheme(window, windowId) {
+  if (window.isDestroyed()) return
+  const { theme } = await readWindowTheme(window)
+  if (!window.isDestroyed()) send({
+    event: 'window.themeChanged',
+    params: { windowId, theme, dark: theme === 'dark' && !nativeTheme.shouldUseHighContrastColors },
+  })
+}
+
+async function emulateContentsTheme(contents, theme) {
+  if (contents.isDestroyed()) return
+  const debugger_ = contents.debugger
+  if (!themeDebuggers.has(contents)) {
+    if (theme === null) return
+    // Never send emulation commands through somebody else's debugger session.
+    if (debugger_.isAttached()) throw new Error('window theme cannot use an existing debugger session')
+    debugger_.attach()
+    themeDebuggers.add(contents)
+  }
+  await debugger_.sendCommand('Emulation.setEmulatedMedia', {
+    features: theme === null ? [] : [{ name: 'prefers-color-scheme', value: theme }],
+  })
+  if (theme === null && themeDebuggers.has(contents)) {
+    themeDebuggers.delete(contents)
+    debugger_.detach()
+  }
+}
+
+function setWindowTheme(window, theme) {
+  theme = windowThemeOverride(theme)
+  const state = windowThemeState.get(window)
+  // Serialize calls so a slow earlier request cannot overwrite a later one.
+  const pending = state.pending.then(async () => {
+    const previous = state.theme
+    state.theme = theme
+    try {
+      await Promise.all([...state.contents].map((contents) => emulateContentsTheme(contents, theme)))
+      await notifyWindowTheme(window, state.windowId)
+    } catch (error) {
+      state.theme = previous
+      await Promise.all([...state.contents].map((contents) =>
+        emulateContentsTheme(contents, previous).catch((rollbackError) => log('window.theme rollback failed', serializeError(rollbackError)))))
+      throw error
+    }
+    return null
+  })
+  state.pending = pending.catch(() => {})
+  return pending
+}
+
+function watchThemeContents(window, contents) {
+  const state = windowThemeState.get(window)
+  state.contents.add(contents)
+  contents.once('destroyed', () => state.contents.delete(contents))
+  contents.debugger.on('detach', () => {
+    if (!themeDebuggers.delete(contents)) return
+    // Do not fight DevTools or an external debugger by immediately reattaching.
+    log('window.theme debugger detached', state.windowId)
+    notifyWindowTheme(window, state.windowId).catch((error) => log('window.theme', serializeError(error)))
+  })
+  contents.on('devtools-closed', () => {
+    if (state.theme !== null && !contents.debugger.isAttached()) {
+      setWindowTheme(window, state.theme).catch((error) => log('window.theme', serializeError(error)))
+    }
+  })
+  // CDP retains emulation across navigation and renderer swaps. A new guest is
+  // a separate target, so apply its owner's override before its app navigation.
+  if (state.theme !== null) {
+    emulateContentsTheme(contents, state.theme).catch((error) => log('window.theme guest', serializeError(error)))
+  }
+}
+
+function installWindowTheme(window, windowId, theme) {
+  windowThemeState.set(window, { windowId, theme: null, contents: new Set(), pending: Promise.resolve() })
+  watchThemeContents(window, window.webContents)
+  window.webContents.on('did-attach-webview', (_event, guest) => watchThemeContents(window, guest))
+  const notify = () => notifyWindowTheme(window, windowId).catch((error) => log('window.theme', serializeError(error)))
+  window.webContents.on('dom-ready', notify)
+  nativeTheme.on('updated', notify)
+  window.once('closed', () => nativeTheme.off('updated', notify))
+  // A debugger command can wait for first navigation. Creation must return so
+  // Rust can service its protocol requests; never await this in createWindow.
+  setWindowTheme(window, theme).catch((error) => log('window.theme config', serializeError(error)))
+}
+
 async function createWindow(params) {
   const { windowId } = params
   const config = params.window ?? {}
@@ -564,6 +669,7 @@ async function createWindow(params) {
   const contentsId = window.webContents.id
 
   applyWindowConfig(window, config, params)
+  installWindowTheme(window, windowId, config.theme)
 
   // Electron destroys the window on `close`; Tauri decides instead (an app may
   // `prevent_close` and keep the window around, e.g. hiding to the tray), so
@@ -971,11 +1077,37 @@ function toDip(window, params, key) {
   return params.physical ? Math.round(value / scaleOf(window)) : Math.round(value)
 }
 
+function applySizeConstraints(window) {
+  const constraints = sizeConstraints.get(window)
+  if (!constraints) return
+  const bounds = window.getBounds()
+  const content = window.getContentBounds()
+  const frameWidth = Math.max(0, bounds.width - content.width)
+  const frameHeight = Math.max(0, bounds.height - content.height)
+  const outer = (value, frame) => value > 0 ? value + frame : 0
+  window.setMinimumSize(outer(constraints.minWidth, frameWidth), outer(constraints.minHeight, frameHeight))
+  window.setMaximumSize(outer(constraints.maxWidth, frameWidth), outer(constraints.maxHeight, frameHeight))
+}
+
+function setSizeConstraint(window, kind, params) {
+  const constraints = sizeConstraints.get(window) ?? {}
+  constraints[`${kind}Width`] = Math.max(0, toDip(window, params, 'width') ?? 0)
+  constraints[`${kind}Height`] = Math.max(0, toDip(window, params, 'height') ?? 0)
+  sizeConstraints.set(window, constraints)
+  applySizeConstraints(window)
+  const [width, height] = window.getContentSize()
+  setWindowSize(window, { width, height })
+}
+
 function setWindowSize(window, params) {
-  const width = toDip(window, params, 'width')
-  const height = toDip(window, params, 'height')
+  let width = toDip(window, params, 'width')
+  let height = toDip(window, params, 'height')
   if (width === undefined || height === undefined) return
-  window.setContentSize(Math.max(1, width), Math.max(1, height))
+  const constraints = sizeConstraints.get(window) ?? {}
+  const clamp = (value, min, max) => Math.max(1, min || 0, max > 0 ? Math.min(value, max) : value)
+  width = clamp(width, constraints.minWidth, constraints.maxWidth)
+  height = clamp(height, constraints.minHeight, constraints.maxHeight)
+  window.setContentSize(width, height)
 }
 
 function setWindowPosition(window, params) {
@@ -1007,7 +1139,10 @@ function setWindowMenu(windowId, menu) {
     return entry
   })
   window.setMenu(menu === null ? null : Menu.buildFromTemplate(template(menu)))
-  if (menu !== null) window.setMenuBarVisibility(true)
+  if (menu !== null) {
+    window.setAutoHideMenuBar(false)
+    window.setMenuBarVisibility(true)
+  }
   return null
 }
 
@@ -1045,22 +1180,12 @@ function handle(method, params) {
     case 'window.position':
       setWindowPosition(findWindow(params.windowId), params)
       return null
-    case 'window.minSize': {
-      const window = findWindow(params.windowId)
-      if (!params.width) return window.setMinimumSize(0, 0)
-      return window.setMinimumSize(
-        toDip(window, params, 'width') ?? 0,
-        toDip(window, params, 'height') ?? 0,
-      )
-    }
-    case 'window.maxSize': {
-      const window = findWindow(params.windowId)
-      if (!params.width) return window.setMaximumSize(0, 0)
-      return window.setMaximumSize(
-        toDip(window, params, 'width') ?? 0,
-        toDip(window, params, 'height') ?? 0,
-      )
-    }
+    case 'window.minSize':
+      setSizeConstraint(findWindow(params.windowId), 'min', params)
+      return null
+    case 'window.maxSize':
+      setSizeConstraint(findWindow(params.windowId), 'max', params)
+      return null
     case 'window.resizable':
       findWindow(params.windowId).setResizable(params.resizable)
       return null
@@ -1306,10 +1431,8 @@ function handle(method, params) {
     case 'window.backgroundColor':
       findWindow(params.windowId).setBackgroundColor(params.color)
       return null
-    case 'window.theme': {
-      nativeTheme.themeSource = params.theme === 'dark' ? 'dark' : params.theme === 'light' ? 'light' : 'system'
-      return null
-    }
+    case 'window.theme':
+      return setWindowTheme(findWindow(params.windowId), params.theme)
     case 'window.ignoreCursorEvents':
       findWindow(params.windowId).setIgnoreMouseEvents(params.ignore, { forward: true })
       return null
@@ -1328,7 +1451,7 @@ function handle(method, params) {
       decoratedState.set(findWindow(params.windowId), params.decorations !== false)
       return null
     case 'window.themeQuery':
-      return { theme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light' }
+      return readWindowTheme(findWindow(params.windowId))
     case 'app.focus':
       app.focus({ steal: params.steal === true })
       return null

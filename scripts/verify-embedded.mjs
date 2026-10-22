@@ -82,7 +82,7 @@ function dragPoint({ number, selector }) {
     for (let x = left; x <= right; x += Math.max(1, Math.min(12, (right - left) / 8))) {
       if (document.elementFromPoint(x, y) !== element) continue
       window.__verifyEmbeddedDrag.expected = element
-      window.__verifyEmbeddedDrag.events.length = 0
+      for (const name of ['events', 'handlers', 'invokes']) window.__verifyEmbeddedDrag[name].length = 0
       return { x, y, dpr: devicePixelRatio, viewport: { width: innerWidth, height: innerHeight },
         target: { tag: element.tagName, role: element.getAttribute('role'), attr: element.getAttribute('data-tauri-drag-region'), text: element.textContent.trim() } }
     }
@@ -123,6 +123,30 @@ function dragListeners() {
     }))])) }
 }
 
+async function observeDragInvokes(cdp) {
+  // False conditions act as logpoints: original functions continue immediately.
+  // No listener/invoke replacement and no debugger pause during desktop input.
+  const watches = [
+    { expression: `getEventListeners(document).mousedown.find(e => String(e.listener).includes('isDragRegion')).listener`,
+      condition: `(() => { window.__verifyEmbeddedDrag?.handlers.push({
+        time: performance.now(), trusted: e.isTrusted, button: e.button, detail: e.detail,
+        bubbles: e.bubbles, region: isDragRegion(e.composedPath()), osName,
+        htmlTarget: e.target instanceof window.HTMLElement, pageDocument: e.currentTarget === document
+      }); return false })()` },
+    { expression: 'window.__TAURI_INTERNALS__.invoke',
+      condition: `(() => { if (cmd === 'plugin:window|start_dragging' || cmd === 'plugin:window|internal_toggle_maximize')
+        window.__verifyEmbeddedDrag?.invokes.push({ cmd, time: performance.now(), stack: new Error().stack }); return false })()` },
+  ]
+  const ids = []
+  for (const watch of watches) {
+    const result = await cdp.send('Runtime.evaluate', { expression: watch.expression, includeCommandLineAPI: true, objectGroup: 'drag-observer' })
+    assert(result.result?.objectId && !result.exceptionDetails, `cannot observe original drag function: ${watch.expression}`)
+    const breakpoint = await cdp.send('Debugger.setBreakpointOnFunctionCall', { objectId: result.result.objectId, condition: watch.condition })
+    ids.push(breakpoint.breakpointId)
+  }
+  return ids
+}
+
 async function directToggleProbe(t, target) {
   const evidence = { command: 'plugin:window|internal_toggle_maximize', before: await nativeWindow(t) }
   const toggle = async () => {
@@ -150,7 +174,7 @@ export async function verifyDrag(t) {
       || (event.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(event.params.type))) rendererEvents.push(event)
   })
   try {
-    await Promise.all([cdp.send('Runtime.enable'), cdp.send('Log.enable')])
+    await Promise.all([cdp.send('Runtime.enable'), cdp.send('Log.enable'), cdp.send('Debugger.enable')])
     save(t, 'drag-initial-listeners', await cdp.send('Runtime.evaluate', {
       expression: `(${dragListeners})()`, includeCommandLineAPI: true, returnByValue: true,
     }))
@@ -159,13 +183,19 @@ export async function verifyDrag(t) {
     await t.capture(target, 'drag-before')
     save(t, 'drag-before-native-state', await desktop(t, 'drag-before'))
     await t.evaluate(target, `(() => {
-      const state = { expected: null, events: [] }
-      state.listener = (event) => state.events.push({ type: event.type, trusted: event.isTrusted,
-        matches: event.target === state.expected, detail: event.detail, x: event.clientX, y: event.clientY,
-        tag: event.target.tagName, role: event.target.getAttribute?.('role'), attr: event.target.getAttribute?.('data-tauri-drag-region') })
+      const state = { expected: null, events: [], handlers: [], invokes: [] }
+      state.listener = (event) => {
+        const entry = { type: event.type, time: performance.now(), trusted: event.isTrusted,
+          button: event.button, buttons: event.buttons, bubbles: event.bubbles,
+          matches: event.target === state.expected, detail: event.detail, x: event.clientX, y: event.clientY,
+          tag: event.target.tagName, role: event.target.getAttribute?.('role'), attr: event.target.getAttribute?.('data-tauri-drag-region') }
+        state.events.push(entry)
+        queueMicrotask(() => { entry.defaultPrevented = event.defaultPrevented })
+      }
       for (const type of ['mousedown', 'dblclick', 'focusin']) document.addEventListener(type, state.listener, { capture: true, passive: true })
       window.__verifyEmbeddedDrag = state
     })()`)
+    await observeDragInvokes(cdp)
     for (const [number, name, selector, shouldMove] of dragCases) {
       await t.native('place')
       const point = await page(t, target, dragPoint, { number, selector })
@@ -177,14 +207,17 @@ export async function verifyDrag(t) {
       await t.capture(target, `${label}-before`)
       const motion = await t.native('drag', { X: Math.round(point.x * point.dpr), Y: Math.round(point.y * point.dpr), Dx: 60, Dy: 35 })
       assert(motion?.before && motion?.after, 'native drag must return before/after states')
-      const events = await t.evaluate(target, 'window.__verifyEmbeddedDrag.events')
+      const { events, handlers, invokes } = await t.evaluate(target, `(() => { const { events, handlers, invokes } = window.__verifyEmbeddedDrag; return { events, handlers, invokes } })()`)
       const dx = motion.after.x - motion.before.x, dy = motion.after.y - motion.before.y
-      const evidence = { number, name, selector, shouldMove, point, motion, dx, dy, events }
+      const evidence = { number, name, selector, shouldMove, point, motion, dx, dy, events, handlers, invokes }
       results.push(evidence)
       save(t, `${label}-motion`, evidence)
       await t.capture(target, `${label}-after`)
       checks.check(`${label} receives real native mousedown on exact target`,
         events.some((e) => e.type === 'mousedown' && e.trusted && e.matches), true)
+      checks.check(`${label} original bubble handler receives trusted input`, handlers.some((e) => e.trusted && e.button === 0 && e.detail === 1 && e.pageDocument), true)
+      checks.check(`${label} original region gate matches source QA`, handlers.some((e) => e.region), shouldMove)
+      checks.check(`${label} original handler issues only source-expected drag invoke`, invokes.map((entry) => entry.cmd), shouldMove ? ['plugin:window|start_dragging'] : [])
       checks.check(`${label} preserves window size`, [motion.after.width, motion.after.height], [motion.before.width, motion.before.height])
       checks.check(`${label} ${shouldMove ? 'moves native window by desktop drag' : 'does not move native window'}`,
         shouldMove ? Math.abs(dx - 60) <= 12 && Math.abs(dy - 35) <= 12 : dx === 0 && dy === 0, true)
@@ -195,9 +228,10 @@ export async function verifyDrag(t) {
       await t.native('place')
       const point = await page(t, target, dragPoint, { number, selector })
       const motion = await t.native('doubleclick', { X: Math.round(point.x * point.dpr), Y: Math.round(point.y * point.dpr) })
-      const events = await t.evaluate(target, 'window.__verifyEmbeddedDrag.events')
-      save(t, `drag-doubleclick-${name}`, { point, motion, events })
+      const { events, handlers, invokes } = await t.evaluate(target, `(() => { const { events, handlers, invokes } = window.__verifyEmbeddedDrag; return { events, handlers, invokes } })()`)
+      save(t, `drag-doubleclick-${name}`, { point, motion, events, handlers, invokes })
       checks.check(`doubleclick ${name} reaches exact non-region target`, events.some((e) => e.type === 'mousedown' && e.trusted && e.matches && e.detail === 2), true)
+      checks.check(`doubleclick ${name} original handler issues no drag/maximize invoke`, invokes, [])
       checks.check(`doubleclick ${name} does not maximize or move`, rect(motion.after), rect(motion.before))
       await t.capture(target, `drag-doubleclick-${name}-after`)
     }
@@ -207,16 +241,20 @@ export async function verifyDrag(t) {
     await t.capture(target, 'drag-doubleclick-region-before')
     await desktop(t, 'drag-doubleclick-region-before')
     const maximized = await t.native('doubleclick', { X: Math.round(point.x * point.dpr), Y: Math.round(point.y * point.dpr) })
-    const events = await t.evaluate(target, 'window.__verifyEmbeddedDrag.events')
-    save(t, 'drag-doubleclick-maximized-state', { point, maximized, events })
+    const { events, handlers, invokes } = await t.evaluate(target, `(() => { const { events, handlers, invokes } = window.__verifyEmbeddedDrag; return { events, handlers, invokes } })()`)
+    save(t, 'drag-doubleclick-maximized-state', { point, maximized, events, handlers, invokes })
     await t.capture(target, 'drag-doubleclick-maximized')
     await desktop(t, 'drag-doubleclick-maximized')
     checks.check('QA10 native doubleclick reaches bare region itself', events.some((e) => e.type === 'mousedown' && e.trusted && e.matches && e.detail === 2), true)
+    checks.check('QA10 original handler receives trusted doubleclick in page realm', handlers.some((e) => e.trusted && e.detail === 2 && e.region && e.htmlTarget && e.pageDocument), true)
+    checks.check('QA10 original handler issues drag then maximize', invokes.map((entry) => entry.cmd), ['plugin:window|start_dragging', 'plugin:window|internal_toggle_maximize'])
     checks.check('QA10 native doubleclick actually enlarges native client area',
       maximized.after.clientWidth > maximized.before.clientWidth + 40 && maximized.after.clientHeight > maximized.before.clientHeight + 40, true)
     point = await page(t, target, dragPoint, { number: 10, selector: '.qa-testable' })
     const restored = await t.native('doubleclick', { X: Math.round(point.x * point.dpr), Y: Math.round(point.y * point.dpr) })
-    save(t, 'drag-doubleclick-restored-state', { point, restored })
+    const restoreRoute = await t.evaluate(target, `(() => { const { events, handlers, invokes } = window.__verifyEmbeddedDrag; return { events, handlers, invokes } })()`)
+    save(t, 'drag-doubleclick-restored-state', { point, restored, ...restoreRoute })
+    checks.check('QA10 second original doubleclick invokes maximize toggle', restoreRoute.invokes.map((entry) => entry.cmd), ['plugin:window|start_dragging', 'plugin:window|internal_toggle_maximize'])
     checks.check('QA10 second native doubleclick restores original dimensions',
       [restored.after.width, restored.after.height], [maximized.before.width, maximized.before.height])
     await t.capture(target, 'drag-doubleclick-restored')
@@ -625,6 +663,22 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
   assert.throws(() => nativeFetchCallSite(`${nativeFetch}\n${nativeFetch}`, '8'))
   assert.equal(compact('(payload) => { return payload };'), '(payload)=>{returnpayload}')
   assert.deepEqual([...new Set(dragCases.map(([number]) => number))], Array.from({ length: 16 }, (_, i) => i + 1))
+  const conditions = []
+  await observeDragInvokes({ async send(method, params) {
+    if (method === 'Runtime.evaluate') return { result: { objectId: String(conditions.length) } }
+    assert.equal(method, 'Debugger.setBreakpointOnFunctionCall')
+    conditions.push(params.condition)
+    return { breakpointId: String(conditions.length) }
+  } })
+  const document = {}, win = { HTMLElement: class {}, __verifyEmbeddedDrag: { handlers: [], invokes: [] } }
+  const event = { isTrusted: true, button: 0, detail: 1, bubbles: true, target: new win.HTMLElement(), currentTarget: document, composedPath: () => [] }
+  assert.equal(Function('e', 'window', 'isDragRegion', 'osName', 'document', `return ${conditions[0]}`)(event, win, () => true, 'windows', document), false)
+  assert.equal(win.__verifyEmbeddedDrag.handlers[0].region, true)
+  assert.equal(win.__verifyEmbeddedDrag.handlers[0].pageDocument, true)
+  for (const cmd of ['plugin:window|start_dragging', 'plugin:window|internal_toggle_maximize', 'unrelated']) {
+    assert.equal(Function('cmd', 'window', `return ${conditions[1]}`)(cmd, win), false)
+  }
+  assert.deepEqual(win.__verifyEmbeddedDrag.invokes.map((e) => e.cmd), ['plugin:window|start_dragging', 'plugin:window|internal_toggle_maximize'])
   for (const outcome of ['changed', 'unchanged', 'rejected']) {
     const original = { x: 120, y: 80, width: 816, height: 639, clientWidth: 800, clientHeight: 600, visible: true }
     let maximized = false, calls = 0

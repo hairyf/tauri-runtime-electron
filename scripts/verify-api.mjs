@@ -1,16 +1,29 @@
 import { readFileSync } from 'node:fs'
+import { verifyStartupTray } from './verify-native-cases.mjs'
 const json = JSON.stringify
 const consoleRows = `Array.from(document.querySelectorAll('#console pre'), e => e.textContent.replace(/^\\[[^\\]]+\\]:\\s*/, '').trim())`
 const currentWindow = 'window.__TAURI__.window.getCurrentWindow()'
 const heading = (text) => `[...document.querySelectorAll('main h4')].find(e => e.textContent.trim() === ${json(text)})`
 const field = (text) => `[...document.querySelectorAll('main label, main div')].find(e => [...e.childNodes].filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join(' ').trim() === ${json(text)} && e.querySelector('input'))?.querySelector('input')`
-// node scripts/verify-api.mjs --self-check tests console parsing without starting an app.
+const windowToggles = [
+  ['Resizable', 'isResizable', true], ['Maximizable', 'isMaximizable', true],
+  ['Minimizable', 'isMinimizable', true], ['Closable', 'isClosable', true],
+  ['Has decorations', 'isDecorated', true], ['Maximized', 'isMaximized', false],
+  ['Fullscreen', 'isFullscreen', false],
+]
+const geometry = `Promise.all([${currentWindow}.outerPosition(), ${currentWindow}.outerSize(), window.__TAURI__.window.currentMonitor()]).then(([p,s,m]) => ({ x:p.x, y:p.y, width:s.width, height:s.height, workArea:m?.workArea }))`
+const centered = ({ x, y, width, height, workArea }) => Boolean(workArea)
+  && Math.abs(x + width / 2 - workArea.position.x - workArea.size.width / 2) <= 2
+  && Math.abs(y + height / 2 - workArea.position.y - workArea.size.height / 2) <= 2
+// Offline helper checks only: no application startup, staging or UI proof.
 if (process.argv.includes('--self-check')) {
   const rows = Function('document', 'return ' + consoleRows)({
     querySelectorAll: () => ['[1:23:45 AM]: {"message":"ok"}', '[13:23:45]: 1000'].map(textContent => ({ textContent }))
   })
   if (json(rows) !== json(['{"message":"ok"}', '1000'])) throw new Error('Console timestamp parsing failed: ' + json(rows))
-  console.log('API console parser self-check passed (no UI verification performed)')
+  const bounds = { x:-1020, y:160, width:800, height:600, workArea:{ position:{ x:-1580, y:40 }, size:{ width:1920, height:840 } } }
+  if (!centered(bounds) || centered({ ...bounds, y:180 }) || centered({ ...bounds, workArea:null })) throw new Error('Window centering geometry check failed')
+  console.log('API console and window geometry self-check passed (no UI verification performed)')
 }
 // Resolve existing, text-labelled controls without adding attributes or replacing DOM.
 async function selector(t, target, expression) {
@@ -68,6 +81,178 @@ async function displayedSize(t, target, expected) {
   })()`
   t.check('Window resize event updates displayed physical size',
     await t.wait(target, expression, (value) => json(value) === json(expected)), expected)
+}
+async function verifyWindowControls(t, main, child, childSize, scale) {
+  const childTitle = await t.evaluate(child, `${currentWindow}.title()`)
+  const mainPosition = await t.evaluate(main, `${currentWindow}.outerPosition().then(p => [p.x,p.y])`)
+  const originalPosition = await t.evaluate(child, `${currentWindow}.outerPosition().then(p => [p.x,p.y])`)
+  const originalTheme = await t.evaluate(child, `${currentWindow}.theme()`)
+  const mainMedia = await t.evaluate(main, `matchMedia('(prefers-color-scheme: dark)').matches`)
+  const workArea = (await t.evaluate(child, geometry)).workArea
+  const failures = []
+  const attempt = async (operation) => {
+    try { await operation() }
+    catch (error) {
+      failures.push(error)
+      try {
+        await t.capture(main, `api-window-failure-${failures.length}-controls`)
+        await t.capture(child, `api-window-failure-${failures.length}-child`)
+      } catch (captureError) { failures.push(captureError) }
+    }
+  }
+  const sizeExpression = `${currentWindow}.innerSize().then(s => [s.width,s.height])`
+  const positionExpression = `${currentWindow}.outerPosition().then(p => [p.x,p.y])`
+  const capture = async (name) => {
+    await t.capture(main, `api-window-${name}-controls`)
+    await t.capture(child, `api-window-${name}-child`)
+    if (process.platform === 'win32' && t.native) await t.native('capture', { Title:childTitle, OutputPath:`${t.dir}/api-window-${name}-native.png` })
+  }
+  const dimensions = async (width, height) => {
+    await setValue(t, main, field('Width'), width)
+    await setValue(t, main, field('Height'), height, true)
+  }
+  const position = async ([x,y]) => {
+    await setValue(t, main, field('X'), x)
+    await setValue(t, main, field('Y'), y, true)
+  }
+  const displayedPosition = async (expected) => {
+    const expression = `(() => {
+      const title = [...document.querySelectorAll('main div')].find(e => e.textContent.trim() === 'Outer Position')
+      return title ? [...title.parentElement.querySelectorAll('span')].map(e => Number(e.textContent.split(':')[1])) : []
+    })()`
+    t.check('Window move event updates displayed outer position', await t.wait(main, expression, value => json(value) === json(expected)), expected)
+  }
+  try {
+    await attempt(async () => {
+      const moved = [originalPosition[0] + Math.round(24 * scale), originalPosition[1] + Math.round(24 * scale)]
+      await position(moved)
+      t.check('Window X/Y controls move selected child', await t.wait(child, positionExpression, value => json(value) === json(moved)), moved)
+      await displayedPosition(moved)
+      t.check('Window child move leaves main position unchanged', await t.evaluate(main, positionExpression), mainPosition)
+      await capture('moved')
+    })
+    await attempt(async () => {
+      await t.button(main, 'Center')
+      const bounds = await t.wait(child, geometry, centered)
+      t.check('Window Center aligns child with monitor work area', centered(bounds), true)
+      await displayedPosition([bounds.x,bounds.y])
+      await capture('centered')
+    })
+
+    for (const [button, getter, active, restore, rows] of [
+      ['Minimize', 'isMinimized', true, 'unminimize()', null],
+      ['Hide', 'isVisible', false, 'show()', ['window is visible','window is invisible','window is visible']],
+      ['Disable', 'isEnabled', false, 'setEnabled(true)', ['window is enabled','window is disabled','window is enabled']],
+    ]) {
+      await attempt(async () => {
+        await clear(t, main)
+        try {
+          await t.button(main, button)
+          // Observe the real transient before any cold native helper can consume its 2s interval.
+          await assertWindow(t, child, `Window ${button} enters native transient state`, getter, active)
+          await assertWindow(t, main, `Window ${button} leaves controller usable`, getter, !active)
+          await t.capture(main, `api-window-${button.toLowerCase()}-observed`)
+          await assertWindow(t, child, `Window ${button} source timer restores child`, getter, !active)
+          if (rows) await expectRows(t, main, `Window ${button} source observations`, rows)
+          await capture(`${button.toLowerCase()}-restored`)
+        } finally {
+          // Recovery is cleanup only; the source timer must pass before this setter runs.
+          await t.evaluate(child, `${currentWindow}.${restore}`)
+        }
+      })
+    }
+
+    for (const [label, getter, initial] of windowToggles) {
+      if (process.platform === 'linux' && ['Maximizable','Minimizable'].includes(label)) {
+        t.note(`Window ${label}`, 'The pinned Tauri API does not support native maximize/minimize button state on Linux.')
+        continue
+      }
+      if (label === 'Has decorations' && process.platform !== 'win32') {
+        t.note('Window decorations', 'Changing an existing BrowserWindow frame is implemented only on Windows by this runtime.')
+        continue
+      }
+      await attempt(async () => {
+        const control = field(label)
+        await assertWindow(t, child, `Window ${label} initial native state`, getter, initial)
+        try {
+          await t.click(main, await selector(t, main, control))
+          await assertWindow(t, child, `Window ${label} checkbox changes selected child`, getter, !initial)
+          t.check(`Window ${label} checkbox reflects changed state`, await t.evaluate(main, `(${control}).checked`), !initial)
+          if (label === 'Maximized') {
+            const size = await t.wait(child, sizeExpression, value => value[0] > childSize[0] || value[1] > childSize[1])
+            t.check('Window Maximized enlarges child client area', size[0] > childSize[0] || size[1] > childSize[1], true)
+          }
+          if (label === 'Fullscreen') {
+            const monitor = await t.evaluate(child, 'window.__TAURI__.window.currentMonitor()')
+            const expected = [monitor.size.width,monitor.size.height]
+            const size = await t.wait(child, `${currentWindow}.outerSize().then(s => [s.width,s.height])`, value => json(value) === json(expected))
+            t.check('Window Fullscreen covers selected monitor', size, expected)
+          }
+          await capture(label.toLowerCase().replaceAll(' ', '-'))
+        } finally {
+          if (await t.evaluate(main, `(${control}).checked`) !== initial) await t.click(main, await selector(t, main, control))
+          await assertWindow(t, child, `Window ${label} restored`, getter, initial)
+        }
+        await capture(`${label.toLowerCase().replaceAll(' ', '-')}-restored`)
+      })
+    }
+
+    await attempt(async () => {
+      try {
+        for (const [previous, next] of [['auto','dark'],['dark','light'],['light','auto']]) {
+          await t.button(main, `Switch Theme (${previous})`)
+          await assertWindow(t, child, `Window Switch Theme ${next} changes selected child`, 'theme', next === 'auto' ? originalTheme : next)
+          const dark = next === 'auto' ? originalTheme === 'dark' : next === 'dark'
+          t.check(`Window ${next} theme reaches real child media query`, await t.wait(child, `matchMedia('(prefers-color-scheme: dark)').matches`, value => value === dark), dark)
+          t.check('Window child theme leaves controller media query unchanged', await t.evaluate(main, `matchMedia('(prefers-color-scheme: dark)').matches`), mainMedia)
+          await capture(`theme-${next}`)
+        }
+      } finally {
+        try {
+          for (const theme of ['dark','light']) {
+            if (await t.evaluate(main, `Array.from(document.querySelectorAll('main button')).some(e => e.textContent.trim() === ${json(`Switch Theme (${theme})`)})`)) await t.button(main, `Switch Theme (${theme})`)
+          }
+        } finally { await t.evaluate(child, `${currentWindow}.setTheme(null)`) }
+      }
+    })
+
+    // Source requires max width >800 and max height >400; fit the request and native frame.
+    const maxWidth = Math.min(900, Math.floor(workArea.size.width / scale) - 64)
+    const maxHeight = Math.min(560, Math.floor(workArea.size.height / scale) - 96)
+    for (const [kind, width, height, delta] of [['Min',600,440,-40], ['Max',maxWidth,maxHeight,24]]) {
+      if (kind === 'Max' && (width <= 800 || height <= 400)) {
+        t.note('Window maximum size', 'Monitor work area cannot fit the source-required maximum dimensions plus the native frame.')
+        continue
+      }
+      await attempt(async () => {
+        const expected = [Math.round(width * scale),Math.round(height * scale)]
+        const requested = [Math.round((width + delta) * scale),Math.round((height + delta) * scale)]
+        try {
+          await setValue(t, main, field(`${kind} width`), width)
+          await setValue(t, main, field(`${kind} height`), height, true)
+          await dimensions(...requested)
+          t.check(`Window ${kind} inner size constrains out-of-range request`, await t.wait(child, sizeExpression, value => json(value) === json(expected)), expected)
+          await displayedSize(t, main, expected)
+          await capture(`${kind.toLowerCase()}imum-size`)
+          await setValue(t, main, field(`${kind} width`), '')
+          await setValue(t, main, field(`${kind} height`), '', true)
+          await dimensions(...requested)
+          t.check(`Window clearing ${kind} constraint permits previous out-of-range size`, await t.wait(child, sizeExpression, value => json(value) === json(requested)), requested)
+          await capture(`${kind.toLowerCase()}-constraint-cleared`)
+        } finally {
+          await setValue(t, main, field(`${kind} width`), '')
+          await setValue(t, main, field(`${kind} height`), '', true)
+          await dimensions(...childSize)
+          t.check(`Window ${kind} cleanup restores child size`, await t.wait(child, sizeExpression, value => json(value) === json(childSize)), childSize)
+        }
+      })
+    }
+    await capture('constraints-restored')
+  } finally {
+    await position(originalPosition)
+    t.check('Window child original position restored', await t.wait(child, positionExpression, value => json(value) === json(originalPosition)), originalPosition)
+  }
+  if (failures.length) throw new AggregateError(failures, failures.map(error => error.message).join('\n'))
 }
 async function popup(t, target, item) {
   let menus = []
@@ -171,13 +356,14 @@ async function verifyNative(t, main) {
   await t.button(main, 'Remove tray')
   await t.wait(main, `Array.from(document.querySelectorAll('button')).some(e => e.textContent.trim() === 'Create tray')`, Boolean)
   if (tray.available) t.check('Removed tray disappears from Windows shell', t.native('tray-state', { ItemText:tooltip }).available, false)
-  t.note('Tray remaining scope', 'Creation, tooltip, native menu callbacks/check state and removal are exercised when shell UIAutomation exposes the icon; icon appearance, template/title and Rust startup tray commands remain unverified.')
+  t.note('Tray remaining scope', 'Creation, tooltip, native menu callbacks/check state and removal are exercised when shell UIAutomation exposes the icon; icon appearance and template/title remain unverified.')
   await navigate(t, main, 'Welcome')
+  await verifyStartupTray(t, main)
 }
 export async function verifyApi(t) {
   const main = t.main
   t.note('WebRTC', 'Not exercised: camera/microphone permissions, real media tracks and video playback require a device-aware test; fake streams are not evidence.')
-  t.note('Other Window controls', 'Only title, create-window, physical size, resize-event UI and always-on-top state are exercised; other window, cursor, effects and taskbar operations are not verified.')
+  t.note('Remaining Window scope', 'Cursor grab/visibility/icon/position/ignore-events, window icon appearance, focusable/attention, always-on-bottom stacking, content protection, progress/taskbar appearance, effects and monitor-specific/simple fullscreen remain unverified. Getter checks for button flags do not prove clicking native titlebar buttons.')
   t.note('OS stacking', 'Always-on-top is checked through the native getter after real checkbox clicks; actual desktop z-order is not visually verified by page screenshots.')
   const config = JSON.parse(readFileSync(new URL('../.cache/examples/api/src-tauri/tauri.conf.json', import.meta.url), 'utf8'))
   const cargo = readFileSync(new URL('../source/tauri/crates/tauri/Cargo.toml', import.meta.url), 'utf8')
@@ -253,46 +439,65 @@ export async function verifyApi(t) {
   await expectRows(t, main, 'Window creation emits created event', ['webview created'])
   const child = await t.target(async (target) => target.type === 'page'
     && (await t.evaluate(target, 'window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label')) === childLabel)
-  t.check('Window new child has requested label', await t.evaluate(child, 'window.__TAURI_INTERNALS__.metadata.currentWindow.label'), childLabel)
-  await t.wait(child, `document.querySelector('main h1')?.textContent.trim()`, (value) => value === 'Welcome')
-  await t.capture(child, 'api-window-child-created')
-  const initialChildSize = await t.evaluate(child, `${currentWindow}.innerSize().then(s => [s.width, s.height])`)
-  await setValue(t, main, selected, childLabel, true)
-  await t.wait(main, `(${selected})?.value`, (value) => value === childLabel)
-  await t.wait(main, `[Number((${field('Width')})?.value), Number((${field('Height')})?.value)]`,
-    (value) => json(value) === json(initialChildSize))
-  await setValue(t, main, titleInput, 'API verifier: child title')
-  await t.button(main, 'Set')
-  await assertWindow(t, child, 'Window selected child title changes', 'title', 'API verifier: child title')
-  await assertWindow(t, main, 'Window child title does not change main', 'title', title)
-  const scale = await t.evaluate(child, `${currentWindow}.scaleFactor()`)
-  const childSize = [Math.round(720 * scale), Math.round(520 * scale)]
-  await setValue(t, main, field('Width'), childSize[0])
-  await setValue(t, main, field('Height'), childSize[1], true)
-  const size = await t.wait(child, `${currentWindow}.innerSize().then(s => [s.width, s.height])`, (value) => json(value) === json(childSize))
-  t.check('Window size controls set child physical dimensions', size, childSize)
-  await displayedSize(t, main, childSize)
-  t.check('Window child resize does not change main', await t.evaluate(main, `${currentWindow}.innerSize().then(s => [s.width, s.height])`), originalSize)
-  const top = field('Always on top')
-  t.check('Window always-on-top starts false', await t.evaluate(child, `${currentWindow}.isAlwaysOnTop()`), false)
-  await t.click(main, await selector(t, main, top))
-  await assertWindow(t, child, 'Window checkbox enables native always-on-top', 'isAlwaysOnTop', true)
-  t.check('Window topmost checkbox reflects enabled control', await t.evaluate(main, `(${top}).checked`), true)
-  await t.capture(main, 'api-window-child-controls')
-  await t.capture(child, 'api-window-child-resized')
-  await t.click(main, await selector(t, main, top))
-  await assertWindow(t, child, 'Window checkbox disables native always-on-top', 'isAlwaysOnTop', false)
-  await setValue(t, main, selected, mainLabel, true)
-  await setValue(t, main, titleInput, originalTitle)
-  await t.button(main, 'Set')
-  await assertWindow(t, main, 'Window main title restored through Set control', 'title', originalTitle)
-  // Native close is cleanup only; creation and all state changes above use app controls.
-  await t.command(child, 'Page.close', {})
+  let windowError
+  try {
+    t.check('Window new child has requested label', await t.evaluate(child, 'window.__TAURI_INTERNALS__.metadata.currentWindow.label'), childLabel)
+    await t.wait(child, `document.querySelector('main h1')?.textContent.trim()`, (value) => value === 'Welcome')
+    await t.capture(child, 'api-window-child-created')
+    const initialChildSize = await t.evaluate(child, `${currentWindow}.innerSize().then(s => [s.width, s.height])`)
+    await setValue(t, main, selected, childLabel, true)
+    await t.wait(main, `(${selected})?.value`, (value) => value === childLabel)
+    await t.wait(main, `[Number((${field('Width')})?.value), Number((${field('Height')})?.value)]`,
+      (value) => json(value) === json(initialChildSize))
+    await setValue(t, main, titleInput, 'API verifier: child title')
+    await t.button(main, 'Set')
+    await assertWindow(t, child, 'Window selected child title changes', 'title', 'API verifier: child title')
+    await assertWindow(t, main, 'Window child title does not change main', 'title', title)
+    const scale = await t.evaluate(child, `${currentWindow}.scaleFactor()`)
+    const childSize = [Math.round(720 * scale), Math.round(520 * scale)]
+    await setValue(t, main, field('Width'), childSize[0])
+    await setValue(t, main, field('Height'), childSize[1], true)
+    const size = await t.wait(child, `${currentWindow}.innerSize().then(s => [s.width, s.height])`, (value) => json(value) === json(childSize))
+    t.check('Window size controls set child physical dimensions', size, childSize)
+    await displayedSize(t, main, childSize)
+    t.check('Window child resize does not change main', await t.evaluate(main, `${currentWindow}.innerSize().then(s => [s.width, s.height])`), originalSize)
+    const top = field('Always on top')
+    t.check('Window always-on-top starts false', await t.evaluate(child, `${currentWindow}.isAlwaysOnTop()`), false)
+    try {
+      await t.click(main, await selector(t, main, top))
+      await assertWindow(t, child, 'Window checkbox enables native always-on-top', 'isAlwaysOnTop', true)
+      t.check('Window topmost checkbox reflects enabled control', await t.evaluate(main, `(${top}).checked`), true)
+      await t.capture(main, 'api-window-child-controls')
+      await t.capture(child, 'api-window-child-resized')
+    } finally {
+      if (await t.evaluate(main, `(${top}).checked`)) await t.click(main, await selector(t, main, top))
+      await assertWindow(t, child, 'Window checkbox disables native always-on-top', 'isAlwaysOnTop', false)
+    }
+    await verifyWindowControls(t, main, child, childSize, scale)
+    t.check('Window child controls leave main physical size unchanged', await t.evaluate(main, `${currentWindow}.innerSize().then(s => [s.width,s.height])`), originalSize)
+  } catch (error) { windowError = error }
+  finally {
+    try {
+      await setValue(t, main, selected, mainLabel, true)
+      await setValue(t, main, titleInput, originalTitle)
+      await t.button(main, 'Set')
+      await assertWindow(t, main, 'Window main title restored through Set control', 'title', originalTitle)
+    } finally {
+      // Close only this verifier-created child, even after a failed state assertion.
+      await t.command(child, 'Page.close', {})
+    }
+  }
   const closed = await t.wait(main,
     `window.__TAURI__.window.getAllWindows().then(windows => windows.map(w => w.label))`,
     (labels) => !labels.includes(childLabel))
   t.check('Window child is removed after cleanup', closed.includes(childLabel), false)
   await navigate(t, main, 'Welcome')
-  await verifyNative(t, main)
-  await t.capture(main, 'api-final-welcome')
+  try {
+    await verifyNative(t, main)
+    await t.capture(main, 'api-final-welcome')
+  } catch (error) {
+    if (windowError) throw new AggregateError([windowError,error], `${windowError.message}\n${error.message}`)
+    throw error
+  }
+  if (windowError) throw windowError
 }

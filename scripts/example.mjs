@@ -129,12 +129,28 @@ function stageConf(confPath, useVite) {
   if (conf.app?.security?.pattern?.use === 'isolation') tauriFeatures.push('isolation')
 }
 
+export function replaceRuntime(original) {
+  // Tauri alpha omits these builder registrations from RuntimeInitArgs.
+  const schemes = [...original.matchAll(/\.register_(?:asynchronous_)?uri_scheme_protocol\(\s*"([a-zA-Z][a-zA-Z0-9+.-]*)"/g)]
+    .map((match) => match[1])
+  const runtime = 'tauri_runtime_electron::Electron::default()' + [...new Set(schemes)]
+    .map((scheme) => `.custom_scheme(${JSON.stringify(scheme)})`).join('')
+  return original.replaceAll('tauri_runtime_wry::Wry::default()', runtime)
+}
+
+// Keep each delayed Window action bound to the window selected at click time.
+export function patchWindowTimers(source) {
+  return source.replace(/(^  (?:async )?function (?:hide|disable|minimize)\(\) \{)([^]*?)(^  \})/gm,
+    (_, head, body, tail) => `${head}\n    const target = selectedWebview${body
+      .replaceAll('selectedWebview', 'target')
+      .replace('setTimeout(target.unminimize, 2000)', 'setTimeout(() => target.unminimize(), 2000)')}${tail}`)
+}
+
 function patchRuntime(file) {
   const original = read(file)
   // `main.rs` frequently only calls into `lib.rs`, which is where the builder is.
   if (!original.includes('tauri_runtime_wry')) return
-  const source = original
-    .replaceAll('tauri_runtime_wry::Wry::default()', 'tauri_runtime_electron::Electron::default()')
+  const source = replaceRuntime(original)
     // The examples live inside the Tauri workspace, so they point at the
     // config through a relative path that does not exist once staged.
     .replace(/generate_context!\(\s*"[^"]*"\s*\)/g, 'generate_context!()')
@@ -245,6 +261,8 @@ function stageFlat(dir, dst) {
 
 function stageApp(dir, dst) {
   for (const entry of fs.readdirSync(dir)) copyTree(path.join(dir, entry), path.join(dst, entry))
+  const windowView = path.join(dst, 'src', 'views', 'Window.svelte')
+  if (name === 'api' && fs.existsSync(windowView)) write(windowView, patchWindowTimers(read(windowView)))
   const tauriDir = path.join(dst, 'src-tauri')
   const rustSources = ['src/lib.rs', 'src/main.rs']
     .map((file) => path.join(tauriDir, file))

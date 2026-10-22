@@ -136,10 +136,12 @@ jobs:
         run: |
           node scripts/verify-runner.mjs
           node scripts/verify-runtime.mjs
+          node scripts/verify-theme.mjs
           node scripts/verify-api.mjs --self-check
           node scripts/verify-cases.mjs --self-check
           node scripts/verify-embedded.mjs --self-check
           node --check scripts/verify-examples.mjs
+          node --check scripts/verify-native-cases.mjs
           node --check scripts/example.mjs
 
       # Native drag/resize and real decoded video frames supplement page CDP.
