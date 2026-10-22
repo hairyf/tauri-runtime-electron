@@ -153,6 +153,11 @@ const closeAllowed = new Set()
 const closableState = new WeakMap()
 /** BrowserWindow -> whether it still has a native frame. */
 const decoratedState = new WeakMap()
+/** BrowserWindow -> whether the window manager may maximize it (Linux has no
+ * Electron API for this, so the value is tracked here). */
+const maximizableState = new WeakMap()
+/** BrowserWindow -> same, for minimize. */
+const minimizableState = new WeakMap()
 /** BrowserWindow -> key of the injected page-wide `cursor` rule. */
 const cursorCssKey = new WeakMap()
 /** webviewId -> BrowserWindow */
@@ -483,6 +488,8 @@ async function createWindow(params) {
   windows.set(windowId, window)
   closableState.set(window, config.closable !== false)
   decoratedState.set(window, config.decorations !== false)
+  maximizableState.set(window, config.maximizable !== false)
+  minimizableState.set(window, config.minimizable !== false)
   // The page webview of this window; later webviews on it become guests.
   if (params.webview) mainWebview.set(windowId, params.webview.webviewId)
   // Read this now: by the time `closed` fires the window and its webContents are
@@ -783,8 +790,8 @@ function readGeometry(window) {
     visible: window.isVisible(),
     fullscreen: window.isFullScreen(),
     resizable: window.isResizable(),
-    maximizable: window.isMaximizable(),
-    minimizable: window.isMinimizable(),
+    maximizable: maximizableState.get(window) ?? true,
+    minimizable: minimizableState.get(window) ?? true,
     closable: closableState.get(window) ?? true,
     decorated: decoratedState.get(window) ?? true,
     alwaysOnTop: window.isAlwaysOnTop(),
@@ -862,12 +869,28 @@ function handle(method, params) {
     case 'window.resizable':
       findWindow(params.windowId).setResizable(params.resizable)
       return null
-    case 'window.maximizable':
-      findWindow(params.windowId).setMaximizable(params.maximizable)
+    case 'window.maximizable': {
+      // Electron only implements this on macOS and Windows; on Linux the value
+      // lives here so the getter is honest about what Tauri asked for.
+      const window = findWindow(params.windowId)
+      maximizableState.set(window, params.maximizable !== false)
+      if (process.platform === 'linux') {
+        log('window.unsupported', params.windowId, 'set_maximizable')
+      } else {
+        window.setMaximizable(params.maximizable !== false)
+      }
       return null
-    case 'window.minimizable':
-      findWindow(params.windowId).setMinimizable(params.minimizable)
+    }
+    case 'window.minimizable': {
+      const window = findWindow(params.windowId)
+      minimizableState.set(window, params.minimizable !== false)
+      if (process.platform === 'linux') {
+        log('window.unsupported', params.windowId, 'set_minimizable')
+      } else {
+        window.setMinimizable(params.minimizable !== false)
+      }
       return null
+    }
     case 'window.closable': {
       const window = findWindow(params.windowId)
       // Our close handler enforces this everywhere; macOS also greys the button.

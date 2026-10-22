@@ -24,7 +24,16 @@ pub(crate) const VERSION: &str = "45.0.0";
 
 /// The target being built for, so cross builds fetch the right archive.
 pub(crate) fn target_triple() -> String {
-  env::var("TARGET").unwrap_or_else(|_| format!("{}-{}", env::consts::ARCH, env::consts::OS))
+  // Only build scripts see `TARGET`; at runtime the binary reports the triple
+  // it was compiled for, otherwise macOS reads as a generic Linux host.
+  env::var("TARGET").unwrap_or_else(|_| {
+    let os = match env::consts::OS {
+      "macos" => "apple-darwin",
+      "windows" => "pc-windows-msvc",
+      other => other,
+    };
+    format!("{}-{}", env::consts::ARCH, os)
+  })
 }
 
 /// Executable path inside an Electron distribution.
