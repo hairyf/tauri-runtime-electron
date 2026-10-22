@@ -54,6 +54,27 @@ The file layout mirrors `crates/tauri-runtime-cef` for side-by-side consistency:
 
 ---
 
+## Verifying Coverage
+
+Two checks exist so "it compiles" is never mistaken for "it works":
+
+```bash
+node scripts/coverage.mjs   # writes docs/coverage.md, exits 1 on silent no-ops
+cargo run --example smoke   # opens real windows, asserts every setter via its getter
+```
+
+`docs/coverage.md` lists every `tauri-runtime` trait member next to how this
+crate handles it, classified as implemented, accepted then ignored,
+platform-limited, refused, or missing. Anything the runtime cannot do is logged
+as `[electron] unsupported, ignored: <api>` on first use instead of returning a
+fake success. Linux needs a display server, so CI runs the smoke example under
+`xvfb-run`.
+
+`source/tauri` and `source/electron` are pinned submodules kept for reading the
+upstream implementations; they are not built.
+
+---
+
 ## Semver & License
 
 * **Semver**: Follows [Semantic Versioning 2.0](https://semver.org/). Major version signifies the intended Tauri version.

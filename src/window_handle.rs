@@ -204,7 +204,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   }
 
   fn set_device_event_filter(&self, _: DeviceEventFilter) {
-    // no-op
+    crate::unsupported::report("RuntimeHandle::set_device_event_filter");
   }
 
   #[cfg(target_os = "android")]

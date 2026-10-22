@@ -4,7 +4,7 @@
 
 use crate::{
   electron_impl::ipc::Ipc, environment, environment::DebugEnvironment, locale, platform, switches,
-  webview::ElectronWebviewDispatcher, window, window::ElectronWindowDispatcher,
+  webview::ElectronWebviewDispatcher, window::ElectronWindowDispatcher,
   window_handle::ElectronRuntimeHandle,
 };
 use serde_json::{json, Value};
@@ -876,7 +876,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     }
   }
 
-  fn set_device_event_filter(&mut self, filter: DeviceEventFilter) {}
+  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {
+    crate::unsupported::report("Runtime::set_device_event_filter");
+  }
 
   #[cfg(any(
     target_os = "macos",
@@ -887,7 +889,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, callback: F) {}
+  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, _callback: F) {
+    crate::unsupported::report("Runtime::run_iteration");
+  }
 
   fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
     self.run(callback);
@@ -1455,20 +1459,22 @@ pub(crate) fn create_window_impl<T: UserEvent>(
   };
 
   let mut payload = json!({ "windowId": serial, "label": label });
-  if let Some(config) = &window_builder.config {
-    payload = json!({
-      "windowId": serial,
-      "label": label,
-      "title": config.title,
-      "width": config.width,
-      "height": config.height,
-      "x": config.x,
-      "y": config.y,
-      "center": config.center,
-      "resizable": config.resizable,
-      "decorations": config.decorations,
-      "transparent": config.transparent,
-      "visible": config.visible,
+  // The whole window configuration travels to the main process; `main.cjs`
+  // applies what Electron can express and reports the rest.
+  payload["window"] =
+    serde_json::to_value(&window_builder.config).map_err(|error| create_window_err(error.to_string()))?;
+  if let Some(icon) = &window_builder.icon {
+    use base64::Engine as _;
+    // Electron builds an image from raw BGRA pixels, so swap the channels here
+    // instead of shipping a PNG encoder.
+    let mut bgra = icon.rgba.clone();
+    for pixel in bgra.chunks_exact_mut(4) {
+      pixel.swap(0, 2);
+    }
+    payload["windowIcon"] = json!({
+      "bgra": base64::engine::general_purpose::STANDARD.encode(bgra),
+      "width": icon.width,
+      "height": icon.height,
     });
   }
   if let Some(icon) = &context.icon {
@@ -1481,6 +1487,13 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       "initScripts": initialization_scripts(webview),
       "policy": policy,
     });
+  }
+
+  if !window_builder.unsupported.is_empty() {
+    eprintln!(
+      "[electron] window {label}: ignoring unsupported builder options: {}",
+      window_builder.unsupported.join(", ")
+    );
   }
 
   context
@@ -1505,6 +1518,21 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       handlers: Vec::new(),
     },
   );
+
+  // Options Electron has no API for, applied to the native window handle.
+  #[cfg(windows)]
+  if window_builder.owner.is_some()
+    || window_builder.parent.is_some()
+    || window_builder.config.always_on_bottom
+  {
+    let handle = context.native_handle(id)?;
+    if window_builder.config.always_on_bottom {
+      crate::window::imp::send_to_bottom(handle);
+    }
+    if let Some(owner) = window_builder.owner.or(window_builder.parent) {
+      crate::window::imp::set_owner(handle, owner.0 as isize);
+    }
+  }
 
   if let (Some(pending_webview), Some(webview_serial)) = (webview.as_mut(), webview_id) {
     let url = context.resolve_url(&pending_webview.webview_attributes.url);

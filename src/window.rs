@@ -114,18 +114,16 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(self.geometry()?["resizable"].as_bool().unwrap_or(true))
   }
 
-  // Electron only exposes these as write-only setters; track the requested
-  // value on the Rust side instead of asking the main process.
   fn is_maximizable(&self) -> Result<bool> {
-    Ok(true)
+    Ok(self.geometry()?["maximizable"].as_bool().unwrap_or(true))
   }
 
   fn is_minimizable(&self) -> Result<bool> {
-    Ok(true)
+    Ok(self.geometry()?["minimizable"].as_bool().unwrap_or(true))
   }
 
   fn is_closable(&self) -> Result<bool> {
-    Ok(true)
+    Ok(self.geometry()?["closable"].as_bool().unwrap_or(true))
   }
 
   fn is_visible(&self) -> Result<bool> {
@@ -331,11 +329,14 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     #[cfg(windows)]
     {
       imp::set_decorations(self.context.native_handle(self.id)?, decorations);
-      Ok(())
+      // Keep the main process' idea of the frame in sync for `is_decorated`.
+      self.window_call("window.decorations", json!({ "decorations": decorations }))
     }
     #[cfg(not(windows))]
     {
+      // A `BrowserWindow` frame is fixed at creation time.
       let _ = decorations;
+      crate::unsupported::report("Window::set_decorations");
       Ok(())
     }
   }
@@ -423,21 +424,43 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     self.window_call("window.skipTaskbar", json!({ "skip": skip }))
   }
 
-  // Electron has no cursor control API; the renderer sets `cursor` in CSS.
-  fn set_cursor_grab(&self, _grab: bool) -> Result<()> {
-    Ok(())
+  // Confining the pointer is a native operation; a page cannot do it.
+  fn set_cursor_grab(&self, grab: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+      imp::clip_cursor(self.context.native_handle(self.id)?, grab);
+      Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+      let _ = grab;
+      crate::unsupported::report("Window::set_cursor_grab");
+      Ok(())
+    }
   }
 
-  fn set_cursor_visible(&self, _visible: bool) -> Result<()> {
-    Ok(())
+  fn set_cursor_visible(&self, visible: bool) -> Result<()> {
+    self.window_call("window.setCursorVisible", json!({ "visible": visible }))
   }
 
-  fn set_cursor_icon(&self, _icon: CursorIcon) -> Result<()> {
-    Ok(())
+  fn set_cursor_icon(&self, icon: CursorIcon) -> Result<()> {
+    self.window_call("window.setCursorIcon", json!({ "cursor": cursor_css(icon) }))
   }
 
-  fn set_cursor_position<Pos: Into<Position>>(&self, _position: Pos) -> Result<()> {
-    Ok(())
+  fn set_cursor_position<Pos: Into<Position>>(&self, position: Pos) -> Result<()> {
+    #[cfg(windows)]
+    {
+      let scale = self.geometry()?["scaleFactor"].as_f64().unwrap_or(1.0);
+      let position: PhysicalPosition<i32> = position.into().to_physical(scale);
+      imp::set_cursor_position(position);
+      Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+      let _ = position;
+      crate::unsupported::report("Window::set_cursor_position");
+      Ok(())
+    }
   }
 
   fn set_ignore_cursor_events(&self, ignore: bool) -> Result<()> {
@@ -455,8 +478,18 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(())
   }
 
-  fn start_resize_dragging(&self, _direction: tauri_runtime::ResizeDirection) -> Result<()> {
-    Ok(())
+  fn start_resize_dragging(&self, direction: tauri_runtime::ResizeDirection) -> Result<()> {
+    #[cfg(windows)]
+    {
+      imp::start_resize_dragging(self.context.native_handle(self.id)?, direction);
+      Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+      let _ = direction;
+      crate::unsupported::report("Window::start_resize_dragging");
+      Ok(())
+    }
   }
 
   fn set_progress_bar(&self, progress_state: ProgressBarState) -> Result<()> {
@@ -494,8 +527,11 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     )
   }
 
-  // Electron applies the title bar style only while creating the window.
+  /// A `BrowserWindow`'s title bar style is fixed when the window is created;
+  /// `window.create` already carries it, so only a post-creation change is out
+  /// of reach.
   fn set_title_bar_style(&self, _style: tauri_utils::TitleBarStyle) -> Result<()> {
+    crate::unsupported::report("Window::set_title_bar_style");
     Ok(())
   }
 
@@ -576,14 +612,61 @@ fn color_css(color: tauri_utils::config::Color) -> String {
   )
 }
 
+/// CSS `cursor` keyword for a window cursor; Electron has no native cursor API,
+/// so the page's stylesheet is the channel.
+fn cursor_css(icon: CursorIcon) -> &'static str {
+  match icon {
+    CursorIcon::Default | CursorIcon::Arrow => "default",
+    CursorIcon::Crosshair => "crosshair",
+    CursorIcon::Hand => "pointer",
+    CursorIcon::Move => "move",
+    CursorIcon::Text => "text",
+    CursorIcon::VerticalText => "vertical-text",
+    CursorIcon::Wait => "wait",
+    CursorIcon::Help => "help",
+    CursorIcon::Progress => "progress",
+    CursorIcon::NotAllowed | CursorIcon::NoDrop => "not-allowed",
+    CursorIcon::ContextMenu => "context-menu",
+    CursorIcon::Cell => "cell",
+    CursorIcon::Alias => "alias",
+    CursorIcon::Copy => "copy",
+    CursorIcon::Grab => "grab",
+    CursorIcon::Grabbing => "grabbing",
+    CursorIcon::AllScroll => "all-scroll",
+    CursorIcon::ZoomIn => "zoom-in",
+    CursorIcon::ZoomOut => "zoom-out",
+    CursorIcon::EResize => "e-resize",
+    CursorIcon::NResize => "n-resize",
+    CursorIcon::NeResize => "ne-resize",
+    CursorIcon::NwResize => "nw-resize",
+    CursorIcon::SResize => "s-resize",
+    CursorIcon::SeResize => "se-resize",
+    CursorIcon::SwResize => "sw-resize",
+    CursorIcon::WResize => "w-resize",
+    CursorIcon::EwResize => "ew-resize",
+    CursorIcon::NsResize => "ns-resize",
+    CursorIcon::NeswResize => "nesw-resize",
+    CursorIcon::NwseResize => "nwse-resize",
+    CursorIcon::ColResize => "col-resize",
+    CursorIcon::RowResize => "row-resize",
+    // `CursorIcon` is `#[non_exhaustive]`; unknown cursors keep the default.
+    _ => "default",
+  }
+}
+
 /// Win32 tweaks that Electron has no API for but the window still supports.
 #[cfg(windows)]
-mod imp {
-  use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+pub(crate) mod imp {
+  use tauri_runtime::{ResizeDirection, dpi::PhysicalPosition};
+  use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+  use windows::Win32::Graphics::Gdi::ClientToScreen;
   use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
   use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, HTCAPTION, HWND_BOTTOM, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SetWindowLongPtrW, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION, WS_THICKFRAME,
+    ClipCursor, GWLP_HWNDPARENT, GetClientRect, GetWindowLongPtrW, HTCAPTION,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetWindowLongPtrW, SetCursorPos, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION,
+    WS_THICKFRAME,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE, SWP_NOMOVE, SWP_NOSIZE,
   };
 
@@ -591,7 +674,7 @@ mod imp {
     HWND(handle as *mut std::ffi::c_void)
   }
 
-  pub(super) fn send_to_bottom(handle: isize) {
+  pub(crate) fn send_to_bottom(handle: isize) {
     // SAFETY: z-order only, no geometry or focus change.
     unsafe {
       let _ = SetWindowPos(
@@ -642,6 +725,66 @@ mod imp {
         Some(WPARAM(HTCAPTION as usize)),
         Some(LPARAM(0)),
       );
+    }
+  }
+
+  /// Same trick as `start_dragging`, for the resize borders.
+  pub(crate) fn start_resize_dragging(handle: isize, direction: ResizeDirection) {
+    let hit = match direction {
+      ResizeDirection::East => HTRIGHT,
+      ResizeDirection::North => HTTOP,
+      ResizeDirection::NorthEast => HTTOPRIGHT,
+      ResizeDirection::NorthWest => HTTOPLEFT,
+      ResizeDirection::South => HTBOTTOM,
+      ResizeDirection::SouthEast => HTBOTTOMRIGHT,
+      ResizeDirection::SouthWest => HTBOTTOMLEFT,
+      ResizeDirection::West => HTLEFT,
+    };
+    // SAFETY: same non-client message path as the caption drag above.
+    unsafe {
+      let _ = ReleaseCapture();
+      SendMessageW(hwnd(handle), WM_NCLBUTTONDOWN, Some(WPARAM(hit as usize)), Some(LPARAM(0)));
+    }
+  }
+
+  /// Confines the pointer to the window's client area (or releases it).
+  pub(crate) fn clip_cursor(handle: isize, grab: bool) {
+    // SAFETY: geometry query plus a pointer clip; no memory is handed out.
+    unsafe {
+      if !grab {
+        let _ = ClipCursor(None);
+        return;
+      }
+      let mut rect = RECT::default();
+      if GetClientRect(hwnd(handle), &mut rect).is_err() {
+        return;
+      }
+      let mut top_left = POINT { x: rect.left, y: rect.top };
+      let mut bottom_right = POINT { x: rect.right, y: rect.bottom };
+      let _ = ClientToScreen(hwnd(handle), &mut top_left);
+      let _ = ClientToScreen(hwnd(handle), &mut bottom_right);
+      let clip = RECT {
+        left: top_left.x,
+        top: top_left.y,
+        right: bottom_right.x,
+        bottom: bottom_right.y,
+      };
+      let _ = ClipCursor(Some(&clip));
+    }
+  }
+
+  pub(crate) fn set_cursor_position(position: PhysicalPosition<i32>) {
+    // SAFETY: plain cursor move in screen coordinates.
+    unsafe {
+      let _ = SetCursorPos(position.x, position.y);
+    }
+  }
+
+  /// Owned windows follow their owner's z-order and lifetime.
+  pub(crate) fn set_owner(handle: isize, owner: isize) {
+    // SAFETY: GWLP_HWNDPARENT takes a window handle; no memory ownership moves.
+    unsafe {
+      SetWindowLongPtrW(hwnd(handle), GWLP_HWNDPARENT, owner);
     }
   }
 }

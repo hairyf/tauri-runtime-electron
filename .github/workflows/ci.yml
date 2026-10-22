@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   workflow_dispatch:
 
@@ -16,7 +16,7 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.os }}
+    name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,3 +49,57 @@ jobs:
 
       - name: Build
         run: cargo build --lib
+
+      - name: Coverage matrix is current
+        run: |
+          node scripts/coverage.mjs
+          git diff --exit-code docs/coverage.md
+
+  # Drives a real Electron window and asserts every setter through its getter.
+  # This is the only job that proves a window can actually be opened.
+  smoke:
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and Electron
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.cache/electron
+            ~/AppData/Local/electron/Cache
+          key: ${{ matrix.os }}-smoke-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-smoke-cargo-
+
+      - name: Linux window libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libgbm1 libxcomposite1 libxdamage1 libxrandr2 \
+            libpango-1.0-0 libcairo2 libgtk-3-0
+
+      - name: Linux audio library
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends libasound2t64 \
+            || sudo apt-get install -y --no-install-recommends libasound2
+
+      - name: Smoke test (Windows, macOS)
+        if: runner.os != 'Linux'
+        run: cargo run --example smoke
+
+      - name: Smoke test (Linux, headless)
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum cargo run --example smoke

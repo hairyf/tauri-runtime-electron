@@ -149,6 +149,12 @@ let socket
 const windows = new Map()
 // Windows Tauri accepted to close; everything else holds the close.
 const closeAllowed = new Set()
+/** BrowserWindow -> whether the user may close it (`closable`). */
+const closableState = new WeakMap()
+/** BrowserWindow -> whether it still has a native frame. */
+const decoratedState = new WeakMap()
+/** BrowserWindow -> key of the injected page-wide `cursor` rule. */
+const cursorCssKey = new WeakMap()
 /** webviewId -> BrowserWindow */
 const webviews = new Map()
 /** webContents id -> webviewId (for routing `tauri-ipc` messages) */
@@ -276,50 +282,226 @@ function serializeError(error) {
   return error && error.message ? error.message : String(error)
 }
 
+/**
+ * Window config keys Electron cannot express, with the value that means
+ * "nothing to do". Only a key whose value differs from that default is worth
+ * warning about.
+ */
+const UNSUPPORTED_WINDOW_OPTIONS = [
+  ['windowClassname', undefined], // Electron creates its own Win32 window class
+  ['noRedirectionBitmap', false], // creation-time DWM style Electron does not expose
+  ['theme', undefined], // nativeTheme is app-wide, not per window
+  ['additionalBrowserArgs', undefined], // would need a process relaunch
+  ['browserExtensionsEnabled', false], // session-wide launch flags
+  ['dataStoreIdentifier', undefined], // Electron partitions are string-keyed
+  ['limitNavigationsToAppBoundDomains', false], // WKWebView only
+  ['activityName', undefined],
+  ['createdByActivityName', undefined],
+  ['requestedBySceneIdentifier', undefined], // mobile only
+  ['proxyUrl', undefined], // Electron proxies are per session, not per window
+  ['dataDirectory', undefined], // Electron's userData path is app-wide
+  ['scrollBarStyle', 'default'], // needs an app-wide Chromium switch
+  ['zoomHotkeysEnabled', true], // no menu accelerators in this runtime
+  ['generalAutofillEnabled', true],
+  ['disableInputAccessoryView', false], // iOS / Mac Catalyst only
+  ['allowLinkPreview', true], // iOS only
+]
+
+/** `[r, g, b, a]` from `tauri_utils::config::Color` as a CSS color. */
+function cssColor(color) {
+  if (typeof color === 'string') return color
+  if (!Array.isArray(color) || color.length < 3) return undefined
+  const [r, g, b, a = 255] = color
+  return `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(3)})`
+}
+
+/** Tauri's title bar styles are macOS concepts; map the closest Electron one. */
+function titleBarStyleOf(config) {
+  if (config.hiddenTitle) return 'hidden'
+  switch (config.titleBarStyle) {
+    case 'transparent':
+      return 'hidden'
+    case 'overlay':
+      return 'hiddenInset'
+    default:
+      return 'default'
+  }
+}
+
+/** Translates tauri window effects to Electron's `backgroundMaterial`. */
+function windowMaterial(config) {
+  const effects = config.windowEffects?.effects
+  if (!Array.isArray(effects)) return undefined
+  const has = (...names) => names.some((name) => effects.includes(name))
+  if (has('mica', 'micaDark', 'micaLight')) return 'mica'
+  if (has('tabbed', 'tabbedDark', 'tabbedLight')) return 'tabbed'
+  if (has('acrylic', 'blur')) return 'acrylic'
+  return undefined
+}
+
+/** Keeps the window inside its display's work area (`prevent_overflow`). */
+function clampToWorkArea(window, preventOverflow) {
+  const margin = typeof preventOverflow === 'object' ? preventOverflow : {}
+  const bounds = window.getBounds()
+  const area = screen.getDisplayMatching(bounds).workArea
+  const width = Math.max(1, Math.min(bounds.width, area.width - (margin.width ?? 0)))
+  const height = Math.max(1, Math.min(bounds.height, area.height - (margin.height ?? 0)))
+  const x = Math.min(Math.max(bounds.x, area.x), area.x + area.width - width)
+  const y = Math.min(Math.max(bounds.y, area.y), area.y + area.height - height)
+  window.setBounds({ x, y, width, height })
+}
+
+function browserWindowOptions(config, params, iconImage, iconPath) {
+  const { windowId } = params
+  const options = {}
+  const set = (key, value) => {
+    if (value !== undefined) options[key] = value
+  }
+  set('title', config.title ?? 'Electron Runtime')
+  set('width', Math.max(1, Math.round(config.width ?? 800)))
+  set('height', Math.max(1, Math.round(config.height ?? 600)))
+  set('x', typeof config.x === 'number' ? Math.round(config.x) : undefined)
+  set('y', typeof config.y === 'number' ? Math.round(config.y) : undefined)
+  set('center', config.center === true)
+  set('resizable', config.resizable !== false)
+  // Tauri's `inner_size` is the webview area, which is what `useContentSize`
+  // makes of a BrowserWindow's width/height.
+  set('useContentSize', true)
+  set('maximizable', config.maximizable !== false)
+  set('minimizable', config.minimizable !== false)
+  set('fullscreen', config.fullscreen === true)
+  set('focusable', config.focusable !== false)
+  set('transparent', config.transparent === true)
+  set('show', config.visible !== false)
+  set('frame', config.decorations !== false)
+  set('alwaysOnTop', config.alwaysOnTop === true)
+  set('skipTaskbar', config.skipTaskbar === true)
+  set('autoHideMenuBar', true)
+  set('minWidth', config.minWidth && Math.round(config.minWidth))
+  set('minHeight', config.minHeight && Math.round(config.minHeight))
+  set('maxWidth', config.maxWidth && Math.round(config.maxWidth))
+  set('maxHeight', config.maxHeight && Math.round(config.maxHeight))
+  set('backgroundColor', cssColor(config.backgroundColor))
+  set('hasShadow', config.shadow !== false)
+  set('titleBarStyle', titleBarStyleOf(config))
+  set('acceptFirstMouse', config.acceptFirstMouse === true)
+  set('tabbingIdentifier', config.tabbingIdentifier)
+  if (process.platform === 'win32') set('backgroundMaterial', windowMaterial(config))
+  set('icon', iconImage ?? iconPath)
+
+  const webPreferences = {
+    contextIsolation: true,
+    sandbox: true,
+    nodeIntegration: false,
+    // Tauri pages embed guests with the Chromium `<webview>` element; Electron
+    // disables that tag by default since v5.
+    webviewTag: true,
+    preload: params.webview
+      ? writeInitPreload(params.webview.webviewId, params.webview.initScripts)
+      : path.join(__dirname, 'preload.cjs'),
+    userAgent: config.userAgent,
+    javascript: config.javascriptDisabled !== true,
+    devTools: config.devtools !== false,
+    backgroundThrottling: config.backgroundThrottling !== 'disabled',
+    // Without `persist:` the partition is in-memory, which is what `incognito`
+    // means here.
+    partition: config.incognito ? `tauri-incognito-${windowId}` : undefined,
+  }
+  options.webPreferences = webPreferences
+  return options
+}
+
+/** Config Electron can only apply once the window exists. */
+function applyWindowConfig(window, config, params) {
+  // Creating the window can pad the content area by a frame border; Tauri's
+  // `inner_size` must be exact, so state it once more as the content size.
+  if (typeof config.width === 'number' && typeof config.height === 'number') {
+    window.setContentSize(
+      Math.max(1, Math.round(config.width)),
+      Math.max(1, Math.round(config.height)),
+    )
+  }
+  if (config.maximized && config.fullscreen !== true) window.maximize()
+  if (config.focus && config.focusable !== false && config.visible !== false) window.focus()
+  if (config.visibleOnAllWorkspaces) {
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  }
+  if (config.contentProtected) window.setContentProtection(true)
+  if (config.preventOverflow) clampToWorkArea(window, config.preventOverflow)
+  if (config.trafficLightPosition && process.platform === 'darwin') {
+    window.setWindowButtonPosition(config.trafficLightPosition)
+  }
+  if (config.dragDropEnabled === false) {
+    // Electron has no window-level drop switch; block the page's drop events.
+    window.webContents.on('did-finish-load', () => {
+      window.webContents.executeJavaScript(
+        "for (const type of ['dragenter', 'dragover', 'drop']) document.addEventListener(type, (event) => { event.preventDefault(); event.stopPropagation() }, true)",
+      )
+    })
+  }
+  const unsupported = UNSUPPORTED_WINDOW_OPTIONS.filter(
+    ([key, defaultValue]) => config[key] !== undefined && config[key] !== defaultValue,
+  )
+  if (unsupported.length) {
+    log(
+      'window.unsupported',
+      params.label ?? params.windowId,
+      unsupported.map(([key]) => key).join(','),
+    )
+  }
+}
+
+/** Replaces the page-wide `cursor` rule; `null` removes it. */
+async function setWindowCursorCss(window, css) {
+  const previous = cursorCssKey.get(window)
+  if (previous) {
+    cursorCssKey.delete(window)
+    await window.webContents.removeInsertedCSS(previous).catch(() => {})
+  }
+  if (!css) return
+  const key = await window.webContents.insertCSS(css, { cssOrigin: 'user' })
+  cursorCssKey.set(window, key)
+}
+
 async function createWindow(params) {
   const { windowId } = params
+  const config = params.window ?? {}
   // Windows canonicalized paths arrive with a verbatim `\\?\` prefix that
   // Electron's image loader cannot open.
-  const icon =
-    typeof params.icon === 'string' ? params.icon.replace(/^\\\\\?\\/, '') : params.icon
-  log('window.create', JSON.stringify({ windowId, icon: icon ?? null }))
-  const window = new BrowserWindow({
-    title: params.title ?? 'Electron Runtime',
-    width: params.width ?? 800,
-    height: params.height ?? 600,
-    x: params.x ?? undefined,
-    y: params.y ?? undefined,
-    center: params.center ?? false,
-    resizable: params.resizable ?? true,
-    frame: params.decorations ?? true,
-    transparent: params.transparent ?? false,
-    show: params.visible ?? true,
-    autoHideMenuBar: true,
-    ...(icon ? { icon } : {}),
-    webPreferences: {
-      contextIsolation: true,
-      sandbox: true,
-      nodeIntegration: false,
-      preload: params.webview
-        ? writeInitPreload(params.webview.webviewId, params.webview.initScripts)
-        : path.join(__dirname, 'preload.cjs'),
-      // Tauri pages embed guests with the Chromium `<webview>` element; Electron
-      // disables that tag by default since v5.
-      webviewTag: true,
-    },
-  })
+  const iconPath =
+    typeof params.icon === 'string' ? params.icon.replace(/^\\\\\?\\/, '') : undefined
+  // `WindowBuilder::icon` sends raw BGRA; Electron takes that directly.
+  const iconImage = params.windowIcon
+    ? nativeImage.createFromBitmap(Buffer.from(params.windowIcon.bgra, 'base64'), {
+        width: params.windowIcon.width,
+        height: params.windowIcon.height,
+        scaleFactor: 1,
+      })
+    : undefined
+  log('window.create', JSON.stringify({ windowId, label: params.label }))
+  const window = new BrowserWindow(browserWindowOptions(config, params, iconImage, iconPath))
   windows.set(windowId, window)
+  closableState.set(window, config.closable !== false)
+  decoratedState.set(window, config.decorations !== false)
   // The page webview of this window; later webviews on it become guests.
   if (params.webview) mainWebview.set(windowId, params.webview.webviewId)
   // Read this now: by the time `closed` fires the window and its webContents are
   // destroyed, and `window.webContents.id` throws "Object has been destroyed".
   const contentsId = window.webContents.id
 
+  applyWindowConfig(window, config, params)
+
   // Electron destroys the window on `close`; Tauri decides instead (an app may
   // `prevent_close` and keep the window around, e.g. hiding to the tray), so
   // hold the close and let the runtime answer with `window.destroy`.
   window.on('close', (event) => {
     if (closeAllowed.has(windowId)) return
+    // `closable: false` keeps the window alive; Tauri's own close goes through
+    // `window.destroy`, which sets `closeAllowed` first.
+    if (!closableState.get(window)) {
+      event.preventDefault()
+      return
+    }
     event.preventDefault()
     send({ event: 'window.closeRequested', params: { windowId } })
   })
@@ -601,6 +783,10 @@ function readGeometry(window) {
     visible: window.isVisible(),
     fullscreen: window.isFullScreen(),
     resizable: window.isResizable(),
+    maximizable: window.isMaximizable(),
+    minimizable: window.isMinimizable(),
+    closable: closableState.get(window) ?? true,
+    decorated: decoratedState.get(window) ?? true,
     alwaysOnTop: window.isAlwaysOnTop(),
     title: window.getTitle(),
   }
@@ -682,9 +868,13 @@ function handle(method, params) {
     case 'window.minimizable':
       findWindow(params.windowId).setMinimizable(params.minimizable)
       return null
-    case 'window.closable':
-      findWindow(params.windowId).setClosable(params.closable)
+    case 'window.closable': {
+      const window = findWindow(params.windowId)
+      // Our close handler enforces this everywhere; macOS also greys the button.
+      closableState.set(window, params.closable !== false)
+      if (process.platform === 'darwin') window.setClosable(params.closable !== false)
       return null
+    }
     case 'window.maximize':
       findWindow(params.windowId).maximize()
       return null
@@ -874,6 +1064,20 @@ function handle(method, params) {
     }
     case 'window.ignoreCursorEvents':
       findWindow(params.windowId).setIgnoreMouseEvents(params.ignore, { forward: true })
+      return null
+    case 'window.setCursorIcon':
+      return setWindowCursorCss(
+        findWindow(params.windowId),
+        `* { cursor: ${params.cursor} !important }`,
+      )
+    case 'window.setCursorVisible':
+      return setWindowCursorCss(
+        findWindow(params.windowId),
+        params.visible ? null : '* { cursor: none !important }',
+      )
+    // Windows toggles the frame natively; this keeps the reported state in sync.
+    case 'window.decorations':
+      decoratedState.set(findWindow(params.windowId), params.decorations !== false)
       return null
     case 'window.themeQuery':
       return { theme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light' }

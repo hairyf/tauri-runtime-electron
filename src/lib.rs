@@ -31,6 +31,7 @@ mod popup;
 mod runtime;
 mod switches;
 mod tauri_ext;
+mod unsupported;
 mod webview;
 mod window;
 mod window_builder;

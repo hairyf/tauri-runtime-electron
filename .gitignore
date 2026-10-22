@@ -6,4 +6,3 @@ node_modules
 target
 .eslintcache
 .temp/
-source/

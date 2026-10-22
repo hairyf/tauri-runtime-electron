@@ -1,0 +1,8 @@
+[submodule "source/tauri"]
+	path = source/tauri
+	url = https://github.com/tauri-apps/tauri.git
+	branch = tauri-v3.0.0-alpha.5
+[submodule "source/electron"]
+	path = source/electron
+	url = https://github.com/electron/electron.git
+	branch = v45.0.0
