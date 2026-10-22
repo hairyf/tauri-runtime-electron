@@ -191,6 +191,23 @@ fn title_checks(window: &Window, failures: &mut Vec<String>) {
 }
 
 fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
+  // A scale factor of zero would make every physical conversion divide by zero.
+  match WindowDispatch::<()>::scale_factor(window) {
+    Ok(scale) if scale > 0.0 && scale.is_finite() => println!("ok   scale_factor {scale}"),
+    Ok(scale) => failures.push(format!("scale_factor is not usable: {scale}")),
+    Err(error) => failures.push(format!("scale_factor: {error}")),
+  }
+  match WindowDispatch::<()>::current_monitor(window) {
+    Ok(Some(monitor)) => println!("ok   current_monitor {:?}", monitor.name),
+    Ok(None) => failures.push("current_monitor: the window sits on no monitor".into()),
+    Err(error) => failures.push(format!("current_monitor: {error}")),
+  }
+  match WindowDispatch::<()>::available_monitors(window) {
+    Ok(monitors) if !monitors.is_empty() => println!("ok   available_monitors {}", monitors.len()),
+    Ok(_) => failures.push("available_monitors is empty".into()),
+    Err(error) => failures.push(format!("available_monitors: {error}")),
+  }
+
   set(failures, "set_size", || {
     WindowDispatch::<()>::set_size(window, Size::Physical(PhysicalSize::new(420, 320)))
   });
@@ -242,6 +259,43 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
   expect(failures, "is_resizable back", true, || {
     WindowDispatch::<()>::is_resizable(window)
   });
+
+  expect_applied(
+    failures,
+    "is_enabled",
+    false,
+    || WindowDispatch::<()>::set_enabled(window, false),
+    || WindowDispatch::<()>::is_enabled(window),
+  );
+  expect_applied(
+    failures,
+    "is_enabled back",
+    true,
+    || WindowDispatch::<()>::set_enabled(window, true),
+    || WindowDispatch::<()>::is_enabled(window),
+  );
+  // Focus and minimization both animate, so they are polled like the rest.
+  expect_applied(
+    failures,
+    "is_focused",
+    true,
+    || WindowDispatch::<()>::set_focus(window),
+    || WindowDispatch::<()>::is_focused(window),
+  );
+  expect_applied(
+    failures,
+    "is_minimized",
+    true,
+    || WindowDispatch::<()>::minimize(window),
+    || WindowDispatch::<()>::is_minimized(window),
+  );
+  expect_applied(
+    failures,
+    "is_minimized back",
+    false,
+    || WindowDispatch::<()>::unminimize(window),
+    || WindowDispatch::<()>::is_minimized(window),
+  );
 
   // The window asks for always-on-top while it is created, which is how an app
   // usually does it; the setter then has to turn it off and back on.

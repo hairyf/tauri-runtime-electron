@@ -102,6 +102,15 @@ impl Ipc {
             .map_err(|e| format!("failed to configure IPC stream: {e}"))?;
           break stream;
         }
+        // A binary that dies at once (wrong platform, missing library, a syntax
+        // error in the main process) never connects; say so instead of waiting
+        // out the timeout.
+        Err(_) if matches!(child.try_wait(), Ok(Some(_))) => {
+          return Err(format!(
+            "electron exited before it connected: {} did not start",
+            binary.display()
+          ));
+        }
         Err(e) if Instant::now() >= deadline => {
           let _ = child.kill();
           return Err(format!(

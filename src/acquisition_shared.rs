@@ -24,7 +24,15 @@ pub(crate) const VERSION: &str = "45.0.0";
 
 /// The target being built for, so cross builds fetch the right archive.
 pub(crate) fn target_triple() -> String {
-  env::var("TARGET").unwrap_or_else(|_| format!("{}-{}", env::consts::ARCH, env::consts::OS))
+  // `TARGET` is set for build scripts and missing at runtime; `env::consts::OS`
+  // spells macOS "macos", while the triples below match on "apple-darwin".
+  env::var("TARGET").unwrap_or_else(|_| {
+    let os = match env::consts::OS {
+      "macos" => "apple-darwin".to_string(),
+      other => other.to_string(),
+    };
+    format!("{}-{}", env::consts::ARCH, os)
+  })
 }
 
 /// Executable path inside an Electron distribution.
@@ -283,4 +291,35 @@ pub(crate) fn install(main_cjs: &str, preload_cjs: &str) -> Result<PathBuf, Stri
     fs::write(&script, contents).map_err(|error| format!("{}: {error}", script.display()))?;
   }
   Ok(dist.join(executable()))
+}
+
+#[cfg(test)]
+mod tests {
+  /// The runtime has no `TARGET` from cargo, so a wrong fallback used to fetch
+  /// a Linux Electron on macOS and then fail as "did not connect".
+  #[test]
+  fn the_archive_name_matches_this_host() {
+    let platform = if cfg!(windows) {
+      "win32"
+    } else if cfg!(target_os = "macos") {
+      "darwin"
+    } else {
+      "linux"
+    };
+    assert_eq!(super::platform(), platform);
+    let arch = match std::env::consts::ARCH {
+      "x86_64" => "x64",
+      "aarch64" => "arm64",
+      other => other,
+    };
+    assert_eq!(super::arch(), arch);
+    let executable = if cfg!(windows) {
+      "electron.exe"
+    } else if cfg!(target_os = "macos") {
+      "Electron.app/Contents/MacOS/Electron"
+    } else {
+      "electron"
+    };
+    assert_eq!(super::executable(), executable);
+  }
 }
