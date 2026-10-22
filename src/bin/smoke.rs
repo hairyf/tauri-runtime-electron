@@ -338,12 +338,19 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
   );
 
   if cfg!(any(windows, target_os = "macos")) {
-    set(failures, "set_maximizable", || {
-      WindowDispatch::<()>::set_maximizable(window, false)
-    });
-    expect(failures, "is_maximizable", false, || {
-      WindowDispatch::<()>::is_maximizable(window)
-    });
+    // Electron's macOS zoom button is enabled from the window style, not from
+    // what set_maximizable asked for (native_window_mac.mm: UpdateZoomButton
+    // only looks at the resizable mask), so only Windows can report it back.
+    if cfg!(windows) {
+      set(failures, "set_maximizable", || {
+        WindowDispatch::<()>::set_maximizable(window, false)
+      });
+      expect(failures, "is_maximizable", false, || {
+        WindowDispatch::<()>::is_maximizable(window)
+      });
+    } else {
+      println!("skip is_maximizable: Electron derives the macOS zoom button from the resizable style");
+    }
     set(failures, "set_minimizable", || {
       WindowDispatch::<()>::set_minimizable(window, false)
     });
