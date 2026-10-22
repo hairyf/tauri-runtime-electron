@@ -74,6 +74,11 @@ follow [Semantic Versioning](https://semver.org/).
   works without extra wiring once the app enables `protocol-asset`.
 
 ### Bug Fixes
+- Every window keeps its own webview serial, and secondary windows no longer
+  inherit the first window's browser window or event handlers.
+- A page's new-window request is answered on the Rust side: `Create` navigates
+  the requested window and `Allow` opens an Electron window instead of relying
+  on Electron's synchronous decision.
 - Packaged apps show the Tauri icon instead of Electron's: the icon is read out of
   the executable's `RT_GROUP_ICON`/`RT_ICON` resources into a temporary `.ico`.
   The executable cannot be passed to `BrowserWindow` directly, and

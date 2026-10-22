@@ -986,16 +986,48 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               continue;
             };
             let features = params["features"].as_str().unwrap_or_default();
-            // Electron already denied the popup; the handler decides whether
-            // Tauri creates a window of its own through the normal path.
-            let handlers = self.context.webview_handlers.borrow();
-            let allowed = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.new_window.as_ref())
-              .map(|handler| handler(url.clone(), features))
-              .unwrap_or(false);
-            if !allowed {
-              eprintln!("[electron] denied new window request for {url}");
+            // Electron always denies the popup: the answer may create a Tauri
+            // window (whose URL is loaded into it), allow a bare popup, or deny.
+            let response = {
+              let handlers = self.context.webview_handlers.borrow();
+              handlers
+                .get(&(serial as u32))
+                .and_then(|handlers| handlers.new_window.as_ref())
+                .map(|handler| handler(url.clone(), features))
+            };
+            match response {
+              Some(NewWindowResponse::Create { window_id }) => {
+                let target = self.context.serial_for_window(window_id);
+                match target {
+                  Some(window_serial) => {
+                    if let Err(error) = self.context.ipc.call(
+                      "webview.navigate",
+                      json!({ "webviewId": window_serial, "url": url.as_str() }),
+                      IPC_TIMEOUT,
+                    ) {
+                      eprintln!("[electron] failed to open {url} in window: {error}");
+                    }
+                  }
+                  None => eprintln!("[electron] new window requested for a closed window: {url}"),
+                }
+              }
+              Some(NewWindowResponse::Allow) => {
+                let (size, _position) = crate::popup::window_features(features);
+                if let Err(error) = self.context.ipc.call(
+                  "webview.openUrl",
+                  json!({
+                    "url": url.as_str(),
+                    "width": size.map(|size| size.width),
+                    "height": size.map(|size| size.height),
+                  }),
+                  IPC_TIMEOUT,
+                ) {
+                  eprintln!("[electron] failed to open popup {url}: {error}");
+                }
+              }
+              Some(NewWindowResponse::Deny) | None => {
+                eprintln!("[electron] denied new window request for {url}");
+              }
             }
           }
           Some("webview.processGone") => {
@@ -1666,7 +1698,8 @@ fn origin_of(url: &str) -> Option<String> {
 pub(crate) struct WebviewHandlers {
   pub(crate) page_load: Option<Rc<dyn Fn(url::Url, PageLoadEvent) + Send>>,
   pub(crate) title: Option<Rc<dyn Fn(String) + Send>>,
-  pub(crate) new_window: Option<Rc<dyn Fn(url::Url, &str) -> bool + Send + Sync>>,
+  pub(crate) new_window:
+    Option<Rc<dyn Fn(url::Url, &str) -> NewWindowResponse + Send + Sync>>,
   pub(crate) process_gone: Option<Rc<dyn Fn(WebContentProcessTermination) + Send>>,
 }
 
@@ -1730,17 +1763,13 @@ fn register_webview_handlers<T: UserEvent>(
         as Rc<dyn Fn(WebContentProcessTermination) + Send>
     });
   let new_window = pending.new_window_handler.take().map(|handler| {
-    let feature_handler = Rc::new(move |url: url::Url, features: &str| {
+    Rc::new(move |url: url::Url, features: &str| {
       let (size, position) = crate::popup::window_features(features);
-      matches!(
-        handler(
-          url,
-          NewWindowFeatures::<T, ElectronRuntime>::new(size, position, ())
-        ),
-        NewWindowResponse::Allow | NewWindowResponse::Create { .. }
+      handler(
+        url,
+        NewWindowFeatures::<T, ElectronRuntime>::new(size, position, ()),
       )
-    });
-    feature_handler as Rc<dyn Fn(url::Url, &str) -> bool + Send + Sync>
+    }) as Rc<dyn Fn(url::Url, &str) -> NewWindowResponse + Send + Sync>
   });
   context.webview_handlers.borrow_mut().insert(
     webview_id,

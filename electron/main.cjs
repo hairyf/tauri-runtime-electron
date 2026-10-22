@@ -750,6 +750,16 @@ function handle(method, params) {
     }
     case 'webview.navigate':
       return contentsFor(params.webviewId).loadURL(params.url).then(() => null)
+    case 'webview.openUrl': {
+      // `NewWindowResponse::Allow`: the engine, not Tauri, owns this window.
+      const popup = new BrowserWindow({
+        width: params.width ?? 800,
+        height: params.height ?? 600,
+        webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false },
+      })
+      popup.loadURL(params.url).catch((error) => log('popup load failed', serializeError(error)))
+      return { windowId: popup.id }
+    }
     case 'webview.reload':
       contentsFor(params.webviewId).reload()
       return null
