@@ -321,6 +321,7 @@ export const cases = {
     t.check('splashscreen transition leaves one visible native main window', visible.length, 1)
     t.check('splashscreen source timer destroys original native splash', after.some((window) => window.handle === splashWindow.handle), false)
     t.check('splashscreen source timer shows original main native window', after.find((window) => window.handle === mainWindow.handle)?.visible, true)
+    t.main = main
     await t.capture(main, 'splashscreen-main')
     await t.native('capture', { OutputPath: path.join(t.dir, 'splashscreen-main-native.png') })
   },
@@ -419,10 +420,11 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
   let closed = false
   const t = {
     dir: root,
+    main: splash,
     check: (label, actual, expected) => assert.deepEqual(actual, expected, label),
     target: async (predicate) => { for (const target of [splash, main]) if (await predicate(target)) return target; throw new Error('missing test target') },
     targets: async () => { closed = true; return [main] },
-    evaluate: async (_target, expression) => expression.includes('currentWindow') ? 'main' : 'This is the main window!',
+    evaluate: async (target, expression) => expression.includes('currentWindow') ? target.id : 'This is the main window!',
     wait: async () => {},
     capture: async (_target, label) => { steps.push(label) },
     splashBefore: async () => { steps.push('before'); return [{ handle: 1, visible: true, clientWidth: 400, clientHeight: 200 }, { handle: 2, visible: false, clientWidth: 800, clientHeight: 600 }] },
@@ -433,6 +435,7 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
   try {
     fs.writeFileSync = () => {}
     await cases.splashscreen(t)
+    assert.equal(t.main, main, 'later menu checks must use the surviving main target')
     assert.deepEqual(steps, ['splashscreen-early', 'before', 'splashscreen-main'])
     t.native = async () => [{ handle: 1, visible: true, clientWidth: 400, clientHeight: 200 }]
     await assert.rejects(cases.splashscreen(t), /splashscreen/)
