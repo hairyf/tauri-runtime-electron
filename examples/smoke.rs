@@ -61,6 +61,7 @@ macro_rules! accepted {
 
 /// macOS animates minimize and fullscreen, so the state settles a moment after
 /// the call returns; poll instead of racing the window manager.
+#[cfg(not(target_os = "linux"))]
 fn eventually<A: Clone + Debug + PartialEq>(
   failures: &mut usize,
   name: &str,
@@ -68,7 +69,7 @@ fn eventually<A: Clone + Debug + PartialEq>(
   mut read: impl FnMut() -> Option<A>,
 ) {
   let mut actual = read();
-  for _ in 0..60 {
+  for _ in 0..200 {
     if actual.as_ref() == Some(&expected) {
       break;
     }
