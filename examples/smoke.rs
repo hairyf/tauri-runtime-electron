@@ -576,6 +576,27 @@ fn checks(runtime: &mut ElectronRuntime, failures: &mut usize) {
         "webview set_background_color",
         v!((webview) set_background_color(Some(Color(0, 0, 0, 255))))
       );
+      check(
+        failures,
+        "webview bounds",
+        v!((webview) bounds()).is_ok(),
+        true,
+      );
+      check(
+        failures,
+        "webview devtools closed",
+        v!((webview) is_devtools_open()).ok(),
+        Some(false),
+      );
+      v!((webview) open_devtools());
+      v!((webview) close_devtools());
+      accepted!(
+        failures,
+        "webview navigate",
+        v!((webview) navigate("about:blank".parse().expect("about:blank")))
+      );
+      accepted!(failures, "webview set_auto_resize", v!((webview) set_auto_resize(true)));
+      accepted!(failures, "webview print", v!((webview) print()));
       accepted!(failures, "webview close", v!((webview) close()));
     }
     Err(error) => {

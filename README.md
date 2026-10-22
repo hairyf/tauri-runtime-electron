@@ -70,7 +70,7 @@ as `[electron] unsupported, ignored: <api>` on first use instead of returning a
 fake success. Linux needs a display server, so CI runs the smoke example under
 `xvfb-run`.
 
-The smoke example asserts ~75 behaviours against two real windows and one guest
+The smoke example asserts ~80 behaviours against two real windows and one guest
 webview: every setter that has a getter round-trips through it, every other
 setter must at least reach Electron without an IPC error, and a third window is
 closed to prove `run_iteration` actually delivers the destroy event. Behaviour

@@ -61,6 +61,8 @@ impl Default for ElectronWindowBuilder {
       owner: None,
       #[cfg(windows)]
       parent: None,
+      #[cfg(target_os = "macos")]
+      macos_parent: None,
     }
   }
 }
