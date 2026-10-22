@@ -12,6 +12,17 @@ A `tauri-runtime` implementation backed by Electron instead of the system webvie
 
 ## Quick Start & Configuration
 
+### 0. Add the Dependency
+
+The crate is not published yet; depend on the `next` branch, which tracks Tauri 3:
+
+```toml
+[dependencies]
+tauri-runtime-electron = { git = "https://github.com/hairyf/tauri-runtime-electron", branch = "next" }
+```
+
+`main` tracks the Tauri 2 line and is not what Tauri 3 applications want. Pin a commit (`rev = "…"`) for reproducible builds.
+
 ### 1. Rust Integration
 
 Initialize the runtime with `tauri::Builder::default()`:
