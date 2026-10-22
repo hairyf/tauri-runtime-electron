@@ -103,7 +103,7 @@ const commandNames = [
 function commandExpected(name, supplied) {
   if (name === 'renamed_command') return 'Err(Command renamed_command not found)'
   if (name === 'renamed_command_in_mod') return 'Err(Command renamed_command_in_mod not found)'
-  if (name === 'raw_request') return `Ok(${read('source/tauri/examples/commands/README.md')})`
+  if (name === 'raw_request') return `Ok(${read('source/tauri/examples/commands/README.md').replace(/\r\n?/g, '\n')})`
   if (name === 'window_label' || name === 'command_arguments_wild') return 'Ok(null)'
   if (name === 'renamed_command_new' || name === 'renamed_command_in_mod_new') return 'Ok(null)'
   if (name === 'stateful_command' || name === 'async_stateful_command') return 'Ok(null)'
@@ -144,13 +144,22 @@ async function expectCommand(t, target, name) {
   await clickButton(t, target, `Run ${name}`)
   await t.wait(
     target,
-    `({ response: document.querySelector('#response')?.textContent ?? '', optional: document.querySelector('#response-optional')?.textContent ?? '' })`,
+    `({ response: document.querySelector('#response')?.innerText ?? '', optional: document.querySelector('#response-optional')?.innerText ?? '' })`,
     (value) => value.response !== '' && value.optional !== '',
     20000,
   )
-  const result = await t.evaluate(target, `({ response: document.querySelector('#response').textContent, optional: document.querySelector('#response-optional').textContent })`)
+  // The source writes innerText: its newlines are <br> nodes, absent from textContent.
+  const result = await t.evaluate(target, `({ response: document.querySelector('#response').innerText, optional: document.querySelector('#response-optional').innerText })`)
   t.check(`${name} with args response`, result.response, commandExpected(name, true))
   t.check(`${name} without args response`, result.optional, commandExpected(name, false))
+  if (name === 'raw_request') {
+    const raw = await t.evaluate(target, `(async () => {
+      const response = await window.__TAURI__.core.invoke('raw_request', { theArgument: 'value' })
+      if (!(response instanceof ArrayBuffer)) throw new Error('raw_request must return an ArrayBuffer')
+      return [...new Uint8Array(response)]
+    })()`)
+    t.check('raw_request exact binary bytes', raw, [...fs.readFileSync(path.join(root, 'source/tauri/examples/commands/README.md'))])
+  }
 }
 
 export const cases = {

@@ -175,6 +175,26 @@ try {
   }
   assert.equal(timers.size, 0, 'attachment must clean up its timer')
 
+  // Validate the helper's real UIA selector without opening a desktop surface.
+  if (process.platform === 'win32') {
+    const { spawnSync } = await import('node:child_process')
+    const menuCheck = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', `
+      $ErrorActionPreference = 'Stop'
+      Add-Type -AssemblyName UIAutomationClient
+      Add-Type -AssemblyName UIAutomationTypes
+      $menuTokens = $null; $menuErrors = $null
+      $menuAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'scripts/verify-native.ps1'), [ref]$menuTokens, [ref]$menuErrors)
+      if ($menuErrors.Count) { throw ($menuErrors | Out-String) }
+      $assignment = $menuAst.Find({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$condition' -and $node.Right.Extent.Text.Contains('[System.Windows.Automation.OrCondition]') }, $true)
+      if (!$assignment) { throw 'Missing menubar role condition' }
+      Invoke-Expression $assignment.Extent.Text
+      $roles = @($condition.GetConditions() | ForEach-Object Value)
+      if ($roles.Count -ne 2 -or $roles[0] -ne [System.Windows.Automation.ControlType]::MenuItem.Id -or $roles[1] -ne [System.Windows.Automation.ControlType]::Button.Id) { throw 'Menubar must accept Win32 MenuItem and Electron popup Button' }
+      'PASS native menu selector: Win32 MenuItem and Electron Button (offline; no UI proof)'
+    `], { cwd: root, stdio: 'inherit', timeout: 10000 })
+    assert.equal(menuCheck.status, 0, menuCheck.error?.message ?? 'native menu selector regression')
+  }
+
   // Execute the real native IPC callback: only Electron's sender/frame chooses identity.
   const sent = []
   let onIpc
@@ -195,6 +215,72 @@ try {
   ]) onIpc({ sender, senderFrame }, data)
   assert.equal(sent.length, 1, 'reject unknown senders, subframes, absent frames and non-string bodies')
 
+  // HTTP aliases let Chromium parse Content-Range totals without changing Rust's URI or bytes.
+  const protocolHandlers = new Map(), protocolEvents = [], forwarded = []
+  const mediaBytes = Buffer.alloc(1024000, 171)
+  let protocolReply = { status: 206, headers: {
+    'content-type': 'video/mp4', 'content-length': String(mediaBytes.length),
+    'content-range': `bytes 0-${mediaBytes.length - 1}/249224577`,
+  }, body: mediaBytes.toString('base64') }
+  Object.assign(sandbox, {
+    Headers, Buffer, Uint8Array, Response, registeredSchemes: new Set(), protocolRequests: new Map(), nextProtocolId: 1,
+    protocol: { handle(scheme, handler) { assert(!protocolHandlers.has(scheme), `duplicate protocol: ${scheme}`); protocolHandlers.set(scheme, handler) } },
+    session: { defaultSession: { fetch(request, options) { forwarded.push({ request, options }); return new Response('network') } } },
+    send(message) {
+      protocolEvents.push(plain(message))
+      const resolve = sandbox.protocolRequests.get(message.params.id)
+      sandbox.protocolRequests.delete(message.params.id)
+      resolve(protocolReply)
+    },
+  })
+  for (const name of ['dispatchProtocol', 'dispatchHttpProtocol']) {
+    const declaration = source.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, 'm'))?.[0]
+    assert.ok(declaration, `missing protocol helper: ${name}`)
+    vm.runInContext(declaration, sandbox)
+  }
+  const protocolRegistration = source.match(/    case 'protocol.register': \{[^]*?(?=    case 'protocol.respond':)/)?.[0]
+  assert.ok(protocolRegistration, 'missing protocol registration')
+  const registerProtocol = vm.runInContext(`(params) => { switch ('protocol.register') { ${protocolRegistration} } }`, sandbox)
+  for (const scheme of ['stream', 'asset', 'tauri', 'ipc', 'stream']) registerProtocol({ scheme })
+  assert.equal(protocolHandlers.size, 6, 'install HTTP transports once and retain custom protocols')
+  for (const transport of ['http', 'https', 'stream']) {
+    const url = transport === 'stream' ? 'stream://localhost/video%20%23.mp4?q=1' : `${transport}://stream.localhost/video%20%23.mp4?q=1`
+    const response = await protocolHandlers.get(transport)(new Request(url, { headers: { Range: 'bytes=0-', Origin: 'https://page.example' } }))
+    assert.equal(response.status, 206)
+    assert.equal(response.headers.get('content-range'), protocolReply.headers['content-range'])
+    assert.equal(response.headers.get('content-length'), String(mediaBytes.length))
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), mediaBytes)
+    const params = protocolEvents.at(-1).params
+    assert.equal(params.uri, 'stream://localhost/video%20%23.mp4?q=1')
+    assert.equal(params.scheme, 'stream')
+    assert.equal(params.method, 'GET')
+    assert.equal(params.headers.range, 'bytes=0-')
+    assert.equal(params.headers.origin, 'https://page.example')
+  }
+  protocolReply = { status: 416, headers: { 'content-range': 'bytes */249224577' }, body: '' }
+  const invalidRange = await protocolHandlers.get('http')(new Request('http://stream.localhost/video.mp4', { headers: { Range: 'bytes=249224577-' } }))
+  assert.equal(invalidRange.status, 416)
+  assert.equal(invalidRange.headers.get('content-range'), 'bytes */249224577')
+  const posted = new Uint8Array([0, 128, 255])
+  await protocolHandlers.get('https')(new Request('https://asset.localhost/a%2Fb?x=1', { method: 'POST', body: posted }))
+  assert.equal(protocolEvents.at(-1).params.uri, 'asset://localhost/a%2Fb?x=1')
+  assert.equal(protocolEvents.at(-1).params.body, Buffer.from(posted).toString('base64'))
+  assert.equal(protocolEvents.at(-1).params.headers.origin, 'asset://localhost')
+  const dispatched = protocolEvents.length
+  for (const transport of ['http', 'https', 'ipc']) {
+    const url = transport === 'ipc' ? 'ipc://localhost/echo' : `${transport}://ipc.localhost/echo`
+    assert.equal((await protocolHandlers.get(transport)(new Request(url))).status, 403)
+  }
+  for (const url of ['https://example.com/', 'http://127.0.0.1:1420/', 'http://unknown.localhost/', 'http://stream.localhost:123/', 'http://stream.localhost.evil/', 'http://sub.stream.localhost/']) {
+    const request = new Request(url)
+    assert.equal(await (await protocolHandlers.get(new URL(url).protocol.slice(0, -1))(request)).text(), 'network')
+    assert.equal(forwarded.at(-1).request, request)
+    assert.deepEqual(plain(forwarded.at(-1).options), { bypassCustomProtocolHandlers: true })
+  }
+  await sandbox.dispatchHttpProtocol({ url: 'http://user@stream.localhost/video.mp4' })
+  assert.equal(protocolEvents.length, dispatched, 'unrelated hosts, ports, credentials and IPC never reach a Rust protocol')
+  assert.equal(sandbox.protocolRequests.size, 0)
+
   // Exercise the real authenticated protocol validator; a renderer cannot choose its identity.
   Object.assign(sandbox, { Headers, Buffer, Uint8Array })
   vm.runInContext(source.match(/^function nativeProtocolRequest\([^]*?^\}/m)[0], sandbox)
@@ -206,7 +292,10 @@ try {
   assert.equal(validated.headers['x-channel-id'], '17')
   assert.equal(validated.body, 'BAU=')
   assert.equal(validated.uri, 'ipc://localhost/echo')
-  for (const url of ['https://ipc.localhost/echo', 'ipc://other/echo', 'http://ipc.localhost:123/echo', 'ipc://user@localhost/echo']) {
+  for (const url of ['http://ipc.localhost/echo', 'https://ipc.localhost/echo']) {
+    assert.deepEqual(plain(sandbox.nativeProtocolRequest({ sender: sibling, senderFrame: sibling.mainFrame }, { ...request, url })), validated)
+  }
+  for (const url of ['https://ipc.localhost.evil/echo', 'ipc://other/echo', 'http://ipc.localhost:123/echo', 'https://ipc.localhost:444/echo', 'ipc://user@localhost/echo', 'https://user@ipc.localhost/echo', 'http://ipc.localhost/echo#spoof']) {
     assert.throws(() => sandbox.nativeProtocolRequest({ sender: sibling, senderFrame: sibling.mainFrame }, { ...request, url }))
   }
   for (const event of [{ sender: sibling, senderFrame: {} }, { sender: { id: 999 }, senderFrame: sibling.mainFrame }]) {

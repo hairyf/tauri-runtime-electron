@@ -42,11 +42,11 @@ Do not edit by hand — re-run the script.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | 🚫 no Electron equivalent | `src/window_handle.rs:206` |
-| `find_class` | ⛔ refused | `src/window_handle.rs:212` |
-| `run_on_android_context` | ⛔ refused | `src/window_handle.rs:222` |
-| `fetch_data_store_identifiers` | ⛔ refused | `src/window_handle.rs:232` |
-| `remove_data_store` | ⛔ refused | `src/window_handle.rs:240` |
+| `set_device_event_filter` | 🚫 no Electron equivalent | `src/window_handle.rs:230` |
+| `find_class` | ⛔ refused | `src/window_handle.rs:236` |
+| `run_on_android_context` | ⛔ refused | `src/window_handle.rs:246` |
+| `fetch_data_store_identifiers` | ⛔ refused | `src/window_handle.rs:256` |
+| `remove_data_store` | ⛔ refused | `src/window_handle.rs:264` |
 
 ## EventLoopProxy
 

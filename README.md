@@ -72,6 +72,12 @@ arguments. Privilege them before Electron starts, alongside their Tauri handler:
 .runtime(tauri_runtime_electron::Electron::default().custom_scheme("stream"))
 ```
 
+`convertFileSrc` uses registered `http://<scheme>.localhost` (or HTTPS) aliases
+for resources. Chromium needs an HTTP-family URL to read the total length of
+partial media responses. Handlers still receive their original custom-scheme URI,
+headers and body. App, IPC and isolation origins keep their direct scheme URLs;
+HTTP aliases cannot invoke IPC.
+
 ---
 
 ## Layout & Architecture

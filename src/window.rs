@@ -911,12 +911,37 @@ pub(crate) mod imp {
     // Capture belongs to Electron's UI thread. WM_CANCELMODE releases it there;
     // ReleaseCapture on this Rust thread cannot do that. Posting the move also
     // leaves the Rust IPC loop free while Electron runs its modal move loop.
-    unsafe {
+    trace_drag(window, hit, "before-post");
+    let result = unsafe {
       GetCursorPos(&mut point)
         .and_then(|_| PostMessageW(Some(window), WM_CANCELMODE, WPARAM(0), LPARAM(0)))
         .and_then(|_| PostMessageW(Some(window), WM_NCLBUTTONDOWN, WPARAM(hit as usize), cursor_lparam(point)))
         .map_err(|error| crate::runtime::create_window_err(error.to_string()))
-    }
+    };
+    trace_drag(window, hit, if result.is_ok() { "posted" } else { "post-failed" });
+    result
+  }
+
+  fn trace_drag(window: HWND, hit: i32, phase: &str) {
+    if std::env::var_os("TAURI_RUNTIME_ELECTRON_LOG").is_none() { return; }
+    use windows::Win32::UI::{Input::KeyboardAndMouse::GetAsyncKeyState, WindowsAndMessaging::{
+      GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    }};
+    let mut process = 0;
+    let mut point = POINT::default();
+    let mut gui = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    // SAFETY: read-only diagnostics on the same Electron HWND used by the post.
+    let (thread, left_down, cursor_ok, gui_ok) = unsafe {
+      let thread = GetWindowThreadProcessId(window, Some(&mut process));
+      (thread, GetAsyncKeyState(1) < 0, GetCursorPos(&mut point).is_ok(), GetGUIThreadInfo(thread, &mut gui).is_ok())
+    };
+    let epoch_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time| time.as_millis()).unwrap_or_default();
+    eprintln!("[electron] native-drag {}", serde_json::json!({
+      "epochMs": epoch_ms, "phase": phase, "hwnd": window.0 as isize, "hit": hit,
+      "processId": process, "threadId": thread, "leftDown": left_down,
+      "cursorOk": cursor_ok, "x": point.x, "y": point.y, "guiOk": gui_ok,
+      "capture": gui.hwndCapture.0 as isize, "moveSize": gui.hwndMoveSize.0 as isize, "guiFlags": gui.flags.0,
+    }));
   }
 
   pub(super) fn start_dragging(handle: isize) -> tauri_runtime::Result<()> {

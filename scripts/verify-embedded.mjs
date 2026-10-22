@@ -129,13 +129,28 @@ async function observeDragInvokes(cdp) {
   const watches = [
     { expression: `getEventListeners(document).mousedown.find(e => String(e.listener).includes('isDragRegion')).listener`,
       condition: `(() => { window.__verifyEmbeddedDrag?.handlers.push({
-        time: performance.now(), trusted: e.isTrusted, button: e.button, detail: e.detail,
+        time: performance.now(), utc: new Date().toISOString(), trusted: e.isTrusted, button: e.button, detail: e.detail,
         bubbles: e.bubbles, region: isDragRegion(e.composedPath()), osName,
         htmlTarget: e.target instanceof window.HTMLElement, pageDocument: e.currentTarget === document
       }); return false })()` },
     { expression: 'window.__TAURI_INTERNALS__.invoke',
       condition: `(() => { if (cmd === 'plugin:window|start_dragging' || cmd === 'plugin:window|internal_toggle_maximize')
-        window.__verifyEmbeddedDrag?.invokes.push({ cmd, time: performance.now(), stack: new Error().stack }); return false })()` },
+        window.__verifyEmbeddedDrag?.invokes.push({ cmd, time: performance.now(), utc: new Date().toISOString(), stack: new Error().stack }); return false })()` },
+    { expression: 'window.__TAURI_INTERNALS__.postMessage',
+      condition: `(() => {
+        const state = window.__verifyEmbeddedDrag
+        if (state && (message.cmd === 'plugin:window|start_dragging' || message.cmd === 'plugin:window|internal_toggle_maximize')) {
+          const entry = state.invokes.findLast(e => e.cmd === message.cmd && e.callback === undefined)
+          if (entry) state.transport.push(Object.assign(entry, { callback: message.callback, error: message.error, sentUtc: new Date().toISOString(), status: 'pending' }))
+        }
+        return false
+      })()` },
+    { expression: 'window.__TAURI_INTERNALS__.runCallback',
+      condition: `(() => {
+        const entry = window.__verifyEmbeddedDrag?.transport.find(e => e.callback === id || e.error === id)
+        if (entry) Object.assign(entry, { status: entry.callback === id ? 'fulfilled' : 'rejected', completed: performance.now(), completedUtc: new Date().toISOString(), result: data })
+        return false
+      })()` },
   ]
   const ids = []
   for (const watch of watches) {
@@ -183,9 +198,9 @@ export async function verifyDrag(t) {
     await t.capture(target, 'drag-before')
     save(t, 'drag-before-native-state', await desktop(t, 'drag-before'))
     await t.evaluate(target, `(() => {
-      const state = { expected: null, events: [], handlers: [], invokes: [] }
+      const state = { expected: null, events: [], handlers: [], invokes: [], transport: [] }
       state.listener = (event) => {
-        const entry = { type: event.type, time: performance.now(), trusted: event.isTrusted,
+        const entry = { type: event.type, time: performance.now(), utc: new Date().toISOString(), trusted: event.isTrusted,
           button: event.button, buttons: event.buttons, bubbles: event.bubbles,
           matches: event.target === state.expected, detail: event.detail, x: event.clientX, y: event.clientY,
           tag: event.target.tagName, role: event.target.getAttribute?.('role'), attr: event.target.getAttribute?.('data-tauri-drag-region') }
@@ -267,11 +282,16 @@ export async function verifyDrag(t) {
     throw error
   } finally {
     try {
-      await t.evaluate(target, `(() => {
+      save(t, 'drag-transport-final', await t.evaluate(target, `(() => {
         const state = window.__verifyEmbeddedDrag
         if (state) for (const type of ['mousedown', 'dblclick', 'focusin']) document.removeEventListener(type, state.listener, true)
+        const transport = state?.transport ?? []
+        const result = { utc: new Date().toISOString(), ready: document.readyState, focused: document.hasFocus(), transport,
+          pending: transport.filter(e => e.status === 'pending').map(e => ({ cmd: e.cmd, callback: e.callback, error: e.error,
+            callbackRegistered: window.__TAURI_INTERNALS__.callbacks.has(e.callback), errorRegistered: window.__TAURI_INTERNALS__.callbacks.has(e.error) })) }
         delete window.__verifyEmbeddedDrag
-      })()`)
+        return result
+      })()`))
     } finally {
       try { save(t, 'drag-renderer-events', rendererEvents) }
       finally { cdp.close() }
@@ -670,7 +690,7 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
     conditions.push(params.condition)
     return { breakpointId: String(conditions.length) }
   } })
-  const document = {}, win = { HTMLElement: class {}, __verifyEmbeddedDrag: { handlers: [], invokes: [] } }
+  const document = {}, win = { HTMLElement: class {}, __verifyEmbeddedDrag: { handlers: [], invokes: [], transport: [] } }
   const event = { isTrusted: true, button: 0, detail: 1, bubbles: true, target: new win.HTMLElement(), currentTarget: document, composedPath: () => [] }
   assert.equal(Function('e', 'window', 'isDragRegion', 'osName', 'document', `return ${conditions[0]}`)(event, win, () => true, 'windows', document), false)
   assert.equal(win.__verifyEmbeddedDrag.handlers[0].region, true)
@@ -679,6 +699,18 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
     assert.equal(Function('cmd', 'window', `return ${conditions[1]}`)(cmd, win), false)
   }
   assert.deepEqual(win.__verifyEmbeddedDrag.invokes.map((e) => e.cmd), ['plugin:window|start_dragging', 'plugin:window|internal_toggle_maximize'])
+  const sendDrag = Function('message', 'window', `return ${conditions[2]}`)
+  const completeDrag = Function('id', 'data', 'window', `return ${conditions[3]}`)
+  for (const [index, entry] of win.__verifyEmbeddedDrag.invokes.entries()) {
+    assert.equal(sendDrag({ cmd: entry.cmd, callback: 10 + index, error: 20 + index }, win), false)
+    assert.equal(entry.status, 'pending')
+  }
+  win.__verifyEmbeddedDrag.invokes.length = 0
+  assert.equal(completeDrag(10, null, win), false)
+  assert.equal(completeDrag(21, 'denied', win), false)
+  assert.equal(completeDrag(99, null, win), false)
+  assert.deepEqual(win.__verifyEmbeddedDrag.transport.map(e => [e.status, e.result]), [['fulfilled', null], ['rejected', 'denied']])
+  assert(win.__verifyEmbeddedDrag.transport.every(e => Date.parse(e.completedUtc) >= Date.parse(e.sentUtc)))
   for (const outcome of ['changed', 'unchanged', 'rejected']) {
     const original = { x: 120, y: 80, width: 816, height: 639, clientWidth: 800, clientHeight: 600, visible: true }
     let maximized = false, calls = 0

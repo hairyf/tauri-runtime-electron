@@ -16,6 +16,30 @@ use tauri_runtime::{
 };
 use tauri_utils::Theme;
 
+// Chromium only interprets Content-Range totals on HTTP-family media URLs.
+// Keep app/IPC/isolation origins direct; the literal placeholder is intentional.
+fn scheme_url(scheme: &str, https: bool) -> String {
+  if matches!(scheme, "tauri" | "ipc" | "isolation") || scheme.starts_with("isolation-") {
+    format!("{scheme}://localhost")
+  } else {
+    format!("{}://{scheme}.localhost", if https { "https" } else { "http" })
+  }
+}
+
+#[cfg(test)]
+#[test]
+fn resource_urls_use_http_without_changing_app_or_isolation_origins() {
+  for https in [false, true] {
+    for scheme in ["tauri", "ipc", "isolation", "isolation-123"] {
+      assert_eq!(scheme_url(scheme, https), format!("{scheme}://localhost"));
+    }
+  }
+  assert_eq!(scheme_url("stream", false), "http://stream.localhost");
+  assert_eq!(scheme_url("asset", true), "https://asset.localhost");
+  assert_eq!(scheme_url("{protocol}", false), "http://{protocol}.localhost");
+  assert_eq!(scheme_url("{protocol}", true), "https://{protocol}.localhost");
+}
+
 #[derive(Debug, Clone)]
 pub struct ElectronRuntimeHandle {
   pub(crate) context: RuntimeContext,
@@ -73,8 +97,8 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     self.context.send_message(Message::Exit)
   }
 
-  fn custom_scheme_url(&self, scheme: &str, _https: bool) -> String {
-    format!("{scheme}://localhost")
+  fn custom_scheme_url(&self, scheme: &str, https: bool) -> String {
+    scheme_url(scheme, https)
   }
 
   fn webview_version(&self) -> Result<String> {

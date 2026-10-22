@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 # Non-interactive compile/state check: & ./scripts/verify-native.ps1 -Action state -RootPid $PID
 # Title matches exactly; Clicks is reserved, and doubleclick always sends two clicks.
 if ($RootPid -le 0) { throw 'RootPid must be a positive process ID.' }
-if ($Action -notin @('state','raise','restore','place','drag','doubleclick','capture','resize','popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click','watch-splash')) { throw "Unknown action: $Action" }
+if ($Action -notin @('state','raise','restore','place','drag','doubleclick','capture','resize','popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click','menu-diagnostics','watch-splash')) { throw "Unknown action: $Action" }
 if ($Action -in @('menu-click','tray-state','tray-click','menubar-click') -and !$ItemText) { throw "$Action requires exact ItemText." }
 if ($Action -eq 'resize' -and ($Width -le 0 -or $Height -le 0)) { throw 'Width and Height must be positive physical client pixel sizes.' }
 if (-not ('NativeVerify' -as [type])) {
@@ -17,11 +17,32 @@ using System.Threading;
 public sealed class NativeWindowState {
     public long handle; public string title;
     public int x, y, width, height, clientX, clientY, clientWidth, clientHeight;
-    public bool visible;
+    public bool visible, maximized, minimized, enabled;
+}
+public sealed class NativeMenuTrace {
+    public long handle, owner; public uint process; public string className; public bool visible;
+    public int x, y, width, height;
+}
+public sealed class NativeInputState {
+    public string phase, utc;
+    public long tick, foreground, hit, capture, moveSize;
+    public uint processId, threadId, guiFlags;
+    public int x, y, physicalX, physicalY;
+    public bool leftDown;
+    public NativeWindowState window;
 }
 public static class NativeVerify {
     [StructLayout(LayoutKind.Sequential)] struct Rect { public int left, top, right, bottom; }
     [StructLayout(LayoutKind.Sequential)] struct Point { public int x, y; }
+    [StructLayout(LayoutKind.Sequential)] struct GuiThreadInfo {
+        public uint size, flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+        public Rect caretRect;
+    }
+    [DllImport("user32.dll", SetLastError=true)] static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool GetPhysicalCursorPos(out Point point);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
     delegate bool EnumProc(IntPtr window, IntPtr data);
     static HashSet<uint> processes;
     [DllImport("user32.dll", SetLastError=true)] static extern bool EnumWindows(EnumProc callback, IntPtr data);
@@ -34,6 +55,8 @@ public static class NativeVerify {
     [DllImport("user32.dll", SetLastError=true)] static extern bool ClientToScreen(IntPtr window, ref Point point);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr window);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr window);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
@@ -53,6 +76,21 @@ public static class NativeVerify {
         return name.ToString() == className;
     }
     public static bool ScopedPopup(IntPtr window) { return Own(window, "#32768") && IsWindowVisible(window); }
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint command);
+    public static NativeMenuTrace[] MenuWindows() {
+        var result = new List<NativeMenuTrace>();
+        Check(EnumWindows((window, data) => {
+            uint process; GetWindowThreadProcessId(window, out process);
+            if (!processes.Contains(process)) return true;
+            var name = new StringBuilder(256); GetClassName(window, name, name.Capacity);
+            Rect rect; Check(GetWindowRect(window, out rect));
+            result.Add(new NativeMenuTrace { handle=window.ToInt64(), owner=GetWindow(window, 4).ToInt64(), process=process,
+                className=name.ToString(), visible=IsWindowVisible(window), x=rect.left, y=rect.top,
+                width=rect.right-rect.left, height=rect.bottom-rect.top });
+            return true;
+        }, IntPtr.Zero));
+        return result.ToArray();
+    }
     [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetMenuStringW(IntPtr menu, uint item, StringBuilder text, int length, uint flags);
@@ -100,7 +138,8 @@ public static class NativeVerify {
         var title = new StringBuilder(GetWindowTextLength(window) + 1); GetWindowText(window, title, title.Capacity);
         return new NativeWindowState { handle=window.ToInt64(), title=title.ToString(), x=rect.left, y=rect.top,
             width=rect.right-rect.left, height=rect.bottom-rect.top, clientX=origin.x, clientY=origin.y,
-            clientWidth=client.right-client.left, clientHeight=client.bottom-client.top, visible=IsWindowVisible(window) };
+            clientWidth=client.right-client.left, clientHeight=client.bottom-client.top, visible=IsWindowVisible(window),
+            maximized=IsZoomed(window), minimized=IsIconic(window), enabled=IsWindowEnabled(window) };
     }
     public static NativeWindowState[] Windows(uint[] pids) {
         processes = new HashSet<uint>(pids); var handles = new List<IntPtr>();
@@ -108,7 +147,10 @@ public static class NativeVerify {
         return handles.ConvertAll(Read).ToArray();
     }
     public static void Raise(IntPtr window) {
-        Require(window); ShowWindow(window, IsIconic(window) ? 9 : 5); BringWindowToTop(window);
+        Require(window);
+        if (!IsWindowVisible(window)) throw new InvalidOperationException("Cannot raise an invisible target window.");
+        if (IsIconic(window)) ShowWindow(window, 9);
+        BringWindowToTop(window);
         if (!SetForegroundWindow(window)) {
             bool topmost = (GetWindowLong(window, -20) & 8) != 0;
             try {
@@ -133,6 +175,17 @@ public static class NativeVerify {
         Cursor(x, y);
     }
     public static void Cursor(int x, int y) { Check(SetCursorPos(x, y)); }
+    public static NativeInputState Input(IntPtr window, string phase) {
+        Require(window); Point point, physical; uint process;
+        uint thread = GetWindowThreadProcessId(window, out process);
+        var gui = new GuiThreadInfo { size=(uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        Check(GetCursorPos(out point)); Check(GetPhysicalCursorPos(out physical)); Check(GetGUIThreadInfo(thread, ref gui));
+        return new NativeInputState { phase=phase, utc=DateTime.UtcNow.ToString("O"), tick=Environment.TickCount64,
+            processId=process, threadId=thread, x=point.x, y=point.y, physicalX=physical.x, physicalY=physical.y,
+            leftDown=GetAsyncKeyState(1)<0, foreground=GetForegroundWindow().ToInt64(),
+            hit=GetAncestor(WindowFromPoint(point), 2).ToInt64(), guiFlags=gui.flags,
+            capture=gui.capture.ToInt64(), moveSize=gui.moveSize.ToInt64(), window=Read(window) };
+    }
 }
 '@
 }
@@ -187,10 +240,33 @@ function Save-Rectangle($rect) {
         $bitmap.Save($OutputPath, [Drawing.Imaging.ImageFormat]::Png)
     } finally { if ($graphics) { $graphics.Dispose() }; $bitmap.Dispose() }
 }
-if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click') -or ($Action -eq 'capture' -and $Surface -ne 'window')) {
+if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click','menu-diagnostics') -or ($Action -eq 'capture' -and $Surface -ne 'window')) {
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
     function Bounds($rect) { @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
+    if ($Action -eq 'menu-diagnostics') {
+        $traces = @(foreach ($nativeWindow in [NativeVerify]::MenuWindows()) {
+            $nodes = [Collections.Generic.List[object]]::new()
+            $queue = [Collections.Generic.Queue[object]]::new()
+            $errorText = $null
+            try {
+                $queue.Enqueue(@{ element=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$nativeWindow.handle); depth=0 })
+                while ($queue.Count -and $nodes.Count -lt 128) {
+                    $node = $queue.Dequeue(); $info = $node.element.Current
+                    $nodes.Add(@{ depth=$node.depth; role=$info.ControlType.ProgrammaticName; name=$info.Name; className=$info.ClassName; process=$info.ProcessId; handle=$info.NativeWindowHandle; offscreen=$info.IsOffscreen; bounds=(Bounds $info.BoundingRectangle) })
+                    if ($node.depth -ge 8) { continue }
+                    $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetFirstChild($node.element)
+                    while ($entry -and $nodes.Count+$queue.Count -lt 128) {
+                        $queue.Enqueue(@{ element=$entry; depth=$node.depth+1 })
+                        $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetNextSibling($entry)
+                    }
+                }
+            } catch [System.Windows.Automation.ElementNotAvailableException] { $errorText = "ElementNotAvailable: $($_.Exception.Message)" }
+              catch [System.Runtime.InteropServices.COMException] { $errorText = "COM $($_.Exception.HResult): $($_.Exception.Message)" }
+            @{ native=$nativeWindow; nodes=@($nodes); error=$errorText; limited=($nodes.Count -ge 128) }
+        })
+        ConvertTo-Json -InputObject $traces -Depth 9 -Compress; return
+    }
     if ($Action -in @('menubar','menubar-click')) {
         $targets = @($windows | Where-Object visible)
         if ($targets.Count -ne 1) { throw 'Menubar requires one visible scoped app window (use exact Title when ambiguous).' }
@@ -200,7 +276,10 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
         $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuBar)
         $bars = @($element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))
         $items = @(foreach ($bar in $bars) {
-            $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem)
+            # Electron's SubmenuButton exposes kPopUpButton; Win32 bars expose MenuItem.
+            $condition = [System.Windows.Automation.OrCondition]::new(
+                [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem),
+                [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))
             foreach ($entry in $bar.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)) {
                 $info = $entry.Current
                 @{ name=($info.Name -split "`t")[0]; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; bounds=(Bounds $info.BoundingRectangle) }
@@ -291,6 +370,7 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
 $targets = @($windows | Where-Object visible)
 if ($targets.Count -ne 1) { throw "Expected one visible scoped Chrome_WidgetWin_1 window; found $($targets.Count). Specify an exact Title if ambiguous." }
 $handle = [IntPtr]$targets[0].handle
+if ($Action -eq 'capture' -and $targets[0].minimized) { throw 'Cannot capture a minimized target window.' }
 if ($Action -in @('raise','drag','doubleclick','capture')) { [NativeVerify]::Raise($handle); Start-Sleep -Milliseconds 120 }
 $before = [NativeVerify]::Read($handle)
 $result = switch ($Action) {
@@ -303,27 +383,46 @@ $result = switch ($Action) {
         $px = [int][Math]::Round($X); $py = [int][Math]::Round($Y)
         if ($px -lt 0 -or $py -lt 0 -or $px -ge $before.clientWidth -or $py -ge $before.clientHeight) { throw 'X and Y must lie inside the target client area.' }
         $sx = $before.clientX + $px; $sy = $before.clientY + $py
+        $inputTrace = [Collections.Generic.List[object]]::new()
         [NativeVerify]::Aim($handle, $sx, $sy); Start-Sleep -Milliseconds 40
+        $inputTrace.Add([NativeVerify]::Input($handle, 'aim'))
         if ($Action -eq 'drag') {
             [NativeVerify]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
             try {
                 Start-Sleep -Milliseconds 40
+                $inputTrace.Add([NativeVerify]::Input($handle, 'down'))
                 for ($step = 1; $step -le 10; $step++) {
                     [NativeVerify]::Cursor([int][Math]::Round($sx + $Dx * $step / 10.0), [int][Math]::Round($sy + $Dy * $step / 10.0))
                     Start-Sleep -Milliseconds 20
+                    $inputTrace.Add([NativeVerify]::Input($handle, "move-$step"))
                 }
             } finally { [NativeVerify]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero) }
+            $inputTrace.Add([NativeVerify]::Input($handle, 'up'))
         } else {
             for ($click = 0; $click -lt 2; $click++) {
                 [NativeVerify]::Aim($handle, $sx, $sy)
                 [NativeVerify]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
-                try { Start-Sleep -Milliseconds 25 } finally { [NativeVerify]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero) }
+                try {
+                    Start-Sleep -Milliseconds 25
+                    $inputTrace.Add([NativeVerify]::Input($handle, "click-$click-down"))
+                } finally { [NativeVerify]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero) }
                 Start-Sleep -Milliseconds 40
+                $inputTrace.Add([NativeVerify]::Input($handle, "click-$click-up"))
             }
         }
         Start-Sleep -Milliseconds 250
-        @{ before=$before; after=[NativeVerify]::Read($handle) }
+        $inputTrace.Add([NativeVerify]::Input($handle, 'settled'))
+        @{ before=$before; after=[NativeVerify]::Read($handle); inputTrace=@($inputTrace.ToArray()) }
     }
-    'capture' { Save-Rectangle $before; $before }
+    'capture' {
+        Save-Rectangle $before
+        $after = [NativeVerify]::Read($handle)
+        $observation = @{ before=$targets[0]; activated=$before; after=$after }
+        ConvertTo-Json -InputObject $observation -Depth 6 | Set-Content -LiteralPath ([IO.Path]::ChangeExtension($OutputPath, '.json')) -Encoding utf8
+        foreach ($field in @('handle','x','y','width','height','clientX','clientY','clientWidth','clientHeight','visible','maximized','minimized','enabled')) {
+            if ($targets[0].$field -cne $before.$field -or $before.$field -cne $after.$field) { throw "Screenshot changed native window $field; see capture state JSON." }
+        }
+        $after
+    }
 }
 ConvertTo-Json -InputObject $result -Depth 4 -Compress

@@ -98,6 +98,10 @@ follow [Semantic Versioning](https://semver.org/).
   real API surface can be exercised by hand without touching `source/tauri`.
 
 ### Bug Fixes
+- Resource URL conversion uses registered HTTP/HTTPS aliases so Chromium parses
+  the total `Content-Range` length of chunked video instead of treating the first
+  chunk as the whole file. Custom handlers keep their canonical URI and request
+  data; unrelated network requests pass through and IPC aliases are refused.
 - Every window keeps its own webview serial, and secondary windows no longer
   inherit the first window's browser window or event handlers.
 - A page's new-window request is answered on the Rust side: `Create` navigates
@@ -139,8 +143,8 @@ follow [Semantic Versioning](https://semver.org/).
 - Fix context menus never appearing: `Window::popup_menu` handed muda the
   Electron window, which belongs to another process, so `TrackPopupMenu`
   returned at once and drew nothing. Tauri now gets a 1x1 window owned by the
-  thread that tracks the menu; a menu *bar* still has no visible effect, because
-  Electron draws that from its own menu API.
+  thread that tracks the menu. Its menu bar is mirrored into Electron's visible
+  menu API, with selections routed back to that owner's original muda menu.
 - Fix every app sharing one Chromium profile (`%APPDATA%\Electron`), which made
   two Tauri apps fight over the same cache lock until the renderer crashed: the
   profile is now `appData/<identifier>` and the identifier reaches `main.cjs`

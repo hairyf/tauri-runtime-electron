@@ -139,7 +139,7 @@ const protocolRequests = new Map()
 let nextProtocolId = 1
 const registeredSchemes = new Set()
 
-async function dispatchProtocol(scheme, request) {
+async function dispatchProtocol(scheme, request, uri = request.url) {
   const id = nextProtocolId++
   const body = Buffer.from(await request.arrayBuffer()).toString('base64')
   const headers = {}
@@ -148,24 +148,40 @@ async function dispatchProtocol(scheme, request) {
     // Tauri's protocols validate the request origin; a synthetic one keeps
     // `tauri://localhost` and `ipc://localhost` requests looking native.
     try {
-      const url = new URL(request.url)
+      const url = new URL(uri)
       headers.origin = `${url.protocol.slice(0, -1)}://${url.host}`
     } catch {}
   }
   const response = new Promise((resolve) => protocolRequests.set(id, resolve))
   send({
     event: 'protocol.request',
-    params: { id, scheme, uri: request.url, method: request.method, headers, body },
+    params: { id, scheme, uri, method: request.method, headers, body },
   })
   const reply = await response
-  log('protocol', scheme, request.method, request.url, reply.status)
+  const data = Buffer.from(reply.body ?? '', 'base64')
+  log('protocol', scheme, request.method, request.url, reply.status, JSON.stringify({
+    range: headers.range, contentRange: reply.headers?.['content-range'],
+    contentLength: reply.headers?.['content-length'], bytes: data.length,
+  }))
   if (reply.status >= 400) {
-    log('protocol-error', request.url, Buffer.from(reply.body ?? '', 'base64').toString().slice(0, 300))
+    log('protocol-error', request.url, data.toString().slice(0, 300))
   }
-  return new Response(Buffer.from(reply.body ?? '', 'base64'), {
+  return new Response(data, {
     status: reply.status ?? 200,
     headers: reply.headers ?? {},
   })
+}
+
+function dispatchHttpProtocol(request) {
+  const url = new URL(request.url)
+  const scheme = url.hostname.endsWith('.localhost') ? url.hostname.slice(0, -'.localhost'.length) : ''
+  if (url.username || url.password || url.port || !registeredSchemes.has(scheme)) {
+    return session.defaultSession.fetch(request, { bypassCustomProtocolHandlers: true })
+  }
+  // Keep commands on the authenticated IPC bridge, including their HTTP aliases.
+  if (scheme === 'ipc') return new Response('Use native IPC', { status: 403 })
+  // Chromium reads Content-Range's total only for HTTP-family media URLs.
+  return dispatchProtocol(scheme, request, `${scheme}://localhost${url.pathname}${url.search}`)
 }
 
 /** @type {import('node:net').Socket | undefined} */
@@ -667,6 +683,11 @@ async function createWindow(params) {
   // Read this now: by the time `closed` fires the window and its webContents are
   // destroyed, and `window.webContents.id` throws "Object has been destroyed".
   const contentsId = window.webContents.id
+  if (process.platform === 'win32' && process.env.TAURI_RUNTIME_ELECTRON_LOG) {
+    for (const [message, phase] of [[0x0231, 'enter'], [0x0232, 'exit']]) {
+      window.hookWindowMessage(message, () => log('native-move-loop', phase, JSON.stringify({ windowId, ...readGeometry(window) })))
+    }
+  }
 
   applyWindowConfig(window, config, params)
   installWindowTheme(window, windowId, config.theme)
@@ -1610,6 +1631,9 @@ function handle(method, params) {
     case 'protocol.register': {
       const { scheme } = params
       if (registeredSchemes.has(scheme)) return null
+      if (!registeredSchemes.size) {
+        for (const transport of ['http', 'https']) protocol.handle(transport, dispatchHttpProtocol)
+      }
       registeredSchemes.add(scheme)
       // A protocol Request cannot identify its native caller. Commands must
       // use the authenticated tauri-ipc bridge, never the first scheme owner.
@@ -1662,7 +1686,7 @@ function nativeProtocolRequest(event, request) {
   }
   const url = new URL(request?.url)
   if (!((url.protocol === 'ipc:' && url.host === 'localhost') ||
-    (url.protocol === 'http:' && url.host === 'ipc.localhost')) || url.username || url.password || url.hash) {
+    (['http:', 'https:'].includes(url.protocol) && url.host === 'ipc.localhost')) || url.username || url.password || url.hash) {
     throw new Error('Invalid IPC URL')
   }
   if (!['POST', 'OPTIONS'].includes(request.method) || !Array.isArray(request.headers) || !(request.body instanceof Uint8Array)) {

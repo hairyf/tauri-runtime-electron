@@ -242,6 +242,9 @@ async function run(name, index) {
     result.status = 'failed'
     result.error = String(error.stack ?? error)
     console.error(`FAIL ${name}: ${error.message}`)
+    // Observe menus before any screenshot helper can change foreground ownership.
+    try { result.nativeMenuDiagnostics = t.native('menu-diagnostics') }
+    catch (diagnosticError) { result.nativeMenuDiagnosticsError = String(diagnosticError.stack ?? diagnosticError) }
     try { for (const [i, target] of (await targets()).entries()) await t.capture(target, `${name}-failure-${i}`) } catch {}
   } finally {
     stop(child)
