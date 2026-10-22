@@ -63,12 +63,12 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `WebviewDispatch::reparent` | `warned` | [src/webview.rs:239](src/webview.rs#L239) | implemented |
 | `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:883](src/runtime.rs#L883) | implemented |
 | `Runtime::run_iteration` | `no-op` | [src/runtime.rs:901](src/runtime.rs#L901) | implemented |
-| `RuntimeHandle::display_handle` | `panic` — Windows path wired | [src/window_handle.rs:98](src/window_handle.rs#L98) | implemented |
-| `RuntimeHandle::set_device_event_filter` | `warned` | [src/window_handle.rs:198](src/window_handle.rs#L198) | implemented |
-| `RuntimeHandle::find_class` | `panic` | [src/window_handle.rs:206](src/window_handle.rs#L206) | `noop` |
-| `RuntimeHandle::run_on_android_context` | `panic` | [src/window_handle.rs:216](src/window_handle.rs#L216) | implemented |
-| `RuntimeHandle::fetch_data_store_identifiers` | `panic` | [src/window_handle.rs:226](src/window_handle.rs#L226) | implemented |
-| `RuntimeHandle::remove_data_store` | `panic` | [src/window_handle.rs:234](src/window_handle.rs#L234) | implemented |
+| `RuntimeHandle::display_handle` | `panic` — Windows path wired | [src/window_handle.rs:99](src/window_handle.rs#L99) | implemented |
+| `RuntimeHandle::set_device_event_filter` | `warned` | [src/window_handle.rs:199](src/window_handle.rs#L199) | implemented |
+| `RuntimeHandle::find_class` | `panic` | [src/window_handle.rs:207](src/window_handle.rs#L207) | `noop` |
+| `RuntimeHandle::run_on_android_context` | `panic` | [src/window_handle.rs:217](src/window_handle.rs#L217) | implemented |
+| `RuntimeHandle::fetch_data_store_identifiers` | `panic` | [src/window_handle.rs:227](src/window_handle.rs#L227) | implemented |
+| `RuntimeHandle::remove_data_store` | `panic` | [src/window_handle.rs:235](src/window_handle.rs#L235) | implemented |
 
 ## Every member
 
