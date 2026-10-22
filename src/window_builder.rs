@@ -116,7 +116,11 @@ impl WindowBuilder for ElectronWindowBuilder {
     self
   }
 
-  fn decorations(self, decorations: bool) -> Self {
+  fn decorations(mut self, decorations: bool) -> Self {
+    self
+      .config
+      .get_or_insert_with(WindowConfig::default)
+      .decorations = decorations;
     self
   }
 
