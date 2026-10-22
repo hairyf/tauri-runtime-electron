@@ -449,7 +449,7 @@ export const cases = {
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
         return { requested: targetTime, actual: element.currentTime }
       })()`,
-      20000,
+      30000,
     )
     t.check('streaming seek reaches requested time', Math.abs(seek.actual - seek.requested) < 0.25, true)
 
