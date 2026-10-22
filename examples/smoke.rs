@@ -310,6 +310,17 @@ fn checks(runtime: &ElectronRuntime, failures: &mut usize) {
   // A window manager is required for these, and xvfb has none.
   #[cfg(not(target_os = "linux"))]
   {
+    // Fullscreen goes first: AppKit ignores the request while the window is
+    // still restoring from a minimize, which is where this used to flake.
+    w!((window) set_fullscreen(true)).expect("fullscreen");
+    eventually(failures, "set_fullscreen true", true, || {
+      w!((window) is_fullscreen()).ok()
+    });
+    w!((window) set_fullscreen(false)).expect("windowed");
+    eventually(failures, "set_fullscreen false", false, || {
+      w!((window) is_fullscreen()).ok()
+    });
+
     w!((window) maximize()).expect("maximize");
     eventually(failures, "maximize", true, || {
       w!((window) is_maximized()).ok()
@@ -325,15 +336,6 @@ fn checks(runtime: &ElectronRuntime, failures: &mut usize) {
     w!((window) unminimize()).expect("unminimize");
     eventually(failures, "unminimize", false, || {
       w!((window) is_minimized()).ok()
-    });
-
-    w!((window) set_fullscreen(true)).expect("fullscreen");
-    eventually(failures, "set_fullscreen true", true, || {
-      w!((window) is_fullscreen()).ok()
-    });
-    w!((window) set_fullscreen(false)).expect("windowed");
-    eventually(failures, "set_fullscreen false", false, || {
-      w!((window) is_fullscreen()).ok()
     });
   }
   accepted!(
