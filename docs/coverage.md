@@ -87,5 +87,5 @@ Every member is implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `transient_for` | 🚫 no Electron equivalent | `src/window_builder.rs:282` |
+| `transient_for` | 🚫 no Electron equivalent | `src/window_builder.rs:284` |
 
