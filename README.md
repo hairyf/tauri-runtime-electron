@@ -18,6 +18,21 @@ A `tauri-runtime` implementation backed by Electron instead of the system webvie
 
 ### 1. Rust Integration
 
+The crate is not published to crates.io, so depend on the repository:
+
+```bash
+cargo add --git https://github.com/hairyf/tauri-runtime-electron
+```
+
+```toml
+[dependencies]
+tauri-runtime-electron = { git = "https://github.com/hairyf/tauri-runtime-electron" }
+```
+
+Pin `rev = "<sha>"` (or a tag) once you ship something, and point `path` at a
+checkout while working on the runtime itself. `main` is the Tauri 2 line;
+`branch = "next"` tracks Tauri 3.0.0-alpha.
+
 Tauri 2 selects the runtime through the builder's type parameter:
 
 ```rust
