@@ -1,0 +1,8 @@
+{
+  "name": "tauri-runtime-electron",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "example": "node scripts/example.mjs"
+  }
+}

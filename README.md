@@ -91,18 +91,21 @@ trip, the page lifecycle handlers, devtools, close). CI runs it on Windows, macO
 Linux (under `xvfb-run`), so a platform that silently stops honouring a setter fails the
 build instead of a user's app.
 
-### Running Tauri's official example
+### Running Tauri's official examples
 
 ```bash
-node scripts/api-example.mjs
+pnpm example <name>
 ```
 
-The api example in the `source/tauri` submodule drives menus, tray, dialogs, events,
-channels, plugins and most of the webview API, which makes it the broadest test we have.
-The script copies that workspace into `target/api-example/`, patches the copy onto this
-runtime, runs it, and deletes it again — `source/tauri` is only ever read.
+`pnpm example` with no name lists the examples that can be built: `api`,
+`file-associations` and `resources` (`resources` and `file-associations` are self
+contained, so they run without any setup). Each run copies the example workspace into
+`target/examples/<name>/`, patches the copy onto this runtime, runs it, and deletes it
+again — `source/tauri` is only ever read.
 
-Its frontend is not checked in, so build it once first (needs network):
+The `api` example drives menus, tray, dialogs, events, channels, plugins and most of the
+webview API, which makes it the broadest test we have. Its frontend is not checked in, so
+build it once first (needs network):
 
 ```bash
 cd source/tauri/examples/api && pnpm install && pnpm build
