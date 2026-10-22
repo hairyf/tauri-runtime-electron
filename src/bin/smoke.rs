@@ -97,6 +97,9 @@ fn main() -> ExitCode {
     visible: true,
     decorations: true,
     always_on_top: true,
+    // Creation-time only: nothing can set the minimum size afterwards.
+    min_width: Some(250.0),
+    min_height: Some(180.0),
     ..Default::default()
   };
 
@@ -249,6 +252,19 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
     (_, Err(error)) => failures.push(format!("outer_size: {error}")),
     (Err(error), _) => failures.push(format!("inner_size: {error}")),
   }
+
+  // The minimum size came from the creation config; a window smaller than it
+  // means the runtime dropped that field on the way to Electron. Electron
+  // applies it to the frame, so `outer_size` is what has to hold. Last, because
+  // it leaves the window at the minimum.
+  let scale = WindowDispatch::<()>::scale_factor(window).unwrap_or(1.0);
+  let floor = PhysicalSize::new((250.0 * scale) as u32, (180.0 * scale) as u32);
+  set(failures, "set_size below the minimum", || {
+    WindowDispatch::<()>::set_size(window, Size::Physical(PhysicalSize::new(120, 100)))
+  });
+  expect_floor(failures, "minimum size holds", floor, || {
+    WindowDispatch::<()>::outer_size(window)
+  });
 }
 
 fn state_checks(window: &Window, failures: &mut Vec<String>) {
@@ -710,6 +726,34 @@ fn expect_size(
       })
     },
   );
+}
+
+/// Retries a getter until the size is at least `floor` in both dimensions.
+fn expect_floor(
+  failures: &mut Vec<String>,
+  name: &str,
+  floor: PhysicalSize<u32>,
+  mut read: impl FnMut() -> tauri_runtime::Result<PhysicalSize<u32>>,
+) {
+  let started = Instant::now();
+  loop {
+    match read() {
+      Ok(got) if got.width >= floor.width && got.height >= floor.height => {
+        CHECKS.fetch_add(1, Ordering::Relaxed);
+        println!("ok   {name} {:?} in {:?}", got, started.elapsed());
+        return;
+      }
+      Ok(got) if started.elapsed() > SETTLE => {
+        failures.push(format!("{name}: got {got:?}, want at least {floor:?}"));
+        return;
+      }
+      Err(error) if started.elapsed() > SETTLE => {
+        failures.push(format!("{name}: {error}"));
+        return;
+      }
+      _ => thread::sleep(Duration::from_millis(25)),
+    }
+  }
 }
 
 /// Requires the observed window events to contain `want`.

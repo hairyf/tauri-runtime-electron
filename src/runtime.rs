@@ -1437,6 +1437,29 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       "transparent": config.transparent,
       "visible": config.visible,
       "alwaysOnTop": config.always_on_top,
+      // Everything below is creation-time only: Electron cannot change these
+      // after the window exists, so a field left out here is silently lost.
+      "minWidth": config.min_width,
+      "minHeight": config.min_height,
+      "maxWidth": config.max_width,
+      "maxHeight": config.max_height,
+      "maximized": config.maximized,
+      "fullscreen": config.fullscreen,
+      "maximizable": config.maximizable,
+      "minimizable": config.minimizable,
+      "closable": config.closable,
+      "focusable": config.focusable,
+      "skipTaskbar": config.skip_taskbar,
+      "alwaysOnBottom": config.always_on_bottom,
+      "visibleOnAllWorkspaces": config.visible_on_all_workspaces,
+      "contentProtected": config.content_protected,
+      "shadow": config.shadow,
+      "backgroundColor": config.background_color.map(|color| {
+        let tauri_utils::config::Color(red, green, blue, alpha) = color;
+        format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}")
+      }),
+      "titleBarHidden": !matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Visible),
+      "titleBarOverlay": matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Overlay),
     });
   }
   if let Some(icon) = &context.icon {
@@ -1629,6 +1652,7 @@ fn register_ipc_handler<T: UserEvent>(
   context.ipc_handlers.borrow_mut().insert(webview_id, handler);
 }
 
+/// Electron only reads the title bar style while creating the window.
 fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
   pending: &PendingWebview<T, R>,
 ) -> Vec<String> {

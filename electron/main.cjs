@@ -314,6 +314,31 @@ async function createWindow(params) {
   const icon =
     typeof params.icon === 'string' ? params.icon.replace(/^\\\\\?\\/, '') : params.icon
   log('window.create', JSON.stringify({ windowId, icon: icon ?? null }))
+  // Creation-time fields are the only chance Electron gets: it ignores most of
+  // them afterwards, so a field missing here is a config value silently lost.
+  // linux ignores maximizable/minimizable/closable/focusable, like Tauri does.
+  const creation = {
+    minWidth: params.minWidth,
+    minHeight: params.minHeight,
+    maxWidth: params.maxWidth,
+    maxHeight: params.maxHeight,
+    fullscreen: params.fullscreen ?? false,
+    maximizable: params.maximizable ?? true,
+    minimizable: params.minimizable ?? true,
+    closable: params.closable ?? true,
+    focusable: params.focusable ?? true,
+    skipTaskbar: params.skipTaskbar ?? false,
+    alwaysOnBottom: params.alwaysOnBottom ?? false,
+    visibleOnAllWorkspaces: params.visibleOnAllWorkspaces ?? false,
+    contentProtection: params.contentProtected ?? false,
+    hasShadow: params.shadow ?? true,
+    ...(params.backgroundColor ? { backgroundColor: params.backgroundColor } : {}),
+    ...(params.titleBarHidden ? { titleBarStyle: 'hidden' } : {}),
+    ...(params.titleBarOverlay ? { titleBarOverlay: true } : {}),
+  }
+  for (const key of Object.keys(creation)) {
+    if (creation[key] === null) delete creation[key]
+  }
   const window = new BrowserWindow({
     title: params.title ?? 'Electron Runtime',
     width: params.width ?? 800,
@@ -326,6 +351,7 @@ async function createWindow(params) {
     transparent: params.transparent ?? false,
     show: params.visible ?? true,
     alwaysOnTop: params.alwaysOnTop ?? false,
+    ...creation,
     autoHideMenuBar: true,
     ...(icon ? { icon } : {}),
     webPreferences: {
@@ -341,6 +367,8 @@ async function createWindow(params) {
     },
   })
   windows.set(windowId, window)
+  // Electron has no constructor option for the maximized state.
+  if (params.maximized) window.maximize()
   // Electron has no decorations getter, so remember what the window was created
   // with; `window.decorations` updates it when the Win32 styles are toggled.
   window.__tauriDecorations = params.decorations ?? true
