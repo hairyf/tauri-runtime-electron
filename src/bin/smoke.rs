@@ -118,6 +118,11 @@ fn main() -> ExitCode {
       // The window loads this page itself, so the checks below can eval against
       // a document that really exists.
       webview.url = PAGE.to_string();
+      // The page posts through `window.ipc.postMessage`, which is the bridge
+      // Tauri's own IPC script uses; the handler is the other end of it.
+      webview.ipc_handler = Some(Box::new(|_webview, request| {
+        IPC.lock().unwrap().push(request.body().clone());
+      }));
       pending.set_webview(webview);
     }
     Err(error) => {
@@ -548,6 +553,22 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     webview,
     "String(window.devicePixelRatio)",
   );
+
+  // The page talks to the runtime the way a Tauri app's frontend does.
+  let _ = eval_once(webview, "window.ipc.postMessage('ping')");
+  let started = Instant::now();
+  loop {
+    if IPC.lock().is_ok_and(|messages| messages.iter().any(|body| body == "ping")) {
+      CHECKS.fetch_add(1, Ordering::Relaxed);
+      println!("ok   ipc round trip ping in {:?}", started.elapsed());
+      return;
+    }
+    if started.elapsed() > SETTLE {
+      failures.push("ipc round trip: the page's postMessage never reached the handler".into());
+      return;
+    }
+    thread::sleep(Duration::from_millis(25));
+  }
 }
 
 /// Evaluates `script` once, for a value another check has to compare against.
@@ -716,3 +737,6 @@ fn expect_named(
 
 static CHECKS: AtomicUsize = AtomicUsize::new(0);
 static REPORT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What the page posted through the IPC bridge, as the runtime received it.
+static IPC: Mutex<Vec<String>> = Mutex::new(Vec::new());

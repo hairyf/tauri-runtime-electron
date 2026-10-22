@@ -1109,6 +1109,12 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             };
             let body = params["body"].as_str().unwrap_or_default().to_string();
             let url = params["url"].as_str().unwrap_or_default().to_string();
+            // A `data:` or `about:blank` page has no URI the http crate
+            // accepts, and dropping its messages would lose IPC silently.
+            let url = match url.parse::<http::Uri>() {
+              Ok(_) => url,
+              Err(_) => "tauri://localhost".to_string(),
+            };
             match Request::builder().uri(url).body(body) {
               Ok(request) => handler(request),
               Err(error) => eprintln!("[electron] invalid ipc request url: {error}"),
