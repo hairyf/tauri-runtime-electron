@@ -167,32 +167,36 @@ async function expectCommand(t, target, name) {
 async function mediaRange(t, target, source, connect = observer) {
   const url = new URL(source)
   url.searchParams.set('__verify_range', String(Date.now()))
-  let resolve, reject, timer, cdp
+  let resolve, reject, timer, cdp, requestId, response, finished = false, reading = false
   const received = new Promise((ok, fail) => { resolve = ok; reject = fail })
   // Attach the rejection handler before launching a request that may fail early.
   received.catch(() => {})
   cdp = await connect(target, ({ method, params }) => {
-    if (method !== 'Fetch.requestPaused') return
-    const request = { requestId: params.requestId }
+    if (method === 'Network.requestWillBeSent' && params.request.url === url.href && !requestId) {
+      requestId = params.requestId
+      // The renderer already applied the header to this request; restore it for later loads.
+      cdp.send('Network.setExtraHTTPHeaders', { headers: {} }).catch(reject)
+    }
+    if (!requestId || params?.requestId !== requestId) return
+    if (method === 'Network.responseReceived') response = params.response
+    if (method === 'Network.loadingFailed') reject(new Error(`media range request failed: ${params.errorText}`))
+    if (method === 'Network.loadingFinished') finished = true
+    if (!response || !finished || reading) return
+    reading = true
     const respond = async () => {
-      if (params.responseErrorReason) throw new Error(`media range request failed: ${params.responseErrorReason}`)
-      if (params.responseStatusCode !== undefined) {
-        const body = await cdp.send('Fetch.getResponseBody', request)
-        const headers = Object.fromEntries(params.responseHeaders.map(({ name, value }) => [name.toLowerCase(), value]))
-        await cdp.send('Fetch.continueRequest', request)
-        resolve({ status: params.responseStatusCode, contentRange: headers['content-range'],
-          contentLength: headers['content-length'], bytes: [...Buffer.from(body.body, body.base64Encoded ? 'base64' : 'utf8')] })
-      } else {
-        const headers = Object.entries(params.request.headers).filter(([name]) => name.toLowerCase() !== 'range')
-          .map(([name, value]) => ({ name, value }))
-        await cdp.send('Fetch.continueRequest', { ...request, headers: [...headers, { name: 'Range', value: 'bytes=0-15' }] })
-      }
+      const body = await cdp.send('Network.getResponseBody', { requestId })
+      const headers = Object.fromEntries(Object.entries(response.headers).map(([name, value]) => [name.toLowerCase(), String(value)]))
+      resolve({ status: response.status, contentRange: headers['content-range'],
+        contentLength: headers['content-length'], bytes: [...Buffer.from(body.body, body.base64Encoded ? 'base64' : 'utf8')] })
     }
     respond().catch(reject)
   })
   try {
-    await cdp.send('Fetch.enable', { patterns: ['Request', 'Response'].map(requestStage => ({ urlPattern: url.href, resourceType: 'Media', requestStage })) })
-    timer = setTimeout(() => reject(new Error('media range response timed out')), 20000)
+    // Electron's protocol override bypasses Fetch interception in the downstream factory.
+    // Network applies headers in Blink and observes the actual response in the renderer.
+    await cdp.send('Network.enable')
+    await cdp.send('Network.setExtraHTTPHeaders', { headers: { Range: 'bytes=0-15' } })
+    timer = setTimeout(() => reject(new Error(`media range response timed out: ${json({ url: url.href, requestId, status: response?.status, finished })}`)), 20000)
     await t.evaluate(target, `(() => {
       const video = document.createElement('video')
       video.id = '__verify_range_media'; video.preload = 'auto'; video.muted = true
@@ -201,8 +205,13 @@ async function mediaRange(t, target, source, connect = observer) {
     return await received
   } finally {
     clearTimeout(timer)
-    try { await cdp.send('Fetch.disable') } finally { cdp.close() }
-    await t.evaluate(target, `document.querySelector('#__verify_range_media')?.remove()`)
+    try {
+      await cdp.send('Network.setExtraHTTPHeaders', { headers: {} })
+      await cdp.send('Network.disable')
+    } finally {
+      cdp.close()
+      await t.evaluate(target, `document.querySelector('#__verify_range_media')?.remove()`)
+    }
   }
 }
 
@@ -225,7 +234,7 @@ export const cases = {
     const target = t.main
     await t.wait(target, 'document.querySelectorAll("#container button").length', (value) => value === 29)
     t.check('commands button count', await t.evaluate(target, 'document.querySelectorAll("#container button").length'), 29)
-    await t.capture(target, 'commands-initial')
+    await t.capture(target, 'commands-controls-ready')
 
     for (const name of commandNames) {
       await expectCommand(t, target, name)
@@ -469,27 +478,52 @@ export const cases = {
 
 // Offline verifier contract guard only; this does not verify any desktop app.
 if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  let paused, rangeUrl, rangeHeaders, rangeClosed = false, rangeRemoved = false
-  const range = await mediaRange({ async evaluate(_target, expression) {
-    if (expression.includes("?.remove()")) { rangeRemoved = true; return }
-    paused({ method: 'Fetch.requestPaused', params: { requestId: 'range', request: { headers: { Range: 'bytes=0-', Accept: '*/*' } } } })
-  } }, {}, 'http://stream.localhost/video.mp4', async (_target, onEvent) => {
-    paused = onEvent
-    return { close() { rangeClosed = true }, async send(method, params) {
-      if (method === 'Fetch.enable') { rangeUrl = params.patterns[0].urlPattern; assert.deepEqual(params.patterns.map(p => p.requestStage), ['Request', 'Response']) }
-      if (method === 'Fetch.continueRequest' && params.headers) {
-        rangeHeaders = params.headers
-        paused({ method: 'Fetch.requestPaused', params: { requestId: 'range', responseStatusCode: 206, responseHeaders: [
-          { name: 'Content-Range', value: 'bytes 0-15/123' }, { name: 'Content-Length', value: '16' },
-        ] } })
+  // Network events are renderer-side: Electron's intercepted protocol emits no Fetch pauses.
+  for (const mode of ['response-first', 'finish-first', 'failed', 'body-error']) {
+    let emit, headers = {}, enabled = false, closed = false, removed = false, finished = false, bodyReads = 0
+    const probe = mediaRange({ async evaluate(_target, expression) {
+      if (expression.includes("?.remove()")) { removed = true; return }
+      assert(enabled)
+      assert.deepEqual(headers, { Range: 'bytes=0-15' })
+      const rangeUrl = JSON.parse(expression.match(/video\.src = ("[^]*?");/)[1])
+      assert.equal(new URL(rangeUrl).pathname, '/video.mp4')
+      assert(new URL(rangeUrl).searchParams.has('__verify_range'))
+      emit({ method: 'Network.requestWillBeSent', params: { requestId: 'other', request: { url: 'http://stream.localhost/other.mp4' } } })
+      emit({ method: 'Network.requestWillBeSent', params: { requestId: 'range', request: { url: rangeUrl } } })
+      assert.deepEqual(headers, {}, 'restore global headers as soon as the probe is sent')
+      emit({ method: 'Network.loadingFailed', params: { requestId: 'other', errorText: 'unrelated' } })
+      if (mode === 'failed') {
+        emit({ method: 'Network.loadingFailed', params: { requestId: 'range', errorText: 'ERR_FAILED' } })
+        return
       }
-      if (method === 'Fetch.getResponseBody') return { body: Buffer.from(Array.from({ length: 16 }, (_, i) => i)).toString('base64'), base64Encoded: true }
-    } }
-  })
-  assert.equal(new URL(rangeUrl).pathname, '/video.mp4')
-  assert.deepEqual(rangeHeaders, [{ name: 'Accept', value: '*/*' }, { name: 'Range', value: 'bytes=0-15' }])
-  assert.deepEqual(range, { status: 206, contentRange: 'bytes 0-15/123', contentLength: '16', bytes: Array.from({ length: 16 }, (_, i) => i) })
-  assert(rangeClosed && rangeRemoved, 'range probe must release CDP and temporary media')
+      const response = { method: 'Network.responseReceived', params: { requestId: 'range', response: { status: 206, headers: {
+        'Content-Range': 'bytes 0-15/123', 'Content-Length': '16',
+      } } } }
+      const finish = () => { finished = true; emit({ method: 'Network.loadingFinished', params: { requestId: 'range' } }) }
+      if (mode === 'finish-first') { finish(); assert.equal(bodyReads, 0); emit(response) }
+      else { emit(response); assert.equal(bodyReads, 0); finish() }
+      emit({ method: 'Network.loadingFinished', params: { requestId: 'range' } })
+    } }, {}, 'http://stream.localhost/video.mp4', async (_target, onEvent) => {
+      emit = onEvent
+      return { close() { closed = true }, async send(method, params) {
+        if (method === 'Network.enable') enabled = true
+        else if (method === 'Network.disable') enabled = false
+        else if (method === 'Network.setExtraHTTPHeaders') headers = params.headers
+        else if (method === 'Network.getResponseBody') {
+          assert(finished, 'read the original body after completion')
+          assert.equal(params.requestId, 'range')
+          bodyReads++
+          if (mode === 'body-error') throw new Error('body unavailable')
+          return { body: Buffer.from(Array.from({ length: 16 }, (_, i) => i)).toString('base64'), base64Encoded: true }
+        } else assert.fail(`unexpected CDP command: ${method}`)
+      } }
+    })
+    if (mode === 'failed' || mode === 'body-error') await assert.rejects(probe, mode === 'failed' ? /ERR_FAILED/ : /body unavailable/)
+    else assert.deepEqual(await probe, { status: 206, contentRange: 'bytes 0-15/123', contentLength: '16', bytes: Array.from({ length: 16 }, (_, i) => i) })
+    assert.equal(bodyReads, mode === 'failed' ? 0 : 1)
+    assert(!enabled && closed && removed, 'range probe must release CDP and temporary media on success and failure')
+    assert.deepEqual(headers, {})
+  }
   const main = { id: 'main', type: 'page' }, splash = { id: 'splash', type: 'page', url: 'tauri://localhost/splashscreen.html' }
   const steps = []
   let closed = false

@@ -23,6 +23,10 @@ public sealed class NativeMenuTrace {
     public long handle, owner; public uint process; public string className; public bool visible;
     public int x, y, width, height;
 }
+public sealed class NativeMenuItem {
+    public string rawName; public uint state;
+    public int x, y, width, height;
+}
 public sealed class NativeInputState {
     public string phase, utc;
     public long tick, foreground, hit, capture, moveSize;
@@ -99,18 +103,27 @@ public static class NativeVerify {
     [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetMenuStringW(IntPtr menu, uint item, StringBuilder text, int length, uint flags);
     [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
-    public static string MenuChecked(IntPtr window, string item) {
-        if (!ScopedPopup(window)) throw new InvalidOperationException("Scoped popup is no longer open.");
+    [DllImport("user32.dll", SetLastError=true)] static extern bool GetMenuItemRect(IntPtr window, IntPtr menu, uint item, out Rect rect);
+    public static NativeMenuItem[] NativeMenuItems(IntPtr window) {
+        if (!ScopedPopup(window)) throw new InvalidOperationException("Scoped native popup is no longer open.");
         UIntPtr result;
-        if (SendMessageTimeoutW(window, 0x01E1, IntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero) return null;
+        if (SendMessageTimeoutW(window, 0x01E1, IntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
         var menu = new IntPtr(unchecked((long)result.ToUInt64()));
-        for (uint i=0; i<GetMenuItemCount(menu); i++) {
-            var name = new StringBuilder(1024); GetMenuStringW(menu, i, name, name.Capacity, 0x400);
-            if (name.ToString().Split('\t')[0].Replace("&", "") != item) continue;
+        int count = GetMenuItemCount(menu);
+        if (count < 0) throw new InvalidOperationException("Could not read the displayed native popup menu.");
+        var items = new List<NativeMenuItem>();
+        for (uint i=0; i<count; i++) {
             uint state = GetMenuState(menu, i, 0x400);
-            return state == 0xffffffff ? null : ((state & 8) != 0 ? "On" : "Off");
+            if (state == 0xffffffff) throw new InvalidOperationException("Could not read native popup item state.");
+            if ((state & 0x800) != 0) continue; // MF_SEPARATOR
+            int length = GetMenuStringW(menu, i, null, 0, 0x400);
+            var text = new StringBuilder(length + 1); GetMenuStringW(menu, i, text, text.Capacity, 0x400);
+            Rect rect; Check(GetMenuItemRect(IntPtr.Zero, menu, i, out rect));
+            items.Add(new NativeMenuItem { rawName=text.ToString(), state=state, x=rect.left, y=rect.top,
+                width=rect.right-rect.left, height=rect.bottom-rect.top });
         }
-        return null;
+        return items.ToArray();
     }
     public static void ClickAt(int x, int y, bool right) {
         Cursor(x, y); Thread.Sleep(40);
@@ -257,7 +270,7 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
                     $node = $queue.Dequeue()
                     try {
                         $info = $node.element.Current
-                        $nodes.Add(@{ depth=$node.depth; role=$info.ControlType.ProgrammaticName; name=$info.Name; className=$info.ClassName; process=$info.ProcessId; handle=$info.NativeWindowHandle; offscreen=$info.IsOffscreen; bounds=(Bounds $info.BoundingRectangle) })
+                        $nodes.Add(@{ depth=$node.depth; role=$info.ControlType.ProgrammaticName; name=$info.Name; accelerator=$info.AcceleratorKey; className=$info.ClassName; process=$info.ProcessId; handle=$info.NativeWindowHandle; offscreen=$info.IsOffscreen; bounds=(Bounds $info.BoundingRectangle) })
                         if ($node.depth -ge 8) { continue }
                         $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetFirstChild($node.element)
                         while ($entry -and $nodes.Count+$queue.Count -lt 128) {
@@ -301,24 +314,45 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
         }
         ConvertTo-Json -InputObject $result -Depth 8 -Compress; return
     }
+    function Menu-Name([string]$rawName, [string]$accelerator) {
+        $name = ($rawName -split "`t")[0]
+        if ($accelerator -and $name.EndsWith(" $accelerator", [StringComparison]::Ordinal)) {
+            $name = $name.Substring(0, $name.Length-$accelerator.Length-1)
+        }
+        $name
+    }
     function Get-Popups {
-        # Electron uses a Views MenuRunner desktop widget, not a Win32 #32768.
         $menuRole = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Menu)
         $itemRole = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem)
-        foreach ($nativeWindow in [NativeVerify]::MenuWindows() | Where-Object visible) {
+        $hostClass = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, 'MenuHostRootView')
+        $nativeWindows = @([NativeVerify]::MenuWindows())
+        foreach ($nativeWindow in $nativeWindows | Where-Object visible) {
             try {
                 $popupHandle = [IntPtr]$nativeWindow.handle
+                if ($nativeWindow.className -ceq '#32768') {
+                    # The displayed muda popup has no UIA menu provider on CI.
+                    $items = @(foreach ($item in [NativeVerify]::NativeMenuItems($popupHandle)) {
+                        $parts = $item.rawName -split "`t", 2
+                        @{ name=(Menu-Name ($parts[0] -replace '&(.)', '$1') ''); rawName=$item.rawName; accelerator=$parts[1]; enabled=($item.state -band 3) -eq 0; offscreen=($item.width -le 0 -or $item.height -le 0); checked=$(if ($item.state -band 8) { 'On' } else { 'Off' }); bounds=@{ x=$item.x; y=$item.y; width=$item.width; height=$item.height } }
+                    })
+                    if ($items.Count) { @{ handle=$nativeWindow.handle; bounds=@{ x=$nativeWindow.x; y=$nativeWindow.y; width=$nativeWindow.width; height=$nativeWindow.height }; items=$items } }
+                    continue
+                }
+                # Views duplicates this subtree under the main window. Inspect
+                # only the owned popup HWND with its immediate MenuHostRootView.
+                if (!@($nativeWindows | Where-Object { $_.handle -eq $nativeWindow.owner -and $_.visible -and $_.process -eq $nativeWindow.process }).Count) { continue }
                 $root = [System.Windows.Automation.AutomationElement]::FromHandle($popupHandle)
-                $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Element -bor [System.Windows.Automation.TreeScope]::Children, $menuRole)
+                $menuHost = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $hostClass)
+                if (!$menuHost) { continue }
+                $element = $menuHost.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $menuRole)
                 if (!$element -or $element.Current.IsOffscreen) { continue }
                 $items = @(foreach ($item in $element.FindAll([System.Windows.Automation.TreeScope]::Children, $itemRole)) {
                     $info = $item.Current; $pattern = $null; $checked = $null
                     if ($item.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) { $checked = $pattern.Current.ToggleState.ToString() }
-                    elseif ($nativeWindow.className -ceq '#32768') { $checked = [NativeVerify]::MenuChecked($popupHandle, ($info.Name -split "`t")[0]) }
                     elseif ($item.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$pattern)) {
                         $checked = if ($pattern.Current.State -band 0x10) { 'On' } else { 'Off' }
                     }
-                    @{ name=($info.Name -split "`t")[0]; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=(Bounds $info.BoundingRectangle) }
+                    @{ name=(Menu-Name $info.Name $info.AcceleratorKey); rawName=$info.Name; accelerator=$info.AcceleratorKey; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=(Bounds $info.BoundingRectangle) }
                 })
                 if ($items.Count) { @{ handle=$nativeWindow.handle; bounds=(Bounds $element.Current.BoundingRectangle); items=$items } }
             } catch [System.Windows.Automation.ElementNotAvailableException] { continue }

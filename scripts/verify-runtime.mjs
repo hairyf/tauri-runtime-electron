@@ -196,7 +196,13 @@ try {
       if ($null -ne (Bounds ([System.Windows.Rect]::Empty))) { throw 'Empty menu bounds must remain null' }
       $rect = Bounds ([System.Windows.Rect]::new(20,30,40,50))
       if ($rect.x -ne 20 -or $rect.y -ne 30 -or $rect.width -ne 40 -or $rect.height -ne 50) { throw 'Finite menu bounds must remain unchanged' }
-      'PASS native menu selector and finite bounds (offline; no UI proof)'
+      $menuName = $menuAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Menu-Name' }, $true)
+      if (!$menuName) { throw 'Missing exact menu accelerator normalizer' }
+      Invoke-Expression $menuName.Extent.Text
+      foreach ($case in @(@('Close Alt+F4','Alt+F4','Close'), @('Close Alt+F4','','Close Alt+F4'), @('Save Alt+F4 copy','Alt+F4','Save Alt+F4 copy'), @("Copy\`tCtrl+C",'Ctrl+C','Copy'))) {
+        if ((Menu-Name $case[0] $case[1]) -cne $case[2]) { throw "Incorrect menu name normalization: $case" }
+      }
+      'PASS native menu selector, exact accelerator labels and finite bounds (offline; no UI proof)'
     `], { cwd: root, stdio: 'inherit', timeout: 10000 })
     assert.equal(menuCheck.status, 0, menuCheck.error?.message ?? 'native menu selector regression')
   }
