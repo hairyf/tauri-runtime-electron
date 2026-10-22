@@ -178,7 +178,7 @@ impl WindowBuilder for ElectronWindowBuilder {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn transient_for<P: gtk::glib::IsA<gtk::Window>>(self, _parent: P) -> Self {
+  fn transient_for(self, _parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
     self
   }
 
