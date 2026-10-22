@@ -264,20 +264,48 @@ pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
   fs::create_dir_all(to).map_err(|error| format!("{}: {error}", to.display()))?;
   for entry in fs::read_dir(from).map_err(|error| format!("{}: {error}", from.display()))? {
     let entry = entry.map_err(|error| error.to_string())?;
+    let source = entry.path();
     let target = to.join(entry.file_name());
-    let kind = entry.file_type().map_err(|error| error.to_string())?;
-    if kind.is_dir() {
-      copy_dir(&entry.path(), &target)?;
+    let meta = fs::symlink_metadata(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+    if meta.file_type().is_symlink() {
+      // macOS bundles keep framework versions behind symlinks; copying the
+      // resolved content instead would duplicate them and break bundling.
+      let link = fs::read_link(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+      #[cfg(unix)]
+      std::os::unix::fs::symlink(&link, &target)
+        .map_err(|error| format!("{}: {error}", target.display()))?;
+      #[cfg(not(unix))]
+      {
+        let _ = link;
+        copy_link_target(&source, &target)?;
+      }
+    } else if meta.is_dir() {
+      copy_dir(&source, &target)?;
     } else {
-      fs::copy(entry.path(), &target)
-        .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+      fs::copy(&source, &target).map_err(|error| format!("{}: {error}", source.display()))?;
     }
   }
   Ok(())
 }
 
+/// Windows cannot create the link, so copy whatever it points at.
+#[cfg(not(unix))]
+fn copy_link_target(source: &Path, target: &Path) -> Result<(), String> {
+  if fs::metadata(source).is_ok_and(|meta| meta.is_dir()) {
+    copy_dir(source, target)
+  } else {
+    fs::copy(source, target)
+      .map(|_| ())
+      .map_err(|error| format!("{}: {error}", source.display()))
+  }
+}
+
 /// Ensures a cached Electron distribution with our main-process scripts next to
 /// its executable, downloading it when necessary. Returns the executable.
+///
+/// The build script includes this file but stages the distribution itself, so
+/// only the runtime reaches this.
+#[allow(dead_code)]
 pub(crate) fn install(main_cjs: &str, preload_cjs: &str) -> Result<PathBuf, String> {
   let dist = match cached_dist() {
     Some(dist) => dist,

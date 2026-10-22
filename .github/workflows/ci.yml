@@ -13,6 +13,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # A warning on one platform is invisible on the others; refuse them all.
+  RUSTFLAGS: -D warnings
 
 jobs:
   build:

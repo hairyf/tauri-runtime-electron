@@ -50,8 +50,11 @@ mod imp {
   }
 
   unsafe fn read_group_icon(module: HMODULE) -> Option<Vec<u8>> {
+    // A `const` item yields a fresh temporary per use, which cannot be borrowed
+    // mutably by `find_map`, so iterate a local copy instead.
+    let mut legacy_ids = LEGACY_ICON_IDS;
     let group = find(module, RT_GROUP_ICON, APP_ICON)
-      .or_else(|| LEGACY_ICON_IDS.find_map(|id| find(module, RT_GROUP_ICON, id)))?;
+      .or_else(|| legacy_ids.find_map(|id| find(module, RT_GROUP_ICON, id)))?;
     // GRPICONDIR: reserved, type, count, then count GRPICONDIRENTRY of 14 bytes:
     // width, height, colors, reserved, planes, bit count, bytes, id.
     if group.len() < 6 {

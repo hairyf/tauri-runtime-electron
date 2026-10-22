@@ -211,7 +211,7 @@ impl Ipc {
 
   /// Closes the socket and terminates the Electron process.
   pub(crate) fn shutdown(&self) {
-    if let Ok(mut writer) = self.writer.lock() {
+    if let Ok(writer) = self.writer.lock() {
       let _ = writer.shutdown(std::net::Shutdown::Both);
     }
     if let Some(mut child) = self.child.lock().unwrap().take() {

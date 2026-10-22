@@ -230,7 +230,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   #[cfg(any(target_os = "macos", target_os = "ios"))]
   fn fetch_data_store_identifiers<F: FnOnce(Vec<[u8; 16]>) + Send + 'static>(
     &self,
-    cb: F,
+    _cb: F,
   ) -> Result<()> {
     todo!()
   }
@@ -238,8 +238,8 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   #[cfg(any(target_os = "macos", target_os = "ios"))]
   fn remove_data_store<F: FnOnce(Result<()>) + Send + 'static>(
     &self,
-    uuid: [u8; 16],
-    cb: F,
+    _uuid: [u8; 16],
+    _cb: F,
   ) -> Result<()> {
     todo!()
   }
