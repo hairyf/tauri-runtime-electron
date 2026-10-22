@@ -143,7 +143,9 @@ Ctrl+C stops the app, cargo and Vite. The original isolation pattern, CSP,
 capabilities and resource declarations are retained; the streaming fixture is
 fetched over HTTPS and checked for an MP4 header before use. The staged API
 example fixes upstream delayed hide/disable/minimize handlers to retain their
-original target and method receiver; reference submodule files are unchanged.
+original target and method receiver. Its web fonts load through browser CSS
+imports so a font server timeout cannot stop Vite; the original font families
+and CSS fallbacks remain. Reference submodule files are unchanged.
 
 For reproducible actions and keyframes on a Windows desktop:
 

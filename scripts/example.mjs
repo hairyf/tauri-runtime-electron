@@ -146,6 +146,12 @@ export function patchWindowTimers(source) {
       .replace('setTimeout(target.unminimize, 2000)', 'setTimeout(() => target.unminimize(), 2000)')}${tail}`)
 }
 
+// Keep the original font families and let the browser use its normal fallback
+// while remote CSS loads; fetching web fonts must not prevent Vite from starting.
+export function patchWebFonts(source) {
+  return source.replace('presetWebFonts({', 'presetWebFonts({\n      inlineImports: false,')
+}
+
 function patchRuntime(file) {
   const original = read(file)
   // `main.rs` frequently only calls into `lib.rs`, which is where the builder is.
@@ -263,6 +269,8 @@ function stageApp(dir, dst) {
   for (const entry of fs.readdirSync(dir)) copyTree(path.join(dir, entry), path.join(dst, entry))
   const windowView = path.join(dst, 'src', 'views', 'Window.svelte')
   if (name === 'api' && fs.existsSync(windowView)) write(windowView, patchWindowTimers(read(windowView)))
+  const fonts = path.join(dst, 'unocss.config.js')
+  if (name === 'api' && fs.existsSync(fonts)) write(fonts, patchWebFonts(read(fonts)))
   const tauriDir = path.join(dst, 'src-tauri')
   const rustSources = ['src/lib.rs', 'src/main.rs']
     .map((file) => path.join(tauriDir, file))

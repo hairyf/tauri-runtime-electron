@@ -440,6 +440,8 @@ export const cases = {
     t.check('streaming duration is positive', video.duration > 0, true)
     t.check('streaming playback currentTime increases', video.after > video.before, true)
     t.check('streaming has decoded video frames', video.frames > 0, true)
+    t.check('streaming is playing at capture', await t.evaluate(target, 'document.querySelector("#video_source").paused'), false)
+    await t.capture(target, 'streaming-playing')
 
     const seek = await t.evaluate(
       target,
@@ -472,7 +474,6 @@ export const cases = {
     t.check('streaming range content-length', range.contentLength, '16')
     t.check('streaming range content-range', range.contentRange, `bytes 0-15/${bytes.length}`)
     t.check('streaming range bytes', range.bytes, [...bytes.subarray(0, 16)])
-    await t.capture(target, 'streaming-playing')
   },
 }
 

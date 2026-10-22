@@ -7,7 +7,10 @@ if ($Action -notin @('state','raise','restore','place','drag','doubleclick','cap
 if ($Action -in @('menu-click','tray-state','tray-click','menubar-click') -and !$ItemText) { throw "$Action requires exact ItemText." }
 if ($Action -eq 'resize' -and ($Width -le 0 -or $Height -le 0)) { throw 'Width and Height must be positive physical client pixel sizes.' }
 if (-not ('NativeVerify' -as [type])) {
-    Add-Type -TypeDefinition @'
+    Add-Type -AssemblyName Accessibility
+    $menuReferences = @((Get-ChildItem -LiteralPath (Join-Path $PSHOME 'ref') -Filter '*.dll').FullName) + [Accessibility.IAccessible].Assembly.Location
+    # The system Accessibility interop targets System.Runtime 4; pwsh binds it to its current runtime.
+    Add-Type -ReferencedAssemblies $menuReferences -CompilerOptions '/nowarn:1701' -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -26,6 +29,9 @@ public sealed class NativeMenuTrace {
 public sealed class NativeMenuItem {
     public string rawName; public uint state;
     public int x, y, width, height;
+}
+public sealed class AccessibleMenuItem {
+    public string name, shortcut, checkedState; public int state;
 }
 public sealed class NativeInputState {
     public string phase, utc;
@@ -124,6 +130,25 @@ public static class NativeVerify {
                 width=rect.right-rect.left, height=rect.bottom-rect.top });
         }
         return items.ToArray();
+    }
+    [DllImport("oleacc.dll")] static extern int AccessibleObjectFromPoint(Point point, out Accessibility.IAccessible accessible, [MarshalAs(UnmanagedType.Struct)] out object child);
+    public static AccessibleMenuItem AccessibleMenuState(IntPtr window, int x, int y, int width, int height) {
+        var point = new Point { x=x+width/2, y=y+height/2 };
+        if (width <= 0 || height <= 0 || !ScopedMenuWindow(window) || GetAncestor(WindowFromPoint(point), 2) != window)
+            throw new InvalidOperationException("Accessible menu item is obscured or outside its scoped popup.");
+        Accessibility.IAccessible accessible; object child;
+        Marshal.ThrowExceptionForHR(AccessibleObjectFromPoint(point, out accessible, out child));
+        if (accessible == null) throw new InvalidOperationException("Menu item has no accessible provider.");
+        try {
+            int left, top, actualWidth, actualHeight;
+            accessible.accLocation(out left, out top, out actualWidth, out actualHeight, child);
+            object role = accessible.get_accRole(child), state = accessible.get_accState(child);
+            if (!(role is int) || (int)role != 0xc || left != x || top != y || actualWidth != width || actualHeight != height || !(state is int))
+                throw new InvalidOperationException("Accessible provider does not match the observed menu item role and bounds.");
+            int flags = (int)state;
+            return new AccessibleMenuItem { name=accessible.get_accName(child), shortcut=accessible.get_accKeyboardShortcut(child), state=flags,
+                checkedState=(flags & 0x20) != 0 ? "Indeterminate" : (flags & 0x10) != 0 ? "On" : "Off" };
+        } finally { Marshal.ReleaseComObject(accessible); }
     }
     public static void ClickAt(int x, int y, bool right) {
         Cursor(x, y); Thread.Sleep(40);
@@ -348,11 +373,12 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
                 if (!$element -or $element.Current.IsOffscreen) { continue }
                 $items = @(foreach ($item in $element.FindAll([System.Windows.Automation.TreeScope]::Children, $itemRole)) {
                     $info = $item.Current; $pattern = $null; $checked = $null
+                    $rect = Bounds $info.BoundingRectangle
+                    if ($info.IsOffscreen -or !$rect -or $rect.width -le 0 -or $rect.height -le 0) { continue }
+                    $accessible = [NativeVerify]::AccessibleMenuState($popupHandle, $rect.x, $rect.y, $rect.width, $rect.height)
                     if ($item.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) { $checked = $pattern.Current.ToggleState.ToString() }
-                    elseif ($item.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$pattern)) {
-                        $checked = if ($pattern.Current.State -band 0x10) { 'On' } else { 'Off' }
-                    }
-                    @{ name=(Menu-Name $info.Name $info.AcceleratorKey); rawName=$info.Name; accelerator=$info.AcceleratorKey; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=(Bounds $info.BoundingRectangle) }
+                    else { $checked = $accessible.checkedState }
+                    @{ name=(Menu-Name $accessible.name $accessible.shortcut); rawName=$info.Name; accelerator=$info.AcceleratorKey; accessibleName=$accessible.name; shortcut=$accessible.shortcut; accessibleState=$accessible.state; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=$rect }
                 })
                 if ($items.Count) { @{ handle=$nativeWindow.handle; bounds=(Bounds $element.Current.BoundingRectangle); items=$items } }
             } catch [System.Windows.Automation.ElementNotAvailableException] { continue }

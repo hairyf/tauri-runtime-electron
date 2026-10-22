@@ -238,12 +238,14 @@ async function verifyWindowControls(t, main, child, childSize, scale) {
           await setValue(t, main, field(`${kind} height`), '', true)
           await dimensions(...requested)
           t.check(`Window clearing ${kind} constraint permits previous out-of-range size`, await t.wait(child, sizeExpression, value => json(value) === json(requested)), requested)
+          await displayedSize(t, main, requested)
           await capture(`${kind.toLowerCase()}-constraint-cleared`)
         } finally {
           await setValue(t, main, field(`${kind} width`), '')
           await setValue(t, main, field(`${kind} height`), '', true)
           await dimensions(...childSize)
           t.check(`Window ${kind} cleanup restores child size`, await t.wait(child, sizeExpression, value => json(value) === json(childSize)), childSize)
+          await displayedSize(t, main, childSize)
         }
       })
     }

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { appManifest, configure, parseArgs, patchWindowTimers, replaceRuntime } from './example.mjs'
+import { appManifest, configure, parseArgs, patchWebFonts, patchWindowTimers, replaceRuntime } from './example.mjs'
 
 const read = (relative) => fs.readFileSync(new URL(`../source/tauri/examples/${relative}`, import.meta.url), 'utf8').replaceAll('\r\n', '\n')
 const json = (relative) => JSON.parse(read(relative))
@@ -65,6 +65,10 @@ for (const name of ['api', 'resources', 'file-associations']) {
 }
 assert(appManifest(read('resources/src-tauri/Cargo.toml'), 'resources', []).includes('features = ["codegen"]'))
 assert(replaceRuntime(read('streaming/main.rs')).includes('Electron::default().custom_scheme("stream")'))
+const originalFonts = read('api/unocss.config.js')
+const patchedFonts = patchWebFonts(originalFonts)
+assert.equal(patchedFonts.replace('      inlineImports: false,\n', ''), originalFonts, 'preserve font families, styling and all other presets')
+assert.match(patchedFonts, /presetWebFonts\(\{\s+inlineImports: false,/)
 const originalWindow = read('api/src/views/Window.svelte')
 const patchedWindow = patchWindowTimers(originalWindow)
 const handlers = patchedWindow.match(/^  (?:async )?function (?:hide|disable|minimize)\(\) \{[^]*?^  \}/gm)
