@@ -93,6 +93,9 @@ follow [Semantic Versioning](https://semver.org/).
 - `examples/smoke.rs` opens real windows and asserts every setter through its
   getter; CI runs it on Windows, macOS and headless Linux (xvfb), and now also
   triggers on the `next` branch.
+- `node scripts/api-example.mjs` stages Tauri's own `examples/api`, swaps only
+  its runtime for this one and launches it, so the real API surface can be
+  exercised by hand without touching `source/tauri`.
 
 ### Bug Fixes
 - Every window keeps its own webview serial, and secondary windows no longer
@@ -133,3 +136,14 @@ follow [Semantic Versioning](https://semver.org/).
   enforced by the close handler.
 - Fix the content area being a couple of pixels taller than the requested
   `inner_size` right after creation.
+- Fix context menus never appearing: `Window::popup_menu` handed muda the
+  Electron window, which belongs to another process, so `TrackPopupMenu`
+  returned at once and drew nothing. Tauri now gets a 1x1 window owned by the
+  thread that tracks the menu; a menu *bar* still has no visible effect, because
+  Electron draws that from its own menu API.
+- Fix every app sharing one Chromium profile (`%APPDATA%\Electron`), which made
+  two Tauri apps fight over the same cache lock until the renderer crashed: the
+  profile is now `appData/<identifier>` and the identifier reaches `main.cjs`
+  instead of being dropped on the way to it.
+- Give macOS fullscreen a fallback to simple fullscreen, so `set_fullscreen`
+  still takes effect where AppKit refuses a space switch (VMs, CI runners).

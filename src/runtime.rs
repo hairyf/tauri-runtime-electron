@@ -156,8 +156,9 @@ pub struct RuntimeContext {
   /// these asynchronously, so the run loop answers over IPC.
   policy_handlers: Rc<RefCell<HashMap<u32, PolicyHandlers>>>,
   /// Native window handle (HWND / NSView / X11 window) per window serial, asked
-  /// from Electron once. `window_handle()` hands it to Tauri so host-side code
-  /// (muda menus, window effects, Win32 tweaks) works as it does on wry.
+  /// from Electron once. Used for the Win32 tweaks Electron has no API for;
+  /// `window_handle()` gives Tauri this handle everywhere except Windows menus,
+  /// which need a window of the calling thread (see `window::imp`).
   native_handles: Rc<RefCell<HashMap<u32, isize>>>,
 }
 
@@ -1568,7 +1569,12 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       crate::window::imp::send_to_bottom(handle);
     }
     if let Some(owner) = window_builder.owner.or(window_builder.parent) {
-      crate::window::imp::set_owner(handle, owner.0 as isize);
+      // Tauri resolves `.parent(&window)` / `.owner(&window)` through
+      // `window_handle`, which hands out our hidden menu window on Windows, so
+      // that handle means "unknown window" here rather than a real owner.
+      if Some(owner.0 as isize) != crate::window::imp::menu_owner_window() {
+        crate::window::imp::set_owner(handle, owner.0 as isize);
+      }
     }
   }
 

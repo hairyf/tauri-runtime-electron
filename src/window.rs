@@ -218,7 +218,12 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     &self,
   ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
     // Electron owns the window, but it will tell us its native handle; Tauri's
-    // host-side code (muda menus, window effects, Win32 tweaks) needs it.
+    // host-side code (window effects, Win32 tweaks) needs it. Menus are the
+    // exception: muda only tracks and pops a menu up on a window of the calling
+    // thread, so on Windows Tauri gets our own hidden window instead.
+    #[cfg(windows)]
+    let handle = imp::menu_owner_window().ok_or(raw_window_handle::HandleError::Unavailable)?;
+    #[cfg(not(windows))]
     let handle = self
       .context
       .native_handle(self.id)
@@ -671,7 +676,8 @@ pub(crate) mod imp {
   use windows::Win32::Graphics::Gdi::ClientToScreen;
   use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
   use windows::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, GWLP_HWNDPARENT, GetClientRect, GetWindowLongPtrW, HTCAPTION,
+    ClipCursor, CreateWindowExW, GWLP_HWNDPARENT, GetClientRect,
+    GetWindowLongPtrW, HTCAPTION, WINDOW_EX_STYLE, WS_POPUP,
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
     SetWindowLongPtrW, SetCursorPos, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION,
@@ -696,6 +702,50 @@ pub(crate) mod imp {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
       );
     }
+  }
+
+  /// Muda tracks a menu on the thread that owns the window it pops the menu up
+  /// on, and Electron's window belongs to another process: `TrackPopupMenu` on
+  /// it returns immediately and nothing is drawn. Tauri therefore gets a window
+  /// of our own as the menu owner. It is 1x1 at the origin and never shown
+  /// because muda reads popup positions relative to the owner's top-left corner,
+  /// so the origin keeps "window coordinates" equal to "screen coordinates".
+  /// The menu *bar* is still out of reach (that needs Electron's `Menu` API),
+  /// but context menus pop up where the app asks.
+  pub(crate) fn menu_owner_window() -> Option<isize> {
+    // Per thread, because a menu only pops up on a window owned by the thread
+    // that tracks it: one shared window would work for whichever thread asked
+    // first and silently fail everywhere else.
+    thread_local! {
+      static OWNER: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+    OWNER.with(|slot| {
+      if slot.get() == 0 {
+        // SAFETY: a predefined window class, so no window procedure of our own
+        // is smuggled into another thread's message loop; the window stays
+        // invisible and never takes focus.
+        let handle = unsafe {
+          CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            windows::core::w!("STATIC"),
+            windows::core::w!(""),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+          )
+        }
+        .map(|window| window.0 as isize)
+        .unwrap_or(0);
+        slot.set(handle);
+      }
+      (slot.get() != 0).then_some(slot.get())
+    })
   }
 
   pub(super) fn set_decorations(handle: isize, decorations: bool) {

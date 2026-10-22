@@ -38,6 +38,22 @@ To bundle the Electron runtime with your application without triggering download
 
 ---
 
+## Menus & Native Handles
+
+Context menus work: `Window::popup_menu` draws the same native menu wry would,
+because Tauri is handed a 1x1 window owned by the thread that tracks the menu
+(muda can only pop a menu up on a window of that thread, and Electron's window
+belongs to another process). Two consequences are worth knowing:
+
+* A **menu bar** (`Window::set_menu`) has no visible effect: Tauri attaches it to
+  that helper window, while Electron draws its menu bar from its own `Menu` API.
+* On Windows, `Window::hwnd()` / `window_handle()` return the helper window, not
+  the Electron one, so third-party Win32 tweaks fed with that handle (window
+  vibrancy, custom DWM calls) do nothing. Effects declared in `tauri.conf.json`
+  are unaffected: they travel as window config, not through the handle.
+
+---
+
 ## Layout & Architecture
 
 The file layout mirrors `crates/tauri-runtime-cef` for side-by-side consistency:
