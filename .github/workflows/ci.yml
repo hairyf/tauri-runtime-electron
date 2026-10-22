@@ -62,6 +62,14 @@ jobs:
       # round-trips, so a platform that silently stops working fails here
       # instead of in a user's app. Linux has no display on the runners, hence
       # the virtual one.
+      # Chromium refuses to start unless its sandbox helper is setuid root, which
+      # a downloaded release archive cannot carry.
+      - name: Fix the Chromium sandbox helper
+        if: runner.os == 'Linux'
+        run: |
+          sudo chown root:root target/electron/*/chrome-sandbox
+          sudo chmod 4755 target/electron/*/chrome-sandbox
+
       - name: Test
         if: runner.os != 'Linux'
         run: cargo test -- --nocapture
