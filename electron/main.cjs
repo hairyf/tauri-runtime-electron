@@ -90,6 +90,19 @@ if (!port) {
 // request (the runtime extracts it from the executable when it is bundled).
 const appIdentifier = readArg('--tauri-identifier') || undefined
 
+// Chromium names its profile after the executable, and every app here runs the
+// same cached `electron.exe`, so without this every Tauri app on this runtime
+// would share one profile: cookies, local storage and the cache lock included
+// (two apps at once corrupt it and crash the renderer).
+if (appIdentifier) {
+  // `setPath` requires the directory to exist.
+  const profile = path.join(app.getPath('appData'), appIdentifier)
+  fs.mkdirSync(profile, { recursive: true })
+  app.setPath('userData', profile)
+  // Taskbar grouping and notification identity (Windows only).
+  if (process.platform === 'win32') app.setAppUserModelId(appIdentifier)
+}
+
 // Tauri's custom schemes (`tauri://localhost`, plugin protocols) must be
 // privileged before the app is ready, so the Rust runtime passes them on the
 // command line.

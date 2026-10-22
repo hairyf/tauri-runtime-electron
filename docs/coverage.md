@@ -33,8 +33,8 @@ Do not edit by hand — re-run the script.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | ⚠️ accepted then ignored | `src/runtime.rs:879` |
-| `run_iteration` | ⚠️ accepted then ignored | `src/runtime.rs:892` |
+| `set_device_event_filter` | ⚠️ accepted then ignored | `src/runtime.rs:892` |
+| `run_iteration` | ⚠️ accepted then ignored | `src/runtime.rs:905` |
 
 ## RuntimeHandle
 

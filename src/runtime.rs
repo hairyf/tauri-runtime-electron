@@ -714,6 +714,17 @@ impl<T: UserEvent> RuntimeInitAttrs<T> for Electron {
   }
 }
 
+/// The app identifier comes from Tauri's `RuntimeInitArgs`, not from these
+/// attributes, but Electron needs it on the command line before it starts: it
+/// names the Chromium profile, so two Tauri apps sharing the cached executable
+/// would otherwise share (and corrupt) one profile.
+fn with_identifier(mut attrs: Electron, identifier: String) -> Electron {
+  if attrs.identifier.is_none() && !identifier.is_empty() {
+    attrs.identifier = Some(identifier);
+  }
+  attrs
+}
+
 impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type WindowDispatcher = ElectronWindowDispatcher;
   type WebviewDispatcher = ElectronWebviewDispatcher;
@@ -725,7 +736,8 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type Webview = ();
 
   fn new(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    Self::start(args.runtime_init_attrs, &args.custom_schemes)
+    let identifier = args.identifier.clone();
+    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
   }
 
   #[cfg(any(
@@ -737,7 +749,8 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "openbsd"
   ))]
   fn new_any_thread(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    Self::start(args.runtime_init_attrs, &args.custom_schemes)
+    let identifier = args.identifier.clone();
+    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
   }
 
   fn create_proxy(&self) -> EventProxy {
