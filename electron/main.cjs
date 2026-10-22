@@ -85,6 +85,14 @@ if (!port) {
   process.exit(1)
 }
 
+// The Rust app's executable carries the app icon and its identifier; Electron
+// uses both so the window looks like the Tauri app instead of Electron itself.
+// A window `icon` must be an image, so the executable's embedded icon is read
+// back through `app.getFileIcon` once the app is ready.
+const appExe = readArg('--tauri-app-exe') || undefined
+const appIdentifier = readArg('--tauri-identifier') || undefined
+let appIcon = undefined
+
 // Tauri's custom schemes (`tauri://localhost`, plugin protocols) must be
 // privileged before the app is ready, so the Rust runtime passes them on the
 // command line.
@@ -271,7 +279,10 @@ function serializeError(error) {
 
 function createWindow(params) {
   const { windowId } = params
-  log('window.create', JSON.stringify({ windowId, icon: params.icon ?? null }))
+  // A packaged app carries no icon file, but the runtime passes its own
+  // executable: Electron reads the icon straight out of a Windows `.exe`.
+  const icon = params.icon && fs.existsSync(params.icon) ? params.icon : appIcon
+  log('window.create', JSON.stringify({ windowId, icon: icon ?? null }))
   const window = new BrowserWindow({
     title: params.title ?? 'Electron Runtime',
     width: params.width ?? 800,
@@ -284,7 +295,7 @@ function createWindow(params) {
     transparent: params.transparent ?? false,
     show: params.visible ?? true,
     autoHideMenuBar: true,
-    ...(params.icon ? { icon: params.icon } : {}),
+    ...(icon ? { icon } : {}),
     webPreferences: {
       contextIsolation: true,
       sandbox: true,
@@ -1028,7 +1039,18 @@ ipcMain.on('tauri-ipc', (event, data) => {
   })
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Windows groups taskbar buttons by AppUserModelID; without the app's own id
+  // the window inherits Electron's identity.
+  if (appIdentifier) app.setAppUserModelId(appIdentifier)
+  if (appExe) {
+    appIcon = await app
+      .getFileIcon(appExe, { size: 'large' })
+      .catch((error) => {
+        log('icon failed', serializeError(error))
+        return undefined
+      })
+  }
   // Tauri apps draw their own chrome; Electron's default File/Edit/View menu is
   // noise here.
   Menu.setApplicationMenu(null)

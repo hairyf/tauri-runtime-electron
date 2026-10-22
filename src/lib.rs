@@ -20,6 +20,7 @@
 //! `sandbox`) have no Electron counterpart and are replaced by the IPC bridge in
 //! [`electron_impl`].
 
+mod acquisition;
 mod devtools;
 mod electron_impl;
 mod environment;

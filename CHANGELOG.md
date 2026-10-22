@@ -60,6 +60,10 @@ follow [Semantic Versioning](https://semver.org/).
   destination is honoured by moving the finished file, and a denied request
   cancels (`permission` falling back to Electron's own deny).
 
+- Packaged apps can ship the staged runtime with a single
+  `"resources": { "target/electron": "runtime" }` entry in `tauri.conf.json`;
+  the resolver picks up `runtime/<platform>-<arch>` beside the executable.
+
 ### Bug Fixes
 - Webview history RPCs use `webContents.navigationHistory` instead of the
   deprecated `canGoBack()`/`goBack()` shortcuts.

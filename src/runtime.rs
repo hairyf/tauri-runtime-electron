@@ -398,7 +398,7 @@ impl ElectronRuntime {
 
   fn start(attrs: Electron, custom_schemes: &[String]) -> Result<Self> {
     let binary = attrs.resolve_binary();
-    let main_script = attrs.resolve_main_script();
+    let main_script = attrs.resolve_main_script(&binary);
     if !main_script.exists() {
       return Err(Error::CreateWindow(io_err(format!(
         "Electron main script not found at {}; configure it with Electron::default().main_script(..)",
@@ -426,6 +426,14 @@ impl ElectronRuntime {
       args.push("--tauri-schemes".to_string());
       args.push(custom_schemes.join(","));
     }
+    if let Some(identifier) = &attrs.identifier {
+      args.push("--tauri-identifier".to_string());
+      args.push(identifier.clone());
+    }
+    if let Ok(app_exe) = std::env::current_exe() {
+      args.push("--tauri-app-exe".to_string());
+      args.push(app_exe.display().to_string());
+    }
     let (ipc, event_rx) = Ipc::launch(
       &binary,
       &main_script,
@@ -451,6 +459,8 @@ pub struct Electron {
   icon: Option<PathBuf>,
   /// Whether Chromium diagnostic environment variables are honoured.
   debug_environment: DebugEnvironment,
+  /// App identifier, handed to Electron as its AppUserModelID (taskbar grouping).
+  identifier: Option<String>,
   startup_timeout: Option<Duration>,
 }
 
@@ -515,11 +525,23 @@ impl Electron {
     }
     // A packaged app ships the runtime next to (or under `resources/` beside)
     // its executable, so those layouts beat anything found in the source tree.
+    // `"resources": { "target/electron": "runtime" }` lands the staged payload in
+    // `runtime/<platform>-<arch>/`, which the bundle target below covers.
     if let Ok(executable) = std::env::current_exe() {
       if let Some(dir) = executable.parent() {
         for candidate in [
           dir.join("electron").join(electron_executable()),
           dir.join("resources").join("electron").join(electron_executable()),
+          dir
+            .join("runtime")
+            .join(format!("{}-{}", crate::acquisition::platform(), crate::acquisition::arch()))
+            .join(electron_executable()),
+          dir
+            .join("resources")
+            .join("runtime")
+            .join(format!("{}-{}", crate::acquisition::platform(), crate::acquisition::arch()))
+            .join(electron_executable()),
+          dir.join("runtime").join(electron_executable()),
         ] {
           if candidate.exists() {
             return candidate;
@@ -538,12 +560,25 @@ impl Electron {
       }
       dir = current.parent().map(PathBuf::from);
     }
+    // A packaged app ships no Electron payload; the first launch fetches it into
+    // the user cache (verified against the release checksums) and later launches
+    // reuse that copy.
+    match crate::acquisition::ensure_installed() {
+      Ok(binary) => return binary,
+      Err(error) => eprintln!("[electron] could not acquire Electron: {error}"),
+    }
     PathBuf::from("electron")
   }
 
-  fn resolve_main_script(&self) -> PathBuf {
+  fn resolve_main_script(&self, binary: &Path) -> PathBuf {
     if let Some(script) = &self.main_script {
       return script.clone();
+    }
+    // The staged runtime keeps `main.cjs` beside the Electron binary, which is
+    // the only layout a packaged app is guaranteed to have.
+    let sibling = binary.with_file_name("main.cjs");
+    if sibling.exists() {
+      return sibling;
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("electron/main.cjs");
     if manifest.exists() {
@@ -605,6 +640,9 @@ impl<T: UserEvent> RuntimeInitAttrs<T> for Electron {
         .dev_url
         .as_ref()
         .map(|url| url.as_str().trim_end_matches('/').to_string());
+    }
+    if self.identifier.is_none() {
+      self.identifier = Some(config.identifier.clone());
     }
     if self.icon.is_some() {
       return Ok(());
