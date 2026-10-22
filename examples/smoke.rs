@@ -59,6 +59,25 @@ macro_rules! accepted {
   };
 }
 
+/// macOS animates minimize and fullscreen, so the state settles a moment after
+/// the call returns; poll instead of racing the window manager.
+fn eventually<A: Clone + Debug + PartialEq>(
+  failures: &mut usize,
+  name: &str,
+  expected: A,
+  mut read: impl FnMut() -> Option<A>,
+) {
+  let mut actual = read();
+  for _ in 0..60 {
+    if actual.as_ref() == Some(&expected) {
+      break;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    actual = read();
+  }
+  check(failures, name, actual, Some(expected));
+}
+
 /// Runtime attributes for the smoke run.
 ///
 /// Chromium's SUID sandbox helper is not usable on CI runners (Ubuntu 24.04
@@ -291,48 +310,30 @@ fn checks(runtime: &ElectronRuntime, failures: &mut usize) {
   #[cfg(not(target_os = "linux"))]
   {
     w!((window) maximize()).expect("maximize");
-    check(
-      failures,
-      "maximize",
-      w!((window) is_maximized()).ok(),
-      Some(true),
-    );
+    eventually(failures, "maximize", true, || {
+      w!((window) is_maximized()).ok()
+    });
     w!((window) unmaximize()).expect("unmaximize");
-    check(
-      failures,
-      "unmaximize",
-      w!((window) is_maximized()).ok(),
-      Some(false),
-    );
+    eventually(failures, "unmaximize", false, || {
+      w!((window) is_maximized()).ok()
+    });
     w!((window) minimize()).expect("minimize");
-    check(
-      failures,
-      "minimize",
-      w!((window) is_minimized()).ok(),
-      Some(true),
-    );
+    eventually(failures, "minimize", true, || {
+      w!((window) is_minimized()).ok()
+    });
     w!((window) unminimize()).expect("unminimize");
-    check(
-      failures,
-      "unminimize",
-      w!((window) is_minimized()).ok(),
-      Some(false),
-    );
+    eventually(failures, "unminimize", false, || {
+      w!((window) is_minimized()).ok()
+    });
 
     w!((window) set_fullscreen(true)).expect("fullscreen");
-    check(
-      failures,
-      "set_fullscreen true",
-      w!((window) is_fullscreen()).ok(),
-      Some(true),
-    );
+    eventually(failures, "set_fullscreen true", true, || {
+      w!((window) is_fullscreen()).ok()
+    });
     w!((window) set_fullscreen(false)).expect("windowed");
-    check(
-      failures,
-      "set_fullscreen false",
-      w!((window) is_fullscreen()).ok(),
-      Some(false),
-    );
+    eventually(failures, "set_fullscreen false", false, || {
+      w!((window) is_fullscreen()).ok()
+    });
   }
   accepted!(
     failures,
