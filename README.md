@@ -1,7 +1,3 @@
-以下是经过精简、优化和重构后的 README 文档。去除了冗余的官方简介，将 `bundle` 配置与 `tauri::Builder::default()` 的使用示例紧密结合在一起，使整个文档更加紧凑、直观且易于维护：
-
----
-
 # tauri-runtime-electron
 
 A `tauri-runtime` implementation backed by Electron instead of the system webview. The Rust process keeps the Tauri event loop and `invoke` handler, spawning an Electron main process as a child and driving it over a loopback JSON-RPC socket.
