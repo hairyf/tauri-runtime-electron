@@ -93,9 +93,9 @@ follow [Semantic Versioning](https://semver.org/).
 - `examples/smoke.rs` opens real windows and asserts every setter through its
   getter; CI runs it on Windows, macOS and headless Linux (xvfb), and now also
   triggers on the `next` branch.
-- `node scripts/api-example.mjs` stages Tauri's own `examples/api`, swaps only
-  its runtime for this one and launches it, so the real API surface can be
-  exercised by hand without touching `source/tauri`.
+- `pnpm example <name>` stages and launches any of Tauri's own examples on this
+  runtime (manifest, `build.rs` and asset paths generated on the way), so the
+  real API surface can be exercised by hand without touching `source/tauri`.
 
 ### Bug Fixes
 - Every window keeps its own webview serial, and secondary windows no longer

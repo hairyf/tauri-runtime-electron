@@ -1,0 +1,8 @@
+{
+  "name": "tauri-runtime-electron-workspace",
+  "private": true,
+  "scripts": {
+    "example": "node scripts/example.mjs",
+    "coverage": "node scripts/coverage.mjs"
+  }
+}

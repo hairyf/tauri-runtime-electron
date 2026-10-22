@@ -97,17 +97,22 @@ manager.
 `source/tauri` and `source/electron` are pinned submodules kept for reading the
 upstream implementations; they are not built.
 
-## Running Tauri's Own Example
+## Running Tauri's Own Examples
 
 ```bash
-node scripts/api-example.mjs
+pnpm example api        # or: node scripts/example.mjs api
+pnpm example --list     # every example that can be staged this way
 ```
 
-That stages `source/tauri/examples/api` (frontend untouched), swaps its
-`src-tauri` runtime for this one, starts Vite on port 1420 and launches the app,
-so the whole of Tauri's API surface can be poked by hand. `--clean` wipes
-`.cache/api-example` first, `--no-install` skips the frontend install, and
-`--keep` leaves everything staged after exit. Ctrl+C stops both the app and Vite.
+The script stages `source/tauri/examples/<name>` under `.cache/examples/<name>`,
+swaps its runtime for this one, generates the manifest and `build.rs` the
+upstream workspace normally supplies, and launches it — so any of Tauri's
+examples can be poked at by hand. Examples with a Vite frontend (`api`) get the
+dev server on port 1420; the rest keep their `frontendDist` assets.
+
+`--clean` wipes the staged copy first, `--no-install` skips the frontend
+install, `--keep` leaves everything staged after exit. Ctrl+C stops the app,
+cargo and Vite.
 
 ---
 

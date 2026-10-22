@@ -458,7 +458,15 @@ function applyWindowConfig(window, config, params) {
   if (config.zoomHotkeysEnabled === false) {
     // Chromium zooms on Ctrl/⌘ + wheel and the zoom accelerators; Tauri's flag
     // says this window must not, so cancel both at the source.
-    window.webContents.setVisualZoomLevelLimits(1, 1)
+    const disableZoom = () => {
+      // Returns a promise, so a missing renderer surfaces as a rejection rather
+      // than a throw; the wheel is still pinned by the key handler below.
+      window.webContents
+        .setVisualZoomLevelLimits(1, 1)
+        .catch((error) => log('window.zoom error', params.label ?? params.windowId, serializeError(error)))
+    }
+    if (window.webContents.isLoading()) window.webContents.once('dom-ready', disableZoom)
+    else disableZoom()
     window.webContents.on('before-input-event', (event, input) => {
       if (!(input.control || input.meta)) return
       if (input.key === '+' || input.key === '-' || input.key === '=' || input.key === '0') {
@@ -469,9 +477,11 @@ function applyWindowConfig(window, config, params) {
   if (config.scrollBarStyle === 'fluentOverlay') {
     // Electron has no per-window scrollbar switch; draw the overlay look instead.
     window.webContents.on('did-finish-load', () => {
-      window.webContents.insertCSS(
-        '::-webkit-scrollbar { width: 8px; height: 8px } ::-webkit-scrollbar-track { background: transparent } ::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.45); border-radius: 4px }',
-      )
+      window.webContents
+        .insertCSS(
+          '::-webkit-scrollbar { width: 8px; height: 8px } ::-webkit-scrollbar-track { background: transparent } ::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.45); border-radius: 4px }',
+        )
+        .catch((error) => log('window.scrollbar error', serializeError(error)))
     })
   }
   const unsupported = UNSUPPORTED_WINDOW_OPTIONS.filter(
