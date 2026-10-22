@@ -31,6 +31,18 @@ fn check<A: PartialEq + Debug>(failures: &mut usize, name: &str, actual: A, expe
   }
 }
 
+/// Runtime attributes for the smoke run.
+///
+/// Chromium's SUID sandbox helper is not usable on CI runners (Ubuntu 24.04
+/// restricts unprivileged user namespaces), and the window behaviour is what
+/// this example is here to verify.
+fn runtime_attrs() -> Electron {
+  #[cfg(target_os = "linux")]
+  return Electron::default().arg("--no-sandbox");
+  #[cfg(not(target_os = "linux"))]
+  Electron::default()
+}
+
 fn main() {
   let runtime = <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs {
     identifier: "tauri-runtime-electron-smoke".into(),
@@ -45,7 +57,7 @@ fn main() {
       target_os = "openbsd"
     ))]
     app_id: None,
-    runtime_init_attrs: Electron::default(),
+    runtime_init_attrs: runtime_attrs(),
   })
   .expect("start the Electron runtime");
 

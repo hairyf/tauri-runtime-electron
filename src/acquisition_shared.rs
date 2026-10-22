@@ -210,10 +210,11 @@ fn digest(path: &Path) -> Result<String, String> {
   }
   let output = output.ok_or_else(|| "no sha256 tool available".to_string())?;
   let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+  // `certutil` prints the digest alone; `shasum`/`sha256sum` print
+  // `<digest>  <path>`, so search tokens instead of whole lines.
   text
-    .lines()
-    .map(str::trim)
-    .find(|line| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()))
+    .split_whitespace()
+    .find(|token| token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()))
     .map(str::to_string)
     .ok_or_else(|| "no sha256 in the hash tool output".to_string())
 }

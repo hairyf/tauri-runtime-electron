@@ -293,7 +293,12 @@ impl WindowBuilder for ElectronWindowBuilder {
   #[cfg(target_os = "macos")]
   fn traffic_light_position<P: Into<Position>>(self, position: P) -> Self {
     self.with(|config| {
-      config.traffic_light_position = Some(position.into().to_logical(1.0).cast())
+      // `dpi::LogicalPosition` and the config's own type are unrelated structs.
+      let logical = position.into().to_logical::<f64>(1.0);
+      config.traffic_light_position = Some(tauri_utils::config::LogicalPosition {
+        x: logical.x,
+        y: logical.y,
+      })
     })
   }
 
@@ -303,8 +308,8 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   #[cfg(target_os = "macos")]
-  fn tabbing_identifier<S: Into<String>>(self, identifier: S) -> Self {
-    self.with(|config| config.tabbing_identifier = Some(identifier.into()))
+  fn tabbing_identifier(self, identifier: &str) -> Self {
+    self.with(|config| config.tabbing_identifier = Some(identifier.to_string()))
   }
 
   fn theme(self, theme: Option<Theme>) -> Self {
