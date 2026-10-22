@@ -65,6 +65,12 @@ follow [Semantic Versioning](https://semver.org/).
   the resolver picks up `runtime/<platform>-<arch>` beside the executable.
 
 ### Bug Fixes
+- Packaged apps show the Tauri icon instead of Electron's: the icon is read out of
+  the executable's `RT_GROUP_ICON`/`RT_ICON` resources into a temporary `.ico`.
+  The executable cannot be passed to `BrowserWindow` directly, and
+  `app.getFileIcon` answers with the shell's generic application icon.
+- `main.cjs`/`preload.cjs` are refreshed on every build, so a staged or cached
+  copy can no longer run stale main-process code.
 - Webview history RPCs use `webContents.navigationHistory` instead of the
   deprecated `canGoBack()`/`goBack()` shortcuts.
 - Fix guest webviews never running their initialization scripts: the scripts ran
