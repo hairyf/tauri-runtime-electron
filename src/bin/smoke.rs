@@ -11,6 +11,7 @@
 //! non-generic test there is no `T` to infer, so each call has to pin it.
 
 use std::{
+  fmt::Debug,
   process::ExitCode,
   sync::{
     Mutex,
@@ -238,18 +239,20 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     WindowDispatch::<()>::is_resizable(window)
   });
 
-  set(failures, "set_always_on_top", || {
-    WindowDispatch::<()>::set_always_on_top(window, true)
-  });
-  expect(failures, "is_always_on_top", true, || {
-    WindowDispatch::<()>::is_always_on_top(window)
-  });
-  set(failures, "set_always_on_top off", || {
-    WindowDispatch::<()>::set_always_on_top(window, false)
-  });
-  expect(failures, "is_always_on_top off", false, || {
-    WindowDispatch::<()>::is_always_on_top(window)
-  });
+  expect_applied(
+    failures,
+    "is_always_on_top",
+    true,
+    || WindowDispatch::<()>::set_always_on_top(window, true),
+    || WindowDispatch::<()>::is_always_on_top(window),
+  );
+  expect_applied(
+    failures,
+    "is_always_on_top off",
+    false,
+    || WindowDispatch::<()>::set_always_on_top(window, false),
+    || WindowDispatch::<()>::is_always_on_top(window),
+  );
 
   set(failures, "set_decorations", || {
     WindowDispatch::<()>::set_decorations(window, false)
@@ -387,10 +390,16 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   // The mirrored url above could be a lie; this reads the document instead.
   expect_eval(failures, "navigated", "smoke-second", webview, "document.title");
 
-  WebviewDispatch::<()>::open_devtools(webview);
-  expect(failures, "devtools open", true, || {
-    WebviewDispatch::<()>::is_devtools_open(webview)
-  });
+  expect_applied(
+    failures,
+    "devtools open",
+    true,
+    || {
+      WebviewDispatch::<()>::open_devtools(webview);
+      Ok(())
+    },
+    || WebviewDispatch::<()>::is_devtools_open(webview),
+  );
   WebviewDispatch::<()>::close_devtools(webview);
   expect(failures, "devtools closed", false, || {
     WebviewDispatch::<()>::is_devtools_open(webview)
@@ -430,6 +439,36 @@ fn expect_eval(
     thread::sleep(Duration::from_millis(250));
   }
   failures.push(format!("{name}: `{script}` returned {last:?}, want {want:?}"));
+}
+
+/// Repeats a setter until its getter agrees, for state Electron only applies
+/// once the window has finished being shown.
+fn expect_applied<T: PartialEq + Debug>(
+  failures: &mut Vec<String>,
+  name: &str,
+  want: T,
+  mut apply: impl FnMut() -> tauri_runtime::Result<()>,
+  mut read: impl FnMut() -> tauri_runtime::Result<T>,
+) {
+  let started = Instant::now();
+  loop {
+    let applied = apply();
+    let got = read();
+    let settled = matches!(&got, Ok(got) if *got == want) || started.elapsed() >= SETTLE;
+    if settled {
+      match (applied, got) {
+        (Err(error), _) => failures.push(format!("{name}: {error}")),
+        (_, Ok(got)) if got == want => {
+          CHECKS.fetch_add(1, Ordering::Relaxed);
+          println!("ok   {name} {got:?} in {:?}", started.elapsed());
+        }
+        (_, Ok(got)) => failures.push(format!("{name}: got {got:?}, want {want:?}")),
+        (_, Err(error)) => failures.push(format!("{name}: {error}")),
+      }
+      return;
+    }
+    thread::sleep(Duration::from_millis(25));
+  }
 }
 
 /// Records a setter failure; setters have no return value to compare.
