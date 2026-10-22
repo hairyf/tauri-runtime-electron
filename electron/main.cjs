@@ -147,6 +147,8 @@ async function dispatchProtocol(scheme, request) {
 /** @type {import('node:net').Socket | undefined} */
 let socket
 const windows = new Map()
+// Windows Tauri accepted to close; everything else holds the close.
+const closeAllowed = new Set()
 /** webviewId -> BrowserWindow */
 const webviews = new Map()
 /** webContents id -> webviewId (for routing `tauri-ipc` messages) */
@@ -298,7 +300,9 @@ async function createWindow(params) {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
-      preload: path.join(__dirname, 'preload.cjs'),
+      preload: params.webview
+        ? writeInitPreload(params.webview.webviewId, params.webview.initScripts)
+        : path.join(__dirname, 'preload.cjs'),
       // Tauri pages embed guests with the Chromium `<webview>` element; Electron
       // disables that tag by default since v5.
       webviewTag: true,
@@ -311,7 +315,17 @@ async function createWindow(params) {
   // destroyed, and `window.webContents.id` throws "Object has been destroyed".
   const contentsId = window.webContents.id
 
+  // Electron destroys the window on `close`; Tauri decides instead (an app may
+  // `prevent_close` and keep the window around, e.g. hiding to the tray), so
+  // hold the close and let the runtime answer with `window.destroy`.
+  window.on('close', (event) => {
+    if (closeAllowed.has(windowId)) return
+    event.preventDefault()
+    send({ event: 'window.closeRequested', params: { windowId } })
+  })
+
   window.on('closed', () => {
+    closeAllowed.delete(windowId)
     windows.delete(windowId)
     mainWebview.delete(windowId)
     webviewByContents.delete(contentsId)
@@ -363,17 +377,44 @@ function wireWebviewEvents(contents, webviewId) {
   })
 }
 
+/**
+ * Writes a preload that installs the IPC bridge and runs Tauri's initialization
+ * scripts in the page's main world.
+ *
+ * Tauri's scripts (`window.__TAURI_INTERNALS__`) must exist before the page's own
+ * modules run, so they cannot be executed from `dom-ready`; a preload runs ahead
+ * of every page script. The bridge goes through `contextBridge` because the
+ * preload itself is sandboxed.
+ */
+function writeInitPreload(webviewId, initScripts) {
+  const scripts = initScripts ?? []
+  if (!scripts.length) return path.join(__dirname, 'preload.cjs')
+  const file = path.join(os.tmpdir(), `tauri-runtime-electron-preload-${webviewId}.cjs`)
+  const source = `'use strict'
+const { contextBridge, ipcRenderer, webFrame } = require('electron')
+contextBridge.exposeInMainWorld('ipc', {
+  postMessage(data) {
+    ipcRenderer.send('tauri-ipc', String(data))
+  },
+})
+for (const source of ${JSON.stringify(scripts)}) {
+  try {
+    webFrame.executeJavaScript(source)
+  } catch (error) {
+    console.error('init script failed', error)
+  }
+}
+`
+  fs.writeFileSync(file, source)
+  return file
+}
+
 function loadWebview(window, webview) {
-  const { webviewId, url, initScripts } = webview
+  const { webviewId, url } = webview
   webviews.set(webviewId, window)
   webviewByContents.set(window.webContents.id, webviewId)
   recordPolicy(webviewId, webview.policy)
   wireWebviewEvents(window.webContents, webviewId)
-  window.webContents.on('dom-ready', () => {
-    for (const script of initScripts ?? []) {
-      window.webContents.executeJavaScript(script, true).catch(() => {})
-    }
-  })
   // Do not await: the page may need a `protocol.request` round trip to the Rust
   // runtime, which only starts pumping events after this call returns.
   window.loadURL(url).catch((error) => log('loadURL failed', url, serializeError(error)))
@@ -390,19 +431,11 @@ function attachWebviewElement(window, webview) {
   webviews.set(webviewId, window)
   recordPolicy(webviewId, webview.policy)
   const elementId = `tauri-webview-${webviewId}`
-  // `initScripts` have to run after the guest exists, but `dom-ready` has
-  // already fired by the time the awaited promise below resolves.
-  const scripts = (initScripts ?? [])
-    .map(
-      (script) =>
-        `await element.executeJavaScript(${JSON.stringify(script)}, true).catch((error) => console.error('init script failed', error))`
-    )
-    .join('\n')
   const code = `(async () => {
     const element = document.createElement('webview')
     element.id = ${JSON.stringify(elementId)}
     element.setAttribute('webpreferences', 'contextIsolation=yes,sandbox=yes')
-    element.setAttribute('preload', ${JSON.stringify(path.join(__dirname, 'preload.cjs'))})
+    element.setAttribute('preload', ${JSON.stringify(writeInitPreload(webviewId, initScripts))})
     element.src = ${JSON.stringify(url)}
     element.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;'
     document.body.appendChild(element)
@@ -411,7 +444,6 @@ function attachWebviewElement(window, webview) {
       element.addEventListener('dom-ready', resolve, { once: true })
       setTimeout(() => reject(new Error('webview dom-ready timed out')), 10000)
     })
-    ${scripts}
     return element.getWebContentsId()
   })()`
   return window.webContents
@@ -763,10 +795,20 @@ function handle(method, params) {
     case 'window.focus':
       windows.get(params.windowId)?.focus()
       return null
+    case 'window.nativeHandle': {
+      // Tauri's host-side code (menus, window effects, Win32 tweaks) needs the
+      // native handle; the Buffer holds the HWND / NSView / X11 window id.
+      const window = findWindow(params.windowId)
+      const buffer = window.getNativeWindowHandle()
+      const handle =
+        buffer.length >= 8 ? Number(buffer.readBigUInt64LE(0)) : buffer.readUInt32LE(0)
+      return { handle }
+    }
     case 'window.close':
       windows.get(params.windowId)?.close()
       return null
     case 'window.destroy':
+      closeAllowed.add(params.windowId)
       windows.get(params.windowId)?.destroy()
       return null
     case 'window.visibleOnAllWorkspaces':

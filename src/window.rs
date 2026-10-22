@@ -211,9 +211,36 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn window_handle(
     &self,
   ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-    // Electron owns the native window; handing out a borrowed handle here would
-    // be a dangling pointer, so callers are told there is none.
-    Err(raw_window_handle::HandleError::Unavailable)
+    // Electron owns the window, but it will tell us its native handle; Tauri's
+    // host-side code (muda menus, window effects, Win32 tweaks) needs it.
+    let handle = self
+      .context
+      .native_handle(self.id)
+      .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
+    let handle = std::num::NonZeroIsize::new(handle)
+      .ok_or(raw_window_handle::HandleError::Unavailable)?;
+    // SAFETY: the handle stays valid while the window exists, and Tauri uses it
+    // synchronously from the main thread.
+    #[cfg(windows)]
+    let raw = raw_window_handle::RawWindowHandle::Win32(
+      raw_window_handle::Win32WindowHandle::new(handle),
+    );
+    #[cfg(target_os = "macos")]
+    let raw = raw_window_handle::RawWindowHandle::AppKit(
+      raw_window_handle::AppKitWindowHandle::new(
+        std::ptr::NonNull::new(handle.get() as *mut std::ffi::c_void)
+          .ok_or(raw_window_handle::HandleError::Unavailable)?,
+      ),
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let raw = raw_window_handle::RawWindowHandle::Xlib(
+      raw_window_handle::XlibWindowHandle::new(handle.get() as std::os::raw::c_ulong),
+    );
+    #[cfg(not(any(windows, unix)))]
+    return Err(raw_window_handle::HandleError::Unavailable);
+
+    #[allow(unreachable_code)]
+    Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
   }
 
   fn center(&self) -> Result<()> {
@@ -298,10 +325,19 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(())
   }
 
-  // Electron cannot flip the frame or the shadow of a live window; both are
-  // creation-time flags on macOS and Windows.
-  fn set_decorations(&self, _decorations: bool) -> Result<()> {
-    Ok(())
+  // Electron cannot flip the frame through its own API, but the window is a real
+  // Win32 window: toggle the caption/thick-frame styles and let it repaint.
+  fn set_decorations(&self, decorations: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+      imp::set_decorations(self.context.native_handle(self.id)?, decorations);
+      Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+      let _ = decorations;
+      Ok(())
+    }
   }
 
   // Electron has no per-window drop shadow API.
@@ -309,8 +345,15 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     self.window_call("window.shadow", json!({ "value": shadow }))
   }
 
-  // Electron only supports always-on-top stacking.
-  fn set_always_on_bottom(&self, _always_on_bottom: bool) -> Result<()> {
+  // Electron has no "always at the bottom" flag; push the native window to the
+  // bottom of the z-order when it is requested.
+  fn set_always_on_bottom(&self, always_on_bottom: bool) -> Result<()> {
+    #[cfg(windows)]
+    if always_on_bottom {
+      imp::send_to_bottom(self.context.native_handle(self.id)?);
+    }
+    #[cfg(not(windows))]
+    let _ = always_on_bottom;
     Ok(())
   }
 
@@ -401,8 +444,14 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     self.window_call("window.ignoreCursorEvents", json!({ "ignore": ignore }))
   }
 
-  // Electron drags windows from CSS (`-webkit-app-region: drag`), not from Rust.
+  // Drag a frameless window the Win32 way: hand the window a caption drag.
   fn start_dragging(&self) -> Result<()> {
+    #[cfg(windows)]
+    {
+      imp::start_dragging(self.context.native_handle(self.id)?);
+      Ok(())
+    }
+    #[cfg(not(windows))]
     Ok(())
   }
 
@@ -525,4 +574,74 @@ fn color_css(color: tauri_utils::config::Color) -> String {
     color.2,
     color.3 as f64 / 255.0
   )
+}
+
+/// Win32 tweaks that Electron has no API for but the window still supports.
+#[cfg(windows)]
+mod imp {
+  use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+  use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+  use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongPtrW, HTCAPTION, HWND_BOTTOM, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetWindowLongPtrW, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION, WS_THICKFRAME,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE, SWP_NOMOVE, SWP_NOSIZE,
+  };
+
+  fn hwnd(handle: isize) -> HWND {
+    HWND(handle as *mut std::ffi::c_void)
+  }
+
+  pub(super) fn send_to_bottom(handle: isize) {
+    // SAFETY: z-order only, no geometry or focus change.
+    unsafe {
+      let _ = SetWindowPos(
+        hwnd(handle),
+        Some(HWND_BOTTOM),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+      );
+    }
+  }
+
+  pub(super) fn set_decorations(handle: isize, decorations: bool) {
+    let window = hwnd(handle);
+    let style = unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32;
+    let frame = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    let style = if decorations {
+      style | frame.0
+    } else {
+      style & !frame.0
+    };
+    // SAFETY: plain Win32 style juggling on a window we were handed.
+    unsafe {
+      SetWindowLongPtrW(window, GWL_STYLE, style as isize);
+      let _ = SetWindowPos(
+        window,
+        None,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+      );
+    }
+  }
+
+  pub(super) fn start_dragging(handle: isize) {
+    let window = hwnd(handle);
+    // SAFETY: the canonical frameless-drag trick; the message is handled by the
+    // window's non-client path and only starts a move loop.
+    unsafe {
+      let _ = ReleaseCapture();
+      SendMessageW(
+        window,
+        WM_NCLBUTTONDOWN,
+        Some(WPARAM(HTCAPTION as usize)),
+        Some(LPARAM(0)),
+      );
+    }
+  }
 }

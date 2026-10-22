@@ -64,6 +64,15 @@ follow [Semantic Versioning](https://semver.org/).
   `"resources": { "target/electron": "runtime" }` entry in `tauri.conf.json`;
   the resolver picks up `runtime/<platform>-<arch>` beside the executable.
 
+- Window handling that needs a native handle now goes through the real one:
+  `WindowDispatch::window_handle` asks Electron for its HWND/NSView/X11 id, so
+  Tauri's own menus (`set_menu`), runtime `set_decorations`, `start_dragging`,
+  always-on-bottom and `window.hwnd()` work unchanged, and window effects such as
+  Mica/Acrylic apply.
+- The `ipc`, `tauri` and `asset` schemes are always registered as privileged
+  before Electron starts, so the asset protocol (`convertFileSrc` + `fetch`)
+  works without extra wiring once the app enables `protocol-asset`.
+
 ### Bug Fixes
 - Packaged apps show the Tauri icon instead of Electron's: the icon is read out of
   the executable's `RT_GROUP_ICON`/`RT_ICON` resources into a temporary `.ico`.

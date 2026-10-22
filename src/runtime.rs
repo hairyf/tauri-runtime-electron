@@ -155,6 +155,10 @@ pub struct RuntimeContext {
   /// Download and permission callbacks, by webview serial. Electron asks for
   /// these asynchronously, so the run loop answers over IPC.
   policy_handlers: Rc<RefCell<HashMap<u32, PolicyHandlers>>>,
+  /// Native window handle (HWND / NSView / X11 window) per window serial, asked
+  /// from Electron once. `window_handle()` hands it to Tauri so host-side code
+  /// (muda menus, window effects, Win32 tweaks) works as it does on wry.
+  native_handles: Rc<RefCell<HashMap<u32, isize>>>,
 }
 
 // SAFETY: we ensure this type is only used on the main thread.
@@ -216,6 +220,31 @@ impl RuntimeContext {
 
   pub(crate) fn serial_for_window(&self, id: WindowId) -> Option<u32> {
     self.windows.borrow().get(&id).map(|window| window.serial)
+  }
+
+  /// The native handle of a window, as Electron knows it. Cached because Tauri
+  /// asks for it on every menu/effect/decoration call.
+  pub(crate) fn native_handle(&self, id: WindowId) -> Result<isize> {
+    let serial = self
+      .serial_for_window(id)
+      .ok_or_else(|| create_window_err("window is gone".to_string()))?;
+    if let Some(handle) = self.native_handles.borrow().get(&serial) {
+      return Ok(*handle);
+    }
+    let value = self
+      .ipc
+      .call(
+        "window.nativeHandle",
+        json!({ "windowId": serial }),
+        IPC_TIMEOUT,
+      )
+      .map_err(create_window_err)?;
+    let handle = value["handle"]
+      .as_i64()
+      .ok_or_else(|| create_window_err("electron returned no native handle".to_string()))?;
+    let handle = handle as isize;
+    self.native_handles.borrow_mut().insert(serial, handle);
+    Ok(handle)
   }
 
   /// Tauri hands us `tauri://localhost/...` in production builds; when a dev
@@ -387,6 +416,7 @@ impl ElectronRuntime {
       protocol_handlers: Default::default(),
       webview_origins: Default::default(),
       policy_handlers: Default::default(),
+      native_handles: Default::default(),
     };
     Self {
       is_running,
@@ -421,11 +451,20 @@ impl ElectronRuntime {
       }
     }
     // Electron only accepts privileged schemes at startup, so they travel on the
-    // command line and are installed before `app.whenReady()`.
-    if !custom_schemes.is_empty() {
-      args.push("--tauri-schemes".to_string());
-      args.push(custom_schemes.join(","));
+    // command line and are installed before `app.whenReady()`. `asset` is not in
+    // Tauri's `custom_schemes` (its handler is registered per webview), but it
+    // needs the same privileges for `convertFileSrc` fetches to work.
+    let mut schemes: Vec<String> = ["ipc", "tauri", "asset"]
+      .iter()
+      .map(|scheme| scheme.to_string())
+      .collect();
+    for scheme in custom_schemes {
+      if !schemes.iter().any(|known| known == scheme) {
+        schemes.push(scheme.clone());
+      }
     }
+    args.push("--tauri-schemes".to_string());
+    args.push(schemes.join(","));
     if let Some(identifier) = &attrs.identifier {
       args.push("--tauri-identifier".to_string());
       args.push(identifier.clone());
@@ -863,6 +902,13 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       // Events pushed by the Electron process.
       while let Ok(event) = self.event_rx.try_recv() {
         match event["event"].as_str() {
+          Some("window.closeRequested") => {
+            let serial = event["params"]["windowId"].as_u64().unwrap_or_default() as u32;
+            let Some(id) = self.context.window_for_serial(serial) else {
+              continue;
+            };
+            close_window(&self.context, id, &mut callback);
+          }
           Some("window.closed") => {
             let serial = event["params"]["windowId"].as_u64().unwrap_or_default() as u32;
             let Some(id) = self.context.window_for_serial(serial) else {
@@ -1172,7 +1218,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
         match message {
           Message::Task(task) => task(),
           Message::CloseWindow(id) => {
-            if window_closed(&self.context, id, &mut callback) {
+            if close_window(&self.context, id, &mut callback) {
               break 'event_loop;
             }
           }
@@ -1192,6 +1238,10 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       }
 
       callback(RunEvent::MainEventsCleared);
+
+      // Native UI (tray icons, menus) lives on this thread and posts window
+      // messages here; Electron owns its own process, so nothing else pumps them.
+      pump_thread_messages();
 
       std::thread::sleep(Duration::from_millis(10));
     }
@@ -1237,7 +1287,10 @@ fn window_event_for(params: &Value) -> Option<WindowEvent> {
 
 /// Emits `WindowEvent::CloseRequested` for `id`; returns `true` if the runtime
 /// should exit (window was removable and the app has no windows left).
-fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
+/// Asks Tauri whether the window may close. Electron keeps the window alive
+/// until the answer comes back, so `prevent_close` is actually honoured.
+/// Returns `true` when the close should proceed.
+fn request_close<T: UserEvent, F: FnMut(RunEvent<T>)>(
   context: &RuntimeContext,
   id: WindowId,
   callback: &mut F,
@@ -1255,12 +1308,27 @@ fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
   let close_requested = WindowEvent::CloseRequested { signal_tx: tx };
   context.emit_window_event(id, &close_requested);
   callback(RunEvent::WindowEvent {
-    label: label.clone(),
+    label,
     event: close_requested,
   });
-  if matches!(rx.try_recv(), Ok(true)) {
+  !matches!(rx.try_recv(), Ok(true))
+}
+
+/// Forgets a window Electron already destroyed. Returns `true` when the app
+/// should exit because no window is left.
+fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
+  context: &RuntimeContext,
+  id: WindowId,
+  callback: &mut F,
+) -> bool {
+  let Some(label) = context
+    .windows
+    .borrow()
+    .get(&id)
+    .map(|window| window.label.clone())
+  else {
     return false;
-  }
+  };
 
   context.emit_window_event(id, &WindowEvent::Destroyed);
   context.windows.borrow_mut().remove(&id);
@@ -1269,6 +1337,28 @@ fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
     event: WindowEvent::Destroyed,
   });
   exit_if_empty(context, callback)
+}
+
+/// Runs the close handshake for a window that asked to close: ask Tauri, and
+/// only tell Electron to destroy the window when nobody prevented it.
+fn close_window<T: UserEvent, F: FnMut(RunEvent<T>)>(
+  context: &RuntimeContext,
+  id: WindowId,
+  callback: &mut F,
+) -> bool {
+  if !request_close(context, id, callback) {
+    return false;
+  }
+  if let Some(serial) = context.serial_for_window(id) {
+    if let Err(error) = context.ipc.call(
+      "window.destroy",
+      serde_json::json!({ "windowId": serial }),
+      IPC_TIMEOUT,
+    ) {
+      eprintln!("[electron] failed to destroy window {serial}: {error}");
+    }
+  }
+  false
 }
 
 /// Emits `RunEvent::ExitRequested` when no windows remain; returns `true` when
@@ -1720,3 +1810,27 @@ mod tests {
     assert_eq!(permission_response_name(PermissionResponse::Default), "default");
   }
 }
+
+/// Drains the thread's window-message queue.
+///
+/// `tray-icon` and `muda` (used by `tauri::tray` and the menu API) create hidden
+/// windows on the calling thread and only dispatch their callbacks from that
+/// thread's message loop. Electron pumps its own process, not this one, so the
+/// runtime has to do it.
+#[cfg(windows)]
+fn pump_thread_messages() {
+  use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+  };
+
+  let mut message = MSG::default();
+  while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+    unsafe {
+      let _ = TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+}
+
+#[cfg(not(windows))]
+fn pump_thread_messages() {}
