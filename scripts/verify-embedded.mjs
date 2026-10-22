@@ -33,6 +33,14 @@ function bridgeCallSite(source, location) {
   return { variable: call[1], location: { scriptId: location.scriptId, lineNumber: before.length - 1, columnNumber: before.at(-1).length } }
 }
 
+function nativeFetchCallSite(source, scriptId) {
+  const marker = "const bytes = Uint8Array.from(atob(reply.body ?? ''), c => c.charCodeAt(0))"
+  const offset = source.indexOf(marker)
+  assert(offset >= 0 && source.indexOf(marker, offset + marker.length) < 0, 'original native IPC response call site is unavailable or ambiguous')
+  const before = source.slice(0, offset).split('\n')
+  return { scriptId, lineNumber: before.length - 1, columnNumber: before.at(-1).length }
+}
+
 function quadrants(width, height) {
   return [
     { x: 0, y: 0, width: width / 2, height: height / 2 },
@@ -103,23 +111,61 @@ const dragCases = [
   [16, 'role-switch-blocks', '[role="switch"]', false], [16, 'role-option-blocks', '[role="option"]', false],
 ]
 
+function dragListeners() {
+  const listeners = getEventListeners(document)
+  return { url: location.href, ready: document.readyState, isTauri: window.isTauri,
+    metadata: window.__TAURI_INTERNALS__?.metadata ?? null,
+    invoke: typeof window.__TAURI_INTERNALS__?.invoke, bridge: typeof window.ipc?.postMessage,
+    listeners: Object.fromEntries(['mousedown', 'mouseup'].map((type) => [type, (listeners[type] ?? []).map((entry) => ({
+      useCapture: entry.useCapture, passive: entry.passive, once: entry.once,
+      scriptId: entry.scriptId, lineNumber: entry.lineNumber, columnNumber: entry.columnNumber,
+      source: String(entry.listener),
+    }))])) }
+}
+
+async function directToggleProbe(t, target) {
+  const evidence = { command: 'plugin:window|internal_toggle_maximize', before: await nativeWindow(t) }
+  const toggle = async () => {
+    try { return { status: 'fulfilled', value: await t.evaluate(target, `window.__TAURI_INTERNALS__.invoke('plugin:window|internal_toggle_maximize')`) } }
+    catch (error) { return { status: 'rejected', error: error.message } }
+  }
+  evidence.invoke = await toggle()
+  await delay(150)
+  evidence.after = await nativeWindow(t)
+  if (json(rect(evidence.before)) !== json(rect(evidence.after))) {
+    evidence.restore = await toggle()
+    await delay(150)
+    evidence.restored = await nativeWindow(t)
+    evidence.restoredOriginalBounds = json(rect(evidence.before)) === json(rect(evidence.restored))
+  }
+  return evidence
+}
+
 export async function verifyDrag(t) {
-  const target = t.main, results = [], checks = collecting(t)
+  const target = t.main, results = [], checks = collecting(t), rendererEvents = []
   await t.wait(target, `document.querySelectorAll('.qa-test-case').length`, (n) => n === 16)
   t.check('drag source QA count', await t.evaluate(target, `document.querySelectorAll('.qa-test-case').length`), 16)
-  await nativeWindow(t)
-  await t.native('place')
-  await t.capture(target, 'drag-before')
-  save(t, 'drag-before-native-state', await desktop(t, 'drag-before'))
-  await t.evaluate(target, `(() => {
-    const state = { expected: null, events: [] }
-    state.listener = (event) => state.events.push({ type: event.type, trusted: event.isTrusted,
-      matches: event.target === state.expected, detail: event.detail, x: event.clientX, y: event.clientY,
-      tag: event.target.tagName, role: event.target.getAttribute?.('role'), attr: event.target.getAttribute?.('data-tauri-drag-region') })
-    for (const type of ['mousedown', 'dblclick', 'focusin']) document.addEventListener(type, state.listener, { capture: true, passive: true })
-    window.__verifyEmbeddedDrag = state
-  })()`)
+  const cdp = await observer(target, (event) => {
+    if (event.method === 'Runtime.exceptionThrown' || event.method === 'Log.entryAdded'
+      || (event.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(event.params.type))) rendererEvents.push(event)
+  })
   try {
+    await Promise.all([cdp.send('Runtime.enable'), cdp.send('Log.enable')])
+    save(t, 'drag-initial-listeners', await cdp.send('Runtime.evaluate', {
+      expression: `(${dragListeners})()`, includeCommandLineAPI: true, returnByValue: true,
+    }))
+    await nativeWindow(t)
+    await t.native('place')
+    await t.capture(target, 'drag-before')
+    save(t, 'drag-before-native-state', await desktop(t, 'drag-before'))
+    await t.evaluate(target, `(() => {
+      const state = { expected: null, events: [] }
+      state.listener = (event) => state.events.push({ type: event.type, trusted: event.isTrusted,
+        matches: event.target === state.expected, detail: event.detail, x: event.clientX, y: event.clientY,
+        tag: event.target.tagName, role: event.target.getAttribute?.('role'), attr: event.target.getAttribute?.('data-tauri-drag-region') })
+      for (const type of ['mousedown', 'dblclick', 'focusin']) document.addEventListener(type, state.listener, { capture: true, passive: true })
+      window.__verifyEmbeddedDrag = state
+    })()`)
     for (const [number, name, selector, shouldMove] of dragCases) {
       await t.native('place')
       const point = await page(t, target, dragPoint, { number, selector })
@@ -177,12 +223,21 @@ export async function verifyDrag(t) {
     await desktop(t, 'drag-doubleclick-restored')
     save(t, 'drag-all-cases', results)
     checks.finish()
+  } catch (error) {
+    try { save(t, 'drag-direct-toggle', await directToggleProbe(t, target)) }
+    catch (probeError) { save(t, 'drag-direct-toggle', { error: probeError.message }) }
+    throw error
   } finally {
-    await t.evaluate(target, `(() => {
-      const state = window.__verifyEmbeddedDrag
-      if (state) for (const type of ['mousedown', 'dblclick', 'focusin']) document.removeEventListener(type, state.listener, true)
-      delete window.__verifyEmbeddedDrag
-    })()`)
+    try {
+      await t.evaluate(target, `(() => {
+        const state = window.__verifyEmbeddedDrag
+        if (state) for (const type of ['mousedown', 'dblclick', 'focusin']) document.removeEventListener(type, state.listener, true)
+        delete window.__verifyEmbeddedDrag
+      })()`)
+    } finally {
+      try { save(t, 'drag-renderer-events', rendererEvents) }
+      finally { cdp.close() }
+    }
   }
 }
 
@@ -238,7 +293,7 @@ export async function verifyIsolation(t) {
   const expectedHook = hookFile.match(/window\.__TAURI_ISOLATION_HOOK__\s*=\s*([\s\S]*)/)?.[1]
   assert(expectedHook, 'source isolation hook assignment is missing')
   const contexts = new Map(), consoles = [], forwarded = [], transport = [], problems = [], tasks = new Set()
-  const bridgeBreakpoints = new Map(), requests = new Map()
+  const bridgeBreakpoints = new Map(), nativeBreakpoints = new Set(), requests = new Map()
   let cdp
   const queue = (promise) => {
     const task = promise.catch((error) => { problems.push(error.message) }).finally(() => tasks.delete(task))
@@ -273,9 +328,10 @@ export async function verifyIsolation(t) {
     } else if (method === 'Debugger.paused') {
       queue((async () => {
         try {
+          const native = params.hitBreakpoints?.some((id) => nativeBreakpoints.has(id))
           const result = await cdp.send('Debugger.evaluateOnCallFrame', {
             callFrameId: params.callFrames[0].callFrameId,
-            expression: `(() => {
+            expression: native ? `({ raw: options.body, url, status: reply.status })` : `(() => {
               const raw = ${params.hitBreakpoints?.map((id) => bridgeBreakpoints.get(id)).find(Boolean) ?? 'arguments[0]'}
               const value = typeof raw === 'string' ? JSON.parse(raw) : raw
               return { rawString: typeof raw === 'string', value: value && { cmd: value.cmd, callback: value.callback, error: value.error, payload: value.payload } }
@@ -283,8 +339,13 @@ export async function verifyIsolation(t) {
           }, sessionId)
           if (result.exceptionDetails) throw new Error(result.exceptionDetails.text)
           const snapshot = result.result?.value
-          const value = packet(snapshot?.value)
-          if (value) (snapshot.rawString ? transport : forwarded).push({ channel: snapshot.rawString ? 'ipc.postMessage' : 'internals.postMessage', value })
+          if (native) {
+            const value = packet(snapshot?.raw, decodeURIComponent(new URL(snapshot.url).pathname.slice(1)))
+            if (value) transport.push({ channel: 'native-protocol', url: snapshot.url, status: snapshot.status, value })
+          } else {
+            const value = packet(snapshot?.value)
+            if (value) (snapshot.rawString ? transport : forwarded).push({ channel: snapshot.rawString ? 'ipc.postMessage' : 'internals.postMessage', value })
+          }
         } finally { await cdp.send('Debugger.resume', {}, sessionId) }
       })())
     }
@@ -325,11 +386,16 @@ export async function verifyIsolation(t) {
       const location = properties.internalProperties?.find((p) => p.name === '[[FunctionLocation]]')?.value?.value
       assert(location?.scriptId, 'original IPC function location is unavailable')
       const { scriptSource } = await cdp.send('Debugger.getScriptSource', { scriptId: location.scriptId })
+      try {
+        // The native invoke has settled here; options.body still holds the original ciphertext.
+        const breakpoint = await cdp.send('Debugger.setBreakpoint', { location: nativeFetchCallSite(scriptSource, location.scriptId) })
+        nativeBreakpoints.add(breakpoint.breakpointId)
+      } catch (error) { problems.push(`original native IPC response: ${error.message}`) }
       const call = bridgeCallSite(scriptSource, location)
       const breakpoint = await cdp.send('Debugger.setBreakpoint', { location: call.location })
       bridgeBreakpoints.set(breakpoint.breakpointId, call.variable)
     } catch (error) {
-      // A real successful Network request body must supply transport evidence if
+      // A successful Network/native response must supply transport evidence if
       // this Chromium cannot expose the original bridge call location.
       problems.push(`original IPC call site: ${error.message}`)
     }
@@ -368,7 +434,7 @@ export async function verifyIsolation(t) {
       const replies = await t.evaluate(main, 'window.__verifyEmbeddedIsolation.replies')
       const reply = hook && replies.find((value) => value.cmd === 'ping' && value.callback === hook.callback && value.error === hook.error)
       const wire = reply && transport.find((entry) => entry.value.cmd === 'ping' && json(entry.value.payload) === json(reply.payload)
-        && (entry.channel !== 'network' || entry.status >= 200 && entry.status < 300))
+        && (!['network', 'native-protocol'].includes(entry.channel) || entry.status >= 200 && entry.status < 300))
       const forward = reply && forwarded.find((entry) => entry.value.cmd === 'ping' && entry.value.callback === reply.callback && json(entry.value.payload) === json(reply.payload))
       const run = { index, text, hooks, reply, wire, forward, rust: (await t.output()).slice(logStart) }
       runs.push(run)
@@ -549,8 +615,38 @@ if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(pro
   assert.deepEqual(bridgeCallSite('const ignored = 0;\nfunction send() {\n  window.ipc.postMessage(data)\n}', { scriptId: '7', lineNumber: 1, columnNumber: 0 }),
     { variable: 'data', location: { scriptId: '7', lineNumber: 2, columnNumber: 2 } })
   assert.throws(() => bridgeCallSite('function send() {}', { scriptId: '7', lineNumber: 0, columnNumber: 0 }))
+  const nativeFetch = readFileSync(new URL('../src/runtime.rs', import.meta.url), 'utf8').replaceAll('\r\n', '\n').match(/const NATIVE_IPC_FETCH: &str = r#"([^]*?)"#;/)?.[1]
+  assert(nativeFetch, 'missing runtime native IPC fetch helper')
+  const nativeSite = nativeFetchCallSite(nativeFetch, '8')
+  assert.equal(nativeSite.scriptId, '8')
+  assert.equal(nativeFetch.split('\n')[nativeSite.lineNumber].slice(nativeSite.columnNumber), "const bytes = Uint8Array.from(atob(reply.body ?? ''), c => c.charCodeAt(0))")
+  assert.deepEqual(nativeFetchCallSite(nativeFetch.replaceAll('\n', '\r\n'), '8'), nativeSite)
+  assert.throws(() => nativeFetchCallSite('function send() {}', '8'))
+  assert.throws(() => nativeFetchCallSite(`${nativeFetch}\n${nativeFetch}`, '8'))
   assert.equal(compact('(payload) => { return payload };'), '(payload)=>{returnpayload}')
   assert.deepEqual([...new Set(dragCases.map(([number]) => number))], Array.from({ length: 16 }, (_, i) => i + 1))
+  for (const outcome of ['changed', 'unchanged', 'rejected']) {
+    const original = { x: 120, y: 80, width: 816, height: 639, clientWidth: 800, clientHeight: 600, visible: true }
+    let maximized = false, calls = 0
+    const probe = await directToggleProbe({ name: 'drag',
+      async native(action) {
+        assert.equal(action, 'state')
+        return [maximized ? { ...original, x: 0, y: 0, width: 1920, height: 1080 } : original]
+      },
+      async evaluate(_target, expression) {
+        assert.equal(expression, `window.__TAURI_INTERNALS__.invoke('plugin:window|internal_toggle_maximize')`)
+        calls++
+        if (outcome === 'rejected') throw new Error('invoke denied')
+        if (outcome === 'changed') maximized = !maximized
+        return null
+      },
+    }, {})
+    assert.equal(probe.invoke.status, outcome === 'rejected' ? 'rejected' : 'fulfilled')
+    assert.equal(calls, outcome === 'changed' ? 2 : 1)
+    assert.equal(maximized, false, 'diagnostic must restore the original window')
+    if (outcome === 'changed') assert.equal(probe.restoredOriginalBounds, true)
+    else assert.equal(probe.restore, undefined)
+  }
   assert.equal(externalStatus('main2', { url: 'chrome-error://chromewebdata/', title: '', text: 'ERR_NAME_NOT_RESOLVED' }), 'network-gap')
   assert.equal(externalStatus('main4', { url: 'https://x.com/i/flow/login', title: 'Log in to X', text: 'Log in to X' }), 'login-or-network-wall')
   assert.equal(externalStatus('main3', { url: 'https://tauri.app/', title: 'Tauri', text: 'Tauri '.repeat(40), ready: 'complete', headings: ['Tauri'] }), 'tauri-site-content')

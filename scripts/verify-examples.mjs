@@ -4,7 +4,8 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { createInterface } from 'node:readline'
 import { exampleNames } from './example.mjs'
 import { cases } from './verify-cases.mjs'
 
@@ -78,6 +79,37 @@ function stop(child) {
   }
 }
 
+async function watchSplash() {
+  const child = spawn('pwsh', [
+    '-NoProfile', '-File', path.join(root, 'scripts', 'verify-native.ps1'),
+    '-RootPid', String(process.pid), '-Action', 'watch-splash',
+  ], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
+  let ready, rejectReady, resolveState, rejectState
+  const started = new Promise((resolve, reject) => { ready = resolve; rejectReady = reject })
+  const state = new Promise((resolve, reject) => { resolveState = resolve; rejectState = reject })
+  state.catch(() => {})
+  const lines = createInterface({ input: child.stdout })
+  let errors = ''
+  child.stderr.on('data', (data) => { errors += data })
+  lines.on('line', (line) => {
+    if (line.trim() === 'READY') ready()
+    else {
+      try { resolveState(JSON.parse(line.replace(/^\uFEFF/, ''))) }
+      catch (error) { rejectState(error) }
+    }
+  })
+  child.on('error', (error) => { rejectReady(error); rejectState(error) })
+  child.on('exit', (code) => {
+    const error = new Error(errors || `splash watcher exited (${code}) before recording the initial windows`)
+    rejectReady(error); rejectState(error)
+  })
+  const timer = setTimeout(() => { rejectReady(new Error('splash watcher did not become ready')); stop(child) }, 30000)
+  try { await started }
+  catch (error) { stop(child); throw error }
+  finally { clearTimeout(timer) }
+  return { state, stop: () => { stop(child); lines.close() } }
+}
+
 async function run(name, index) {
   const dir = path.join(evidence, name)
   fs.mkdirSync(dir, { recursive: true })
@@ -87,10 +119,11 @@ async function run(name, index) {
   if (name === 'file-associations') for (const [i, file] of fileFixtures.entries()) fs.writeFileSync(file, `fixture ${i}\n`)
   const port = 9400 + index
   const logFd = fs.openSync(path.join(dir, 'app.log'), 'w')
+  const splashWatch = name === 'splashscreen' ? await watchSplash() : null
   const child = spawn(process.execPath, [
     path.join(root, 'scripts', 'example.mjs'), name,
     ...(args.includes('--no-install') ? ['--no-install'] : []),
-    ...(name === 'file-associations' ? ['--', ...fileFixtures] : []),
+    ...(name === 'file-associations' ? ['--', ...fileFixtures.map((file) => pathToFileURL(file).href)] : []),
   ], {
     cwd: root,
     stdio: ['ignore', logFd, logFd],
@@ -110,6 +143,7 @@ async function run(name, index) {
   }
   const t = {
     name, root, dir, fileFixtures, command, evaluate, output, targets, childPid: child.pid,
+    splashBefore: () => splashWatch.state,
     native(action, params = {}) {
       assert.equal(process.platform, 'win32', 'native desktop checks require Windows')
       const nativeResult = spawnSync('pwsh', [
@@ -194,8 +228,11 @@ async function run(name, index) {
     assert(cases[name], `missing acceptance case ${name}`)
     // A clean checkout can spend several minutes building all Rust dependencies.
     t.main = await t.target((target) => target.type === 'page' && !target.url.startsWith('devtools://'), 600000)
-    await t.wait(t.main, `document.readyState`, (state) => state === 'complete' || state === 'interactive')
-    await t.capture(t.main, `${name}-initial`)
+    // Splash has a real 2s transition; observe it before generic CDP work.
+    if (name !== 'splashscreen') {
+      await t.wait(t.main, `document.readyState`, (state) => state === 'complete' || state === 'interactive')
+      await t.capture(t.main, `${name}-initial`)
+    }
     await cases[name](t)
     assert(result.checks.length > 0, 'a case without assertions cannot pass')
     result.status = result.notes.length ? 'assertions-passed-with-unverified-scope' : 'assertions-passed-awaiting-visual-review'
@@ -206,6 +243,7 @@ async function run(name, index) {
     try { for (const [i, target] of (await targets()).entries()) await t.capture(target, `${name}-failure-${i}`) } catch {}
   } finally {
     stop(child)
+    splashWatch?.stop()
     await Promise.race([exited.catch(() => {}), delay(2000)])
     result.finished = new Date().toISOString()
     fs.writeFileSync(path.join(dir, 'result.json'), JSON.stringify(result, null, 2) + '\n')

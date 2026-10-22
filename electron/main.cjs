@@ -660,13 +660,12 @@ contextBridge.exposeInMainWorld('ipc', {
   postMessage(data) {
     ipcRenderer.send('tauri-ipc', String(data))
   },
+  fetch(request) {
+    return ipcRenderer.invoke('tauri-protocol', request)
+  },
 })
 for (const source of ${JSON.stringify(scripts)}) {
-  try {
-    webFrame.executeJavaScript(source)
-  } catch (error) {
-    console.error('init script failed', error)
-  }
+  webFrame.executeJavaScript(source).catch(error => console.error('init script failed', error))
 }
 `
   fs.writeFileSync(file, source)
@@ -986,11 +985,39 @@ function setWindowPosition(window, params) {
   window.setPosition(x, y)
 }
 
+/** Mirror muda's Win32 menu; the Rust owner remains authoritative for clicks. */
+function setWindowMenu(windowId, menu) {
+  const window = findWindow(windowId)
+  const template = (items) => items.map((item) => {
+    if (item.type === 'separator') return { type: 'separator' }
+    const entry = {
+      label: item.label,
+      enabled: item.enabled,
+      ...(item.accelerator ? { accelerator: item.accelerator } : {}),
+    }
+    if (item.submenu) entry.submenu = template(item.submenu)
+    else {
+      // Unchecked Win32 check items are indistinguishable from ordinary items.
+      // Rust toggles them and the next snapshot supplies the visible checkmark.
+      if (item.checked) Object.assign(entry, { type: 'checkbox', checked: true })
+      entry.click = () => {
+        if (!window.isDestroyed()) send({ event: 'menu.command', params: { windowId, commandId: item.commandId } })
+      }
+    }
+    return entry
+  })
+  window.setMenu(menu === null ? null : Menu.buildFromTemplate(template(menu)))
+  if (menu !== null) window.setMenuBarVisibility(true)
+  return null
+}
+
 function handle(method, params) {
   if (process.env.TAURI_RUNTIME_ELECTRON_DEBUG) log('ipc', method, JSON.stringify(params).slice(0, 200))
   switch (method) {
     case 'window.create':
       return createWindow(params)
+    case 'window.setMenu':
+      return setWindowMenu(params.windowId, params.menu)
     case 'webview.create': {
       const window = windows.get(params.windowId)
       if (!window) throw new Error(`unknown window ${params.windowId}`)
@@ -1503,6 +1530,41 @@ function onLine(line) {
       send({ id: message.id, error: serializeError(error) })
     })
 }
+
+function nativeProtocolRequest(event, request) {
+  const webviewId = webviewByContents.get(event.sender.id)
+  const frame = event.senderFrame
+  if (webviewId === undefined || !frame || frame !== event.sender.mainFrame) {
+    throw new Error('IPC requires a mapped main frame')
+  }
+  const url = new URL(request?.url)
+  if (!((url.protocol === 'ipc:' && url.host === 'localhost') ||
+    (url.protocol === 'http:' && url.host === 'ipc.localhost')) || url.username || url.password || url.hash) {
+    throw new Error('Invalid IPC URL')
+  }
+  if (!['POST', 'OPTIONS'].includes(request.method) || !Array.isArray(request.headers) || !(request.body instanceof Uint8Array)) {
+    throw new Error('Invalid IPC request')
+  }
+  const headers = new Headers(request.headers)
+  // Renderer-supplied identity, Origin and Referer are never authoritative.
+  headers.set('origin', new URL(frame.url).origin === 'null'
+    ? `${new URL(frame.url).protocol}//${new URL(frame.url).host}` : new URL(frame.url).origin)
+  headers.delete('referer')
+  return {
+    scheme: 'ipc', webviewId, pageUrl: frame.url, uri: `ipc://localhost${url.pathname}${url.search}`,
+    method: request.method, headers: Object.fromEntries(headers), body: Buffer.from(request.body).toString('base64'),
+  }
+}
+
+ipcMain.handle('tauri-protocol', (event, request) => {
+  const params = nativeProtocolRequest(event, request)
+  const id = nextProtocolId++
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { protocolRequests.delete(id); reject(new Error('Native IPC response timed out')) }, 60000)
+    protocolRequests.set(id, (reply) => { clearTimeout(timer); resolve(reply) })
+    send({ event: 'protocol.request', params: { id, ...params } })
+  })
+})
 
 ipcMain.on('tauri-ipc', (event, data) => {
   const webviewId = webviewByContents.get(event.sender.id)

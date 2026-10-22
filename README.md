@@ -51,17 +51,15 @@ To bundle the Electron runtime with your application without triggering download
 
 ## Menus & Native Handles
 
-Context menus work: `Window::popup_menu` draws the same native menu wry would,
-because Tauri is handed a 1x1 window owned by the thread that tracks the menu
-(muda can only pop a menu up on a window of that thread, and Electron's window
-belongs to another process). Two consequences are worth knowing:
+On Windows, each window has a hidden owner on the Rust UI thread so muda can
+track context menus. Its menu bar is mirrored into Electron's `Menu` API;
+clicks return to muda so Tauri handles callbacks and check-item state. Changes
+to labels, enabled state and menu attachment are synchronized by the runtime.
 
-* A **menu bar** (`Window::set_menu`) has no visible effect: Tauri attaches it to
-  that helper window, while Electron draws its menu bar from its own `Menu` API.
-* On Windows, `Window::hwnd()` / `window_handle()` return the helper window, not
-  the Electron one, so third-party Win32 tweaks fed with that handle (window
-  vibrancy, custom DWM calls) do nothing. Effects declared in `tauri.conf.json`
-  are unaffected: they travel as window config, not through the handle.
+`Window::hwnd()` / `window_handle()` return this helper on Windows. Third-party
+Win32 effects using that handle affect the helper; effects declared in
+`tauri.conf.json` and the runtime's window operations use the Electron window.
+Parent and owner options translate helper handles back to their visible window.
 
 ---
 

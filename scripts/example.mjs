@@ -418,24 +418,29 @@ function stageResources(crate, binDir) {
 function prepareVideo(crate) {
   if (name !== 'streaming') return
   const file = path.join(crate, 'streaming_example_test_video.mp4')
-  const valid = () => {
-    if (!fs.existsSync(file)) return false
-    const fd = fs.openSync(file, 'r')
+  const valid = (candidate) => {
+    if (!fs.existsSync(candidate)) return false
+    const fd = fs.openSync(candidate, 'r')
     try {
       const header = Buffer.alloc(12)
       return fs.readSync(fd, header) === 12 && header.toString('ascii', 4, 8) === 'ftyp'
     } finally { fs.closeSync(fd) }
   }
-  if (valid()) return
-  // Upstream curl accepts an HTTP proxy's error page as a successful download.
-  // Fetch the same fixture over HTTPS and fail before launching on bad data.
+  if (valid(file)) return
+  // Keep upstream's Big Buck Bunny film; W3 hosts the full film if Google denies access.
   const url = read(path.join(crate, 'main.rs')).match(/"(http:\/\/commondatastorage[^\"]+\.mp4)"/)?.[1]
   if (!url) fail('upstream streaming video URL changed')
   const temp = file + '.part'
-  const result = spawnSync('curl', ['--fail', '--location', '--retry', '2', '--max-time', '180', '--output', temp, url.replace('http:', 'https:')], { stdio: 'inherit' })
-  if (result.error || result.status !== 0) fail('streaming fixture download failed')
-  fs.renameSync(temp, file)
-  if (!valid()) fail('streaming fixture is not an MP4 file')
+  for (const source of [url.replace('http:', 'https:'), 'https://media.w3.org/2010/05/bunny/movie.mp4']) {
+    console.log(`[example] downloading streaming fixture ${source}`)
+    try {
+      const result = spawnSync('curl', ['--fail', '--location', '--retry', '2', '--max-time', '180', '--output', temp, source], { stdio: 'inherit' })
+      if (result.error || result.status !== 0 || !valid(temp)) continue
+      fs.renameSync(temp, file)
+      return
+    } finally { fs.rmSync(temp, { force: true }) }
+  }
+  fail('streaming fixture download failed or is not an MP4 file')
 }
 
 function runApp(crate) {

@@ -222,7 +222,8 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     // exception: muda only tracks and pops a menu up on a window of the calling
     // thread, so on Windows Tauri gets our own hidden window instead.
     #[cfg(windows)]
-    let handle = imp::menu_owner_window().ok_or(raw_window_handle::HandleError::Unavailable)?;
+    let handle = self.context.menu_owner_window(self.id)
+      .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
     #[cfg(not(windows))]
     let handle = self
       .context
@@ -266,9 +267,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &mut self,
     pending: PendingWindow<T, Self::Runtime>,
-    _after_window_creation: Option<F>,
+    after_window_creation: Option<F>,
   ) -> Result<DetachedWindow<T, Self::Runtime>> {
-    create_window_impl(&self.context, pending)
+    create_window_impl(&self.context, pending, after_window_creation)
   }
 
   fn create_webview(
@@ -704,48 +705,85 @@ pub(crate) mod imp {
     }
   }
 
-  /// Muda tracks a menu on the thread that owns the window it pops the menu up
-  /// on, and Electron's window belongs to another process: `TrackPopupMenu` on
-  /// it returns immediately and nothing is drawn. Tauri therefore gets a window
-  /// of our own as the menu owner. It is 1x1 at the origin and never shown
-  /// because muda reads popup positions relative to the owner's top-left corner,
-  /// so the origin keeps "window coordinates" equal to "screen coordinates".
-  /// The menu *bar* is still out of reach (that needs Electron's `Menu` API),
-  /// but context menus pop up where the app asks.
-  pub(crate) fn menu_owner_window() -> Option<isize> {
-    // Per thread, because a menu only pops up on a window owned by the thread
-    // that tracks it: one shared window would work for whichever thread asked
-    // first and silently fail everywhere else.
-    thread_local! {
-      static OWNER: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+  /// Muda requires an owner on the Rust UI thread for its subclass and popup
+  /// tracking. Each Electron window gets its own invisible owner and menu bar.
+  pub(crate) struct MenuOwner {
+    pub(crate) handle: isize,
+    pub(crate) mirrored: serde_json::Value,
+  }
+
+  impl MenuOwner {
+    pub(crate) fn new() -> Option<Self> {
+      // SAFETY: predefined class, never shown. The origin preserves the popup
+      // positioning behavior of the previous hidden owner.
+      let window = unsafe {
+        CreateWindowExW(
+          WINDOW_EX_STYLE(0), windows::core::w!("STATIC"), windows::core::w!(""),
+          WS_POPUP, 0, 0, 1, 1, None, None, None, None,
+        )
+      }.ok()?;
+      Some(Self { handle: window.0 as isize, mirrored: serde_json::Value::Null })
     }
-    OWNER.with(|slot| {
-      if slot.get() == 0 {
-        // SAFETY: a predefined window class, so no window procedure of our own
-        // is smuggled into another thread's message loop; the window stays
-        // invisible and never takes focus.
-        let handle = unsafe {
-          CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            windows::core::w!("STATIC"),
-            windows::core::w!(""),
-            WS_POPUP,
-            0,
-            0,
-            1,
-            1,
-            None,
-            None,
-            None,
-            None,
-          )
+  }
+
+  // ponytail: retain one hidden HWND per closed window until process exit.
+  // Muda retains its HWND association after native destruction, and this runtime
+  // has no menu object with which to remove_for_hwnd. Reusing that HWND can let
+  // an old menu detach a new window's menu. Add a menu-lifetime cleanup hook
+  // before destroying these owners; Windows reclaims them at process exit.
+
+  pub(crate) fn menu_snapshot(handle: isize) -> std::result::Result<serde_json::Value, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      GetMenu, GetMenuItemCount, GetMenuItemInfoW, GetMenuStringW, HMENU,
+      MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFT_SEPARATOR, MF_BYPOSITION,
+      MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_SUBMENU,
+    };
+    fn items(menu: HMENU, depth: usize) -> std::result::Result<serde_json::Value, String> {
+      if depth > 64 { return Err("menu nesting exceeds 64 levels".into()); }
+      let count = unsafe { GetMenuItemCount(Some(menu)) };
+      if count < 0 { return Err("could not read native menu".into()); }
+      let mut result = Vec::new();
+      for index in 0..count as u32 {
+        let mut info = MENUITEMINFOW {
+          cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+          fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_SUBMENU,
+          ..Default::default()
+        };
+        // SAFETY: only reads muda's live menu on its owning thread.
+        unsafe { GetMenuItemInfoW(menu, index, true, &mut info) }.map_err(|error| error.to_string())?;
+        if info.fType.0 & MFT_SEPARATOR.0 != 0 {
+          result.push(serde_json::json!({ "type": "separator" }));
+          continue;
         }
-        .map(|window| window.0 as isize)
-        .unwrap_or(0);
-        slot.set(handle);
+        let length = unsafe { GetMenuStringW(menu, index, None, MF_BYPOSITION) };
+        let mut text = vec![0; length.max(0) as usize + 1];
+        let length = unsafe { GetMenuStringW(menu, index, Some(&mut text), MF_BYPOSITION) };
+        let text = String::from_utf16_lossy(&text[..length.max(0) as usize]);
+        let (label, accelerator) = text.split_once('\t').unwrap_or((&text, ""));
+        let mut item = serde_json::json!({
+          "commandId": info.wID,
+          "label": label,
+          "accelerator": accelerator,
+          "enabled": info.fState.0 & MFS_DISABLED.0 == 0,
+          "checked": info.fState.0 & MFS_CHECKED.0 != 0,
+        });
+        if !info.hSubMenu.0.is_null() {
+          item["submenu"] = items(info.hSubMenu, depth + 1)?;
+        }
+        result.push(item);
       }
-      (slot.get() != 0).then_some(slot.get())
-    })
+      Ok(serde_json::Value::Array(result))
+    }
+    let menu = unsafe { GetMenu(hwnd(handle)) };
+    if menu.0.is_null() { Ok(serde_json::Value::Null) } else { items(menu, 0) }
+  }
+
+  pub(crate) fn dispatch_menu_command(handle: isize, command: u32) {
+    use windows::Win32::UI::WindowsAndMessaging::WM_COMMAND;
+    // SAFETY: runtime validated the command against this owner's current menu.
+    // Muda receives the same command as a native click, preserving its callbacks
+    // and check-item state. No RefCell borrow is held across this callback.
+    unsafe { SendMessageW(hwnd(handle), WM_COMMAND, Some(WPARAM(command as usize)), Some(LPARAM(0))); }
   }
 
   pub(super) fn set_decorations(handle: isize, decorations: bool) {

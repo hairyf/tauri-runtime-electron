@@ -23,10 +23,11 @@ follow [Semantic Versioning](https://semver.org/).
   RPCs; the first webview of a window is its page, and every later one is
   attached as an Electron `<webview>` element, so it is an out-of-process iframe
   and host-page DOM can cover it.
-- Tauri IPC uses its native `window.ipc.postMessage` transport. Electron supplies
-  the sender webview and main-frame URL; invoke keys, isolation encryption and
-  channel responses remain handled by Tauri. Unattributed `ipc://` requests are
-  refused instead of being dispatched as the first registered webview.
+- Tauri's typed IPC protocol travels over an authenticated Electron native
+  bridge. Electron supplies the sender webview and main-frame URL; MIME types,
+  raw bytes, invoke keys, isolation encryption and channel responses are
+  preserved. Unattributed `ipc://` requests are refused instead of being
+  dispatched as the first registered webview.
 - Custom scheme protocol handlers (`tauri://`, plugin schemes) are registered
   before the window loads and answered from the Rust run loop, so production
   builds serve embedded assets without a dev server.
@@ -64,11 +65,10 @@ follow [Semantic Versioning](https://semver.org/).
   `"resources": { "target/electron": "runtime" }` entry in `tauri.conf.json`;
   the resolver picks up `runtime/<platform>-<arch>` beside the executable.
 
-- Window handling that needs a native handle now goes through the real one:
-  `WindowDispatch::window_handle` asks Electron for its HWND/NSView/X11 id, so
-  Tauri's own menus (`set_menu`), runtime `set_decorations`, `start_dragging`,
-  always-on-bottom and `window.hwnd()` work unchanged, and window effects such as
-  Mica/Acrylic apply.
+- Runtime window operations use Electron's native HWND/NSView/X11 handle.
+  Windows menus use a separate owner on the Rust UI thread; visible menu bars
+  are mirrored to Electron and clicks return to muda. Runtime decorations,
+  dragging, always-on-bottom and configured Mica/Acrylic use the visible window.
 - The `ipc`, `tauri` and `asset` schemes are always registered as privileged
   before Electron starts, so the asset protocol (`convertFileSrc` + `fetch`)
   works without extra wiring once the app enables `protocol-asset`.

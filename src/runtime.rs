@@ -118,6 +118,8 @@ struct Window {
   webviews: Vec<Webview>,
   /// Handlers registered by Tauri to observe this window's events.
   handlers: Vec<(WindowEventId, Rc<dyn Fn(&WindowEvent) + Send>)>,
+  #[cfg(windows)]
+  menu_owner: Option<crate::window::imp::MenuOwner>,
 }
 
 #[derive(Clone)]
@@ -149,6 +151,8 @@ pub struct RuntimeContext {
   /// Custom protocols registered by Tauri, served through Electron's
   /// `protocol.handle`.
   protocol_handlers: Rc<RefCell<HashMap<String, (String, Rc<UriSchemeProtocolHandler>)>>>,
+  /// IPC responses retain their MIME type and the authenticated caller's label.
+  ipc_protocol_handlers: Rc<RefCell<HashMap<u32, (String, Rc<UriSchemeProtocolHandler>)>>>,
   /// Page origin per webview label, injected as the `Origin` header on
   /// custom-protocol requests (Electron reports the request URL instead).
   webview_origins: Rc<RefCell<HashMap<String, String>>>,
@@ -246,6 +250,44 @@ impl RuntimeContext {
     let handle = handle as isize;
     self.native_handles.borrow_mut().insert(serial, handle);
     Ok(handle)
+  }
+
+  #[cfg(windows)]
+  pub(crate) fn menu_owner_window(&self, id: WindowId) -> Result<isize> {
+    if std::thread::current().id() != self.main_thread_id {
+      return Err(create_window_err("menu owner requires the runtime UI thread".into()));
+    }
+    let mut windows = self.windows.borrow_mut();
+    let window = windows.get_mut(&id).ok_or_else(|| create_window_err("window is gone".into()))?;
+    if window.menu_owner.is_none() {
+      window.menu_owner = crate::window::imp::MenuOwner::new();
+    }
+    window.menu_owner.as_ref().map(|owner| owner.handle)
+      .ok_or_else(|| create_window_err("could not create menu owner".into()))
+  }
+
+  #[cfg(windows)]
+  fn sync_window_menus(&self) {
+    // ponytail: O(total menu items) per pump; use native mutation hooks if large
+    // menus make polling measurable. IPC and Electron rebuild only on changes.
+    let changed: Vec<_> = self.windows.borrow().iter().filter_map(|(id, window)| {
+      let owner = window.menu_owner.as_ref()?;
+      match crate::window::imp::menu_snapshot(owner.handle) {
+        Ok(menu) if menu != owner.mirrored => Some((*id, window.serial, menu)),
+        Ok(_) => None,
+        Err(error) => { eprintln!("[electron] menu snapshot failed: {error}"); None }
+      }
+    }).collect();
+    for (id, serial, menu) in changed {
+      match self.ipc.call("window.setMenu", json!({ "windowId": serial, "menu": menu }), IPC_TIMEOUT) {
+        Ok(_) => {
+          if let Some(owner) = self.windows.borrow_mut().get_mut(&id).and_then(|window| window.menu_owner.as_mut()) {
+            owner.mirrored = menu;
+          }
+        }
+        Err(error) => eprintln!("[electron] menu mirror failed: {error}"),
+      }
+    }
   }
 
   /// Tauri hands us `tauri://localhost/...` in production builds; when a dev
@@ -415,6 +457,7 @@ impl ElectronRuntime {
       ipc_handlers: Default::default(),
       webview_handlers: Default::default(),
       protocol_handlers: Default::default(),
+      ipc_protocol_handlers: Default::default(),
       webview_origins: Default::default(),
       policy_handlers: Default::default(),
       native_handles: Default::default(),
@@ -742,6 +785,20 @@ impl ElectronRuntime {
       // Events pushed by the Electron process.
       while let Ok(event) = self.event_rx.try_recv() {
         match event["event"].as_str() {
+          #[cfg(windows)]
+          Some("menu.command") => {
+            let params = &event["params"];
+            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
+            let Some(command) = params["commandId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
+            let owner = self.context.windows.borrow().values()
+              .find(|window| window.serial == serial)
+              .and_then(|window| window.menu_owner.as_ref().map(|owner| owner.handle));
+            if let Some(owner) = owner {
+              if crate::window::imp::menu_snapshot(owner).is_ok_and(|menu| menu_command_enabled(&menu, command)) {
+                crate::window::imp::dispatch_menu_command(owner, command);
+              }
+            }
+          }
           Some("window.closeRequested") => {
             let serial = event["params"]["windowId"].as_u64().unwrap_or_default() as u32;
             let Some(id) = self.context.window_for_serial(serial) else {
@@ -1002,14 +1059,15 @@ impl ElectronRuntime {
             let params = &event["params"];
             let Some(id) = params["id"].as_u64() else { continue };
             let scheme = params["scheme"].as_str().unwrap_or_default().to_string();
-            let Some((label, handler)) = self
-              .context
-              .protocol_handlers
-              .borrow()
-              .get(&scheme)
-              .cloned()
-            else {
-              eprintln!("[electron] no protocol handler for {scheme}");
+            let selected = if scheme == "ipc" {
+              params["webviewId"].as_u64().and_then(|serial| {
+                self.context.ipc_protocol_handlers.borrow().get(&(serial as u32)).cloned()
+              })
+            } else {
+              self.context.protocol_handlers.borrow().get(&scheme).cloned()
+            };
+            let Some((label, handler)) = selected else {
+              let _ = self.context.ipc.call("protocol.respond", json!({ "id": id, "status": 403 }), IPC_TIMEOUT);
               continue;
             };
             let uri = params["uri"].as_str().unwrap_or_default().to_string();
@@ -1031,6 +1089,7 @@ impl ElectronRuntime {
               Ok(request) => request,
               Err(error) => {
                 eprintln!("[electron] invalid protocol request {uri}: {error}");
+                let _ = self.context.ipc.call("protocol.respond", json!({ "id": id, "status": 400 }), IPC_TIMEOUT);
                 continue;
               }
             };
@@ -1038,12 +1097,11 @@ impl ElectronRuntime {
             // Origin header. Tauri validates that header against the page URL to
             // decide between local and remote contexts, so rewrite it to the
             // origin of the webview that issued the request.
-            let origin = self
-              .context
-              .webview_origins
-              .borrow()
-              .get(&label)
-              .cloned();
+            let origin = if scheme == "ipc" {
+              params["pageUrl"].as_str().and_then(origin_of)
+            } else {
+              self.context.webview_origins.borrow().get(&label).cloned()
+            };
             if let Some(origin) = origin {
               if let Ok(value) = http::HeaderValue::from_str(&origin) {
                 request.headers_mut().insert(http::header::ORIGIN, value);
@@ -1114,6 +1172,8 @@ impl ElectronRuntime {
       // Native UI (tray icons, menus) lives on this thread and posts window
       // messages here; Electron owns its own process, so nothing else pumps them.
       pump_thread_messages();
+      #[cfg(windows)]
+      self.context.sync_window_menus();
 
       if once {
         break;
@@ -1177,9 +1237,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &self,
     pending: PendingWindow<T, Self>,
-    _after_window_creation: Option<F>,
+    after_window_creation: Option<F>,
   ) -> Result<DetachedWindow<T, Self>> {
-    create_window_impl(&self.context, pending)
+    create_window_impl(&self.context, pending, after_window_creation)
   }
 
   fn create_webview(
@@ -1407,7 +1467,16 @@ fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
   };
 
   context.emit_window_event(id, &WindowEvent::Destroyed);
-  context.windows.borrow_mut().remove(&id);
+  if let Some(window) = context.windows.borrow_mut().remove(&id) {
+    for webview in window.webviews {
+      context.ipc_protocol_handlers.borrow_mut().remove(&webview.serial);
+      context.ipc_handlers.borrow_mut().remove(&webview.serial);
+      context.webview_handlers.borrow_mut().remove(&webview.serial);
+      context.policy_handlers.borrow_mut().remove(&webview.serial);
+      context.webview_origins.borrow_mut().remove(&webview.label);
+    }
+    context.native_handles.borrow_mut().remove(&window.serial);
+  }
   callback(RunEvent::WindowEvent {
     label,
     event: WindowEvent::Destroyed,
@@ -1451,9 +1520,19 @@ fn exit_if_empty<T: UserEvent, F: FnMut(RunEvent<T>)>(
   !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent))
 }
 
-pub(crate) fn create_window_impl<T: UserEvent>(
+#[cfg(any(windows, target_os = "macos"))]
+fn run_window_creation_callback(callback: impl FnOnce(RawWindow<'_>), _handle: isize) {
+  callback(RawWindow {
+    #[cfg(windows)]
+    hwnd: _handle,
+    _marker: &std::marker::PhantomData,
+  });
+}
+
+pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'static>(
   context: &RuntimeContext,
   pending: PendingWindow<T, ElectronRuntime>,
+  after_window_creation: Option<F>,
 ) -> Result<DetachedWindow<T, ElectronRuntime>> {
   let PendingWindow {
     label,
@@ -1467,15 +1546,19 @@ pub(crate) fn create_window_impl<T: UserEvent>(
 
   if let Some(webview) = webview.as_mut() {
     for (scheme, handler) in webview.uri_scheme_protocols.drain() {
-      // Scheme handlers answer for the whole session, and Electron's protocol
-      // API cannot tell us which webview sent a request, so the first webview
-      // (the window's page) keeps ownership of the scheme. Guests then reach
-      // Tauri through that page's IPC handler.
+      let handler: Rc<UriSchemeProtocolHandler> = Rc::from(handler);
+      if scheme == "ipc" {
+        context.ipc_protocol_handlers.borrow_mut().insert(
+          webview_id.expect("a pending webview has a serial"), (webview.label.clone(), handler.clone()),
+        );
+      }
+      // Asset protocols are session-wide; commands use an authenticated
+      // per-webview handler instead of inheriting the first window's identity.
       context
         .protocol_handlers
         .borrow_mut()
         .entry(scheme.clone())
-        .or_insert_with(|| (label.clone(), Rc::from(handler)));
+        .or_insert_with(|| (webview.label.clone(), handler));
       if let Err(error) = context.ipc.call(
         "protocol.register",
         json!({ "scheme": scheme }),
@@ -1555,6 +1638,8 @@ pub(crate) fn create_window_impl<T: UserEvent>(
         .into_iter()
         .collect(),
       handlers: Vec::new(),
+      #[cfg(windows)]
+      menu_owner: None,
     },
   );
 
@@ -1569,12 +1654,16 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       crate::window::imp::send_to_bottom(handle);
     }
     if let Some(owner) = window_builder.owner.or(window_builder.parent) {
-      // Tauri resolves `.parent(&window)` / `.owner(&window)` through
-      // `window_handle`, which hands out our hidden menu window on Windows, so
-      // that handle means "unknown window" here rather than a real owner.
-      if Some(owner.0 as isize) != crate::window::imp::menu_owner_window() {
-        crate::window::imp::set_owner(handle, owner.0 as isize);
-      }
+      // Tauri resolves parent/owner through window_handle(), so translate our
+      // per-window menu owner back to the actual Electron window.
+      let parent_id = context.windows.borrow().iter().find_map(|(id, window)| {
+        window.menu_owner.as_ref().filter(|menu| menu.handle == owner.0 as isize).map(|_| *id)
+      });
+      let owner = match parent_id {
+        Some(id) => context.native_handle(id)?,
+        None => owner.0 as isize,
+      };
+      crate::window::imp::set_owner(handle, owner);
     }
   }
 
@@ -1620,6 +1709,42 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       );
     }
     register_webview_handlers::<T>(context, webview_serial, pending_webview);
+  }
+
+  if let Some(callback) = after_window_creation {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+      let context = context.clone();
+      let (tx, rx) = sync_channel(1);
+      #[cfg(windows)]
+      let task_context = context.clone();
+      let task = Message::Task(Box::new(move || {
+        let result: Result<()> = (|| {
+          #[cfg(windows)]
+          let handle = task_context.menu_owner_window(id)?;
+          #[cfg(target_os = "macos")]
+          let handle = 0;
+          run_window_creation_callback(callback, handle);
+          Ok(())
+        })();
+        let _ = tx.send(result);
+      }));
+      if std::thread::current().id() == context.main_thread_id {
+        context.send_message(task)?;
+      } else {
+        // send_message runs tasks inline before the loop starts, which would
+        // create muda's owner on a worker. Always queue this native callback.
+        context.run_tx.send(task).map_err(|_| Error::FailedToSendMessage)?;
+      }
+      rx.recv().map_err(|_| Error::FailedToReceiveMessage)??;
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+      // RawWindow requires a valid GtkApplicationWindow. Electron has none;
+      // never hand a GTK consumer a null or a foreign-process pointer.
+      let _ = callback;
+      crate::unsupported::report("after_window_creation (Electron has no GTK window)");
+    }
   }
 
   let webview = webview_id.map(|webview_id| DetachedWindowWebview {
@@ -1675,12 +1800,15 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   // Schemes must be installed before the page is loaded, otherwise the initial
   // `tauri://` navigation fails with ERR_FAILED.
   for (scheme, handler) in pending.uri_scheme_protocols.drain() {
-    // See `create_window_impl`: the scheme keeps the first owner's label.
+    let handler: Rc<UriSchemeProtocolHandler> = Rc::from(handler);
+    if scheme == "ipc" {
+      context.ipc_protocol_handlers.borrow_mut().insert(webview_id, (pending.label.clone(), handler.clone()));
+    }
     context
       .protocol_handlers
       .borrow_mut()
       .entry(scheme.clone())
-      .or_insert_with(|| (pending.label.clone(), Rc::from(handler)));
+      .or_insert_with(|| (pending.label.clone(), handler));
     if let Err(error) = context.ipc.call(
       "protocol.register",
       json!({ "scheme": scheme }),
@@ -1785,9 +1913,8 @@ fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
 }
 
 fn native_ipc_script(script: &str) -> Result<String> {
-  // Electron's protocol Request has no trusted webview/frame identity. Use
-  // Tauri's own postMessage transport, whose sender Electron authenticates.
-  // Keep its invoke key, isolation encryption and binary/channel handling.
+  // A protocol Request has no trusted sender. Keep Tauri's typed protocol,
+  // invoke key and isolation encryption, but transport it through native IPC.
   if script.contains("const __TAURI_INVOKE_KEY__ =")
     && script.contains("const fetchChannelDataCommand =")
     && script.contains("Object.defineProperty(window.__TAURI_INTERNALS__, 'postMessage'")
@@ -1796,11 +1923,23 @@ fn native_ipc_script(script: &str) -> Result<String> {
     if script.matches(marker).count() != 1 {
       return Err(create_webview_err("Tauri IPC transport changed; native sender attribution requires an update".into()));
     }
-    Ok(script.replacen(marker, "let customProtocolIpcFailed = true", 1))
+    Ok(script.replacen(marker, NATIVE_IPC_FETCH, 1))
   } else {
     Ok(script.to_owned())
   }
 }
+
+const NATIVE_IPC_FETCH: &str = r#"let customProtocolIpcFailed = false
+  const fetch = async (url, options) => {
+    const body = Array.isArray(options.body) ? new Uint8Array(options.body) : options.body
+    const reply = await window.ipc.fetch({
+      url, method: options.method,
+      headers: [...options.headers],
+      body: new Uint8Array(await new Response(body).arrayBuffer())
+    })
+    const bytes = Uint8Array.from(atob(reply.body ?? ''), c => c.charCodeAt(0))
+    return new Response(bytes, { status: reply.status, headers: reply.headers })
+  }"#;
 
 /// Scheme+host of `url`, e.g. `tauri://localhost` — the origin Tauri sees for
 /// a local page.
@@ -1937,6 +2076,20 @@ fn termination_reason(reason: &str) -> WebContentProcessTerminationReason {
   }
 }
 
+/// Reject stale, disabled, hidden, separator and submenu commands, including
+/// children of a disabled submenu. WM_COMMAND carries only a 16-bit item ID.
+#[cfg(any(windows, test))]
+fn menu_command_enabled(menu: &Value, command: u32) -> bool {
+  command <= u16::MAX as u32 && menu.as_array().is_some_and(|items| items.iter().any(|item| {
+    item["enabled"].as_bool() == Some(true) && item["type"] != "separator" &&
+      if item["submenu"].is_array() {
+        menu_command_enabled(&item["submenu"], command)
+      } else {
+        item["commandId"].as_u64() == Some(command as u64)
+      }
+  }))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1945,10 +2098,61 @@ mod tests {
   fn selects_native_ipc_without_changing_user_scripts() {
     let source = "const __TAURI_INVOKE_KEY__ = 'key';\nconst fetchChannelDataCommand = 'channel';\nlet customProtocolIpcFailed = false;\nObject.defineProperty(window.__TAURI_INTERNALS__, 'postMessage', {});";
     let native = native_ipc_script(source).unwrap();
-    assert_eq!(native, source.replace("let customProtocolIpcFailed = false", "let customProtocolIpcFailed = true"));
+    assert_eq!(native, source.replace("let customProtocolIpcFailed = false", NATIVE_IPC_FETCH));
+    assert!(native.contains("const fetch = async"));
+    assert!(native.contains("let customProtocolIpcFailed = false"));
     assert!(native_ipc_script(&source.replace("let customProtocolIpcFailed = false", "let changed = false")).is_err());
     let user_script = "let customProtocolIpcFailed = false";
     assert_eq!(native_ipc_script(user_script).unwrap(), user_script);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn window_creation_callback_initializes_the_menu_owner_once() {
+    use std::cell::Cell;
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::{
+      AppendMenuW, CreateMenu, DestroyMenu, DestroyWindow, MF_STRING, SetMenu,
+    }};
+    let owner = crate::window::imp::MenuOwner::new().unwrap();
+    let menu = unsafe { CreateMenu() }.unwrap();
+    unsafe { AppendMenuW(menu, MF_STRING, 1001, windows::core::w!("Builder menu")) }.unwrap();
+    let calls = Cell::new(0);
+    let thread = std::thread::current().id();
+    run_window_creation_callback(|raw| {
+      calls.set(calls.get() + 1);
+      assert_eq!(std::thread::current().id(), thread);
+      assert_eq!(raw.hwnd, owner.handle);
+      unsafe { SetMenu(HWND(raw.hwnd as *mut _), Some(menu)) }.unwrap();
+    }, owner.handle);
+    assert_eq!(calls.get(), 1);
+    let snapshot = crate::window::imp::menu_snapshot(owner.handle).unwrap();
+    assert_eq!(snapshot[0]["label"], "Builder menu");
+    assert_eq!(snapshot[0]["commandId"], 1001);
+    // This test owns the menu and has no muda association, so it can clean up.
+    unsafe {
+      SetMenu(HWND(owner.handle as *mut _), None).unwrap();
+      DestroyMenu(menu).unwrap();
+      DestroyWindow(HWND(owner.handle as *mut _)).unwrap();
+    }
+  }
+
+  #[test]
+  fn accepts_only_live_enabled_menu_commands() {
+    let mut menu = json!([{ "commandId": 900, "enabled": true, "submenu": [
+      { "commandId": 1001, "enabled": true, "checked": false },
+      { "commandId": 1002, "enabled": false },
+      { "type": "separator", "commandId": 1003, "enabled": true }
+    ] }]);
+    assert!(menu_command_enabled(&menu, 1001));
+    for command in [900, 1002, 1003, 9999, 65536] {
+      assert!(!menu_command_enabled(&menu, command));
+    }
+    menu[0]["enabled"] = json!(false);
+    assert!(!menu_command_enabled(&menu, 1001));
+    assert!(!menu_command_enabled(&Value::Null, 1001));
+    menu[0]["enabled"] = json!(true);
+    menu[0]["submenu"] = json!([]);
+    assert!(!menu_command_enabled(&menu, 1001));
   }
 
   #[test]

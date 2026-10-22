@@ -195,33 +195,75 @@ try {
   ]) onIpc({ sender, senderFrame }, data)
   assert.equal(sent.length, 1, 'reject unknown senders, subframes, absent frames and non-string bodies')
 
-  // Cross-check the Rust selector against the actual upstream template, then run that template.
-  const rust = readFileSync(new URL('../src/runtime.rs', import.meta.url), 'utf8')
-    .match(/^fn native_ipc_script\([^]*?^\}/m)?.[0]
-  assert.ok(rust, 'missing native IPC script selector')
+  // Exercise the real authenticated protocol validator; a renderer cannot choose its identity.
+  Object.assign(sandbox, { Headers, Buffer, Uint8Array })
+  vm.runInContext(source.match(/^function nativeProtocolRequest\([^]*?^\}/m)[0], sandbox)
+  const request = { url: 'ipc://localhost/echo', method: 'POST', headers: [['origin', 'tauri://localhost'], ['x-channel-id', '17']], body: new Uint8Array([4, 5]) }
+  const validated = plain(sandbox.nativeProtocolRequest({ sender: sibling, senderFrame: sibling.mainFrame }, request))
+  assert.equal(validated.webviewId, 8)
+  assert.equal(validated.pageUrl, sibling.mainFrame.url)
+  assert.equal(validated.headers.origin, 'https://sibling.example')
+  assert.equal(validated.headers['x-channel-id'], '17')
+  assert.equal(validated.body, 'BAU=')
+  assert.equal(validated.uri, 'ipc://localhost/echo')
+  for (const url of ['https://ipc.localhost/echo', 'ipc://other/echo', 'http://ipc.localhost:123/echo', 'ipc://user@localhost/echo']) {
+    assert.throws(() => sandbox.nativeProtocolRequest({ sender: sibling, senderFrame: sibling.mainFrame }, { ...request, url }))
+  }
+  for (const event of [{ sender: sibling, senderFrame: {} }, { sender: { id: 999 }, senderFrame: sibling.mainFrame }]) {
+    assert.throws(() => sandbox.nativeProtocolRequest(event, request))
+  }
+  assert.throws(() => sandbox.nativeProtocolRequest({ sender: sibling, senderFrame: sibling.mainFrame }, { ...request, method: 'GET' }))
+
+  // Run the real upstream template with the Rust-selected local fetch. MIME must
+  // distinguish Raw bytes from valid JSON arrays without changing global fetch.
+  const rustSource = readFileSync(new URL('../src/runtime.rs', import.meta.url), 'utf8')
+  const rust = rustSource.match(/^fn native_ipc_script\([^]*?^\}/m)?.[0]
   const marker = JSON.parse(rust.match(/let marker = ("[^"]+");/)[1])
-  const replacement = JSON.parse(rust.match(/script\.replacen\(marker, ("[^"]+"), 1\)/)[1])
-  assert.equal(replacement, marker.replace('false', 'true'))
+  const replacement = rustSource.match(/const NATIVE_IPC_FETCH: &str = r#"([^]*?)"#;/)[1]
   const signatures = [...rust.matchAll(/script\.contains\(("[^"]+")\)/g)].map((match) => JSON.parse(match[1]))
-  assert.equal(signatures.length, 3)
   const upstream = readFileSync(new URL('../source/tauri/crates/tauri/scripts/ipc-protocol.js', import.meta.url), 'utf8')
   for (const text of [marker, ...signatures]) assert.equal(upstream.split(text).length - 1, 1, `upstream IPC signature changed: ${text}`)
   const native = upstream.replace(marker, replacement)
-  assert.equal(native.replace(replacement, marker), upstream, 'preserve all invoke-key and payload code')
-  const messages = []
-  const window = { __TAURI_INTERNALS__: {}, ipc: { postMessage(data) { messages.push(JSON.parse(data)) } } }
-  vm.runInNewContext(native, {
-    window, __TEMPLATE_invoke_key__: 'test-key', __TEMPLATE_os_name__: 'windows',
+  assert.equal(native.replace(replacement, marker), upstream, 'preserve invoke-key, encryption and fallback code')
+  const requests = [], callbacks = []
+  let reply
+  const window = { __TAURI_INTERNALS__: {
+    convertFileSrc: (cmd) => `ipc://localhost/${encodeURIComponent(cmd)}`,
+    runCallback: (id, value) => callbacks.push({ id, value }),
+  }, ipc: { postMessage() { assert.fail('typed requests must not use lossy fallback') }, async fetch(value) { requests.push(value); return reply } } }
+  const context = vm.createContext({
+    window, Headers, Response, Uint8Array, atob, ArrayBuffer,
+    __TEMPLATE_invoke_key__: 'test-key', __TEMPLATE_os_name__: 'windows',
     __TEMPLATE_fetch_channel_data_command__: 'plugin:channel|fetch',
-    __RAW_process_ipc_message_fn__: (payload) => ({ data: JSON.stringify(payload) }),
+    __RAW_process_ipc_message_fn__: (payload) => ({ contentType: typeof payload === 'string' ? 'application/json' : 'application/octet-stream', data: payload }),
     fetch() { assert.fail('native IPC must not use unattributed custom-protocol fetch') },
   })
-  for (const cmd of ['greet', 'plugin:channel|fetch']) {
-    const message = { cmd, callback: 1, error: 2, payload: { nonce: [1], payload: [2] }, options: { headers: { custom: 'value' } } }
-    window.__TAURI_INTERNALS__.postMessage(message)
-    assert.deepEqual(messages.at(-1), { ...message, options: { ...message.options, customProtocolIpcBlocked: true }, __TAURI_INVOKE_KEY__: 'test-key' })
+  vm.runInContext(native, context)
+  const response = async (payload, type, bytes, ok = true, cmd = 'echo') => {
+    reply = { status: 200, headers: { 'content-type': type, 'tauri-response': ok ? 'ok' : 'error' }, body: Buffer.from(bytes).toString('base64') }
+    const count = callbacks.length
+    window.__TAURI_INTERNALS__.postMessage({ cmd, callback: 1, error: 2, payload, options: { headers: { 'x-channel-id': '17' } } })
+    await bounded((async () => { while (callbacks.length === count) await new Promise(resolve => setImmediate(resolve)) })())
+    const request = requests.at(-1)
+    assert.equal(new Headers(request.headers).get('tauri-invoke-key'), 'test-key')
+    assert.equal(new Headers(request.headers).get('x-channel-id'), '17')
+    assert.equal(callbacks.at(-1).id, ok ? 1 : 2)
+    return callbacks.at(-1).value
   }
-  console.log('PASS runtime helpers: readiness, failure cleanup, preload URL encoding, guest mapping/policy, DPI units, proportional bounds, isolation URL preservation, native IPC attribution and upstream fallback selection (offline; no Electron UI proof)')
+  for (const size of [0, 1023, 1024, 8193]) {
+    const bytes = Buffer.alloc(size, 171)
+    const raw = await response('{}', 'application/octet-stream', bytes)
+    assert(raw instanceof ArrayBuffer)
+    assert.deepEqual(Buffer.from(raw), bytes)
+  }
+  assert.deepEqual(await response('{}', 'application/json', '[0,255]'), [0, 255])
+  assert.equal(await response('{}', 'application/json', '"denied"', false), 'denied')
+  const view = new Uint8Array([9, 1, 2, 9]).subarray(1, 3)
+  await response(view, 'text/plain', 'ok', true, 'plugin:channel|fetch')
+  assert.deepEqual([...requests.at(-1).body], [1, 2], 'retain view offset and length')
+  await response([3, 4], 'text/plain', 'ok')
+  assert.deepEqual([...requests.at(-1).body], [3, 4])
+  console.log('PASS runtime helpers: readiness, guest geometry and authenticated typed IPC including raw bytes, JSON arrays, errors and channel headers (offline; no Electron UI proof)')
 } finally {
   for (const timer of timers) clearTimeout(timer)
 }

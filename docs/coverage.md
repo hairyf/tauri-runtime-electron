@@ -34,7 +34,7 @@ Do not edit by hand — re-run the script.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1301` |
+| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1361` |
 
 ## RuntimeHandle
 
@@ -66,11 +66,11 @@ Every member is implemented.
 | `default_vbox` | ⛔ refused | `src/window.rs:197` |
 | `activity_name` | ⛔ refused | `src/window.rs:204` |
 | `scene_identifier` | ⛔ refused | `src/window.rs:211` |
-| `set_decorations` | ⚠️ only some platforms | `src/window.rs:341` |
-| `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:441` |
-| `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:463` |
-| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:494` |
-| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:546` |
+| `set_decorations` | ⚠️ only some platforms | `src/window.rs:342` |
+| `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:442` |
+| `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:464` |
+| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:495` |
+| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:547` |
 
 ## WebviewDispatch
 

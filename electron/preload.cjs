@@ -8,4 +8,7 @@ contextBridge.exposeInMainWorld('ipc', {
   postMessage(data) {
     ipcRenderer.send('tauri-ipc', String(data))
   },
+  fetch(request) {
+    return ipcRenderer.invoke('tauri-protocol', request)
+  },
 })

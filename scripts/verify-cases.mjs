@@ -289,17 +289,32 @@ export const cases = {
   },
 
   async splashscreen(t) {
+    // The driver must enter this case before its generic initial screenshot:
+    // the source's main document closes the splash 2000 ms after DOMContentLoaded.
     const splash = await t.target((target) => target.type === 'page' && target.url.includes('splashscreen.html'), 20000)
     await t.capture(splash, 'splashscreen-early')
+    // The driver starts this read-only watcher before launch; cold PowerShell
+    // compilation here would consume the source's two-second display interval.
+    const before = await t.splashBefore()
+    fs.writeFileSync(path.join(t.dir, 'splashscreen-native-before.json'), JSON.stringify(before, null, 2) + '\n')
+    const splashWindow = before.find((window) => window.visible && window.clientWidth > 0 && window.clientHeight > 0)
+    const mainWindow = before.find((window) => !window.visible && window.clientWidth > 0 && window.clientHeight > 0)
+    t.check('splashscreen initially has one visible native window', before.filter((window) => window.visible).length, 1)
+    t.check('splashscreen main native window starts hidden', Boolean(mainWindow), true)
+    assert(splashWindow, 'splashscreen must be visible before its source timer fires')
     const main = await targetByLabel(t, 'main')
-    await t.wait(main, `document.body.innerText.trim()`, (value) => value === 'This is the main window!', 10000)
     await t.wait(main, `document.querySelector('h1')?.textContent ?? ''`, (value) => value === 'This is the main window!', 10000)
     t.check('splashscreen main content', await text(t, main, 'h1'), 'This is the main window!')
     await t.target(async (candidate) => candidate.id === main.id && !(await t.targets()).some((item) => item.id === splash.id), 10000)
-    const remainingSplash = (await t.targets()).filter((target) => target.type === 'page' && target.url.includes('splashscreen.html'))
-    t.check('splashscreen closes after timeout', remainingSplash.length, 0)
+    t.check('splashscreen source timer destroys splash target', (await t.targets()).some((target) => target.id === splash.id), false)
+    const after = await t.native('state')
+    fs.writeFileSync(path.join(t.dir, 'splashscreen-native-after.json'), JSON.stringify(after, null, 2) + '\n')
+    const visible = after.filter((window) => window.visible && window.clientWidth > 0 && window.clientHeight > 0)
+    t.check('splashscreen transition leaves one visible native main window', visible.length, 1)
+    t.check('splashscreen source timer destroys original native splash', after.some((window) => window.handle === splashWindow.handle), false)
+    t.check('splashscreen source timer shows original main native window', after.find((window) => window.handle === mainWindow.handle)?.visible, true)
     await t.capture(main, 'splashscreen-main')
-    t.note('splashscreen native visibility', 'CDP proves page transition and target destruction; native hidden/visible flags require the desktop runner.')
+    await t.native('capture', { OutputPath: path.join(t.dir, 'splashscreen-main-native.png') })
   },
 
   async ['file-associations'](t) {
@@ -307,7 +322,9 @@ export const cases = {
     const fixtures = t.fileFixtures
     assert(Array.isArray(fixtures) && fixtures.length === 2, 'file association fixtures must contain exactly two paths')
     await t.wait(target, 'Array.isArray(window.openedFiles)', (value) => value === true)
-    t.check('file associations direct argv paths', await t.evaluate(target, 'window.openedFiles'), fixtures)
+    // The source accepts file: URLs and converts them back to native paths;
+    // drive-letter argv is parsed as an unsupported URL scheme upstream.
+    t.check('file associations file URL argv resolves to native fixture paths', await t.evaluate(target, 'window.openedFiles'), fixtures)
     t.check('file associations rendered paths', await text(t, target, '#files'), fixtures.join('\n'))
     await t.capture(target, 'file-associations-fixtures')
     t.note('file associations OS registration', 'Direct executable-argument verification only; packaged/native Open-with registration is untested.')
@@ -369,4 +386,38 @@ export const cases = {
     t.check('streaming range bytes', range.bytes, [...bytes.subarray(0, 16)])
     await t.capture(target, 'streaming-playing')
   },
+}
+
+// Offline verifier contract guard only; this does not verify any desktop app.
+if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const main = { id: 'main', type: 'page' }, splash = { id: 'splash', type: 'page', url: 'tauri://localhost/splashscreen.html' }
+  const steps = []
+  let closed = false
+  const t = {
+    dir: root,
+    check: (label, actual, expected) => assert.deepEqual(actual, expected, label),
+    target: async (predicate) => { for (const target of [splash, main]) if (await predicate(target)) return target; throw new Error('missing test target') },
+    targets: async () => { closed = true; return [main] },
+    evaluate: async (_target, expression) => expression.includes('currentWindow') ? 'main' : 'This is the main window!',
+    wait: async () => {},
+    capture: async (_target, label) => { steps.push(label) },
+    splashBefore: async () => { steps.push('before'); return [{ handle: 1, visible: true, clientWidth: 400, clientHeight: 200 }, { handle: 2, visible: false, clientWidth: 800, clientHeight: 600 }] },
+    native: async (action) => { assert(closed, 'native helper must not delay the early keyframe'); return action === 'state' ? [{ handle: 2, visible: true, clientWidth: 800, clientHeight: 600 }] : undefined },
+  }
+  // Keep the contract guard read-only even though real cases retain JSON evidence.
+  const originalWrite = fs.writeFileSync
+  try {
+    fs.writeFileSync = () => {}
+    await cases.splashscreen(t)
+    assert.deepEqual(steps, ['splashscreen-early', 'before', 'splashscreen-main'])
+    t.native = async () => [{ handle: 1, visible: true, clientWidth: 400, clientHeight: 200 }]
+    await assert.rejects(cases.splashscreen(t), /splashscreen/)
+    const fixtures = ['D:\\fixture dir\\hello world.txt', 'D:\\fixture dir\\文件.txt']
+    const files = { main, fileFixtures: fixtures, wait: async () => {}, check: t.check, capture: async () => {}, note: () => {},
+      evaluate: async (_target, expression) => expression === 'window.openedFiles' ? fixtures : fixtures.join('\n') }
+    await cases['file-associations'](files)
+    files.evaluate = async (_target, expression) => expression === 'window.openedFiles' ? [] : ''
+    await assert.rejects(cases['file-associations'](files), /native fixture paths/)
+  } finally { fs.writeFileSync = originalWrite }
+  console.log('Verifier contract self-check passed (no apps launched; no UI verification performed)')
 }
