@@ -4,14 +4,18 @@
 //! setter it was handed, so CI fails instead of trusting the compiler. On Linux
 //! this needs a display server (CI runs it under `xvfb-run`).
 
-use std::fmt::Debug;
+use std::{
+  fmt::Debug,
+  sync::{Arc, Mutex},
+  time::{Duration, Instant},
+};
 
 use tauri_runtime::{
-  Icon, ProgressBarState, ProgressBarStatus, Runtime, RuntimeInitArgs, UserAttentionType,
+  Icon, ProgressBarState, ProgressBarStatus, RunEvent, Runtime, RuntimeInitArgs, UserAttentionType,
   WebviewDispatch, WindowDispatch,
   dpi::{LogicalPosition, LogicalSize, LogicalUnit, PhysicalPosition, PixelUnit, Position, Size},
   webview::{PendingWebview, WebviewAttributes},
-  window::{CursorIcon, PendingWindow, RawWindow, WindowBuilder, WindowSizeConstraints},
+  window::{CursorIcon, PendingWindow, RawWindow, WindowBuilder, WindowEvent, WindowSizeConstraints},
 };
 use tauri_runtime_electron::{
   Electron, ElectronRuntime, ElectronWebviewDispatcher, ElectronWindowBuilder,
@@ -92,7 +96,7 @@ fn runtime_attrs() -> Electron {
 }
 
 fn main() {
-  let runtime = <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs {
+  let mut runtime = <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs {
     identifier: "tauri-runtime-electron-smoke".into(),
     custom_schemes: Vec::new(),
     #[cfg(windows)]
@@ -110,7 +114,7 @@ fn main() {
   .expect("start the Electron runtime");
 
   let mut failures = 0usize;
-  checks(&runtime, &mut failures);
+  checks(&mut runtime, &mut failures);
 
   if failures > 0 {
     println!("\n{failures} check(s) failed");
@@ -121,7 +125,7 @@ fn main() {
   std::process::exit(0);
 }
 
-fn checks(runtime: &ElectronRuntime, failures: &mut usize) {
+fn checks(runtime: &mut ElectronRuntime, failures: &mut usize) {
   let size_of = |window: &ElectronWindowDispatcher| -> Option<(i64, i64)> {
     let scale = w!((window) scale_factor()).ok()?;
     let size = w!((window) inner_size()).ok()?;
@@ -311,34 +315,17 @@ fn checks(runtime: &ElectronRuntime, failures: &mut usize) {
   #[cfg(not(target_os = "linux"))]
   {
     // Fullscreen goes first: AppKit ignores the request while the window is
-    // still restoring from a minimize, which is where this used to flake.
-    #[cfg(windows)]
-    {
-      w!((window) set_fullscreen(true)).expect("fullscreen");
-      eventually(failures, "set_fullscreen true", true, || {
-        w!((window) is_fullscreen()).ok()
-      });
-      w!((window) set_fullscreen(false)).expect("windowed");
-      eventually(failures, "set_fullscreen false", false, || {
-        w!((window) is_fullscreen()).ok()
-      });
-    }
-    // Switching spaces needs a real login session: on the macOS runner
-    // isFullScreen() stays false however long we wait, so only the round trip
-    // is asserted here.
-    #[cfg(target_os = "macos")]
-    {
-      accepted!(
-        failures,
-        "set_fullscreen true",
-        w!((window) set_fullscreen(true))
-      );
-      accepted!(
-        failures,
-        "set_fullscreen false",
-        w!((window) set_fullscreen(false))
-      );
-    }
+    // still restoring from a minimize, which is where this used to flake. On
+    // macOS the runtime falls back to simple fullscreen when the space switch
+    // is refused, so the state must still become true.
+    w!((window) set_fullscreen(true)).expect("fullscreen");
+    eventually(failures, "set_fullscreen true", true, || {
+      w!((window) is_fullscreen()).ok()
+    });
+    w!((window) set_fullscreen(false)).expect("windowed");
+    eventually(failures, "set_fullscreen false", false, || {
+      w!((window) is_fullscreen()).ok()
+    });
 
     w!((window) maximize()).expect("maximize");
     eventually(failures, "maximize", true, || {
@@ -596,4 +583,43 @@ fn checks(runtime: &ElectronRuntime, failures: &mut usize) {
       println!("FAIL create webview = {error}");
     }
   }
+
+  // --- events through run_iteration --------------------------------------
+  // A third window exercises two things no getter can: that closing a window
+  // reaches Tauri's event handler, and that `run_iteration` really pumps it —
+  // a polling driver never calls `run`.
+  let builder = ElectronWindowBuilder::new()
+    .title("smoke-events")
+    .inner_size(320.0, 240.0);
+  let pending =
+    PendingWindow::<(), ElectronRuntime>::new(builder, "smoke-events").expect("pending window");
+  let third = runtime
+    .create_window(pending, None::<fn(RawWindow)>)
+    .expect("create third window")
+    .dispatcher;
+  let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+  let sink = Arc::clone(&seen);
+  w!((third) on_window_event(move |event: &WindowEvent| {
+    sink.lock().expect("event sink").push(format!("{event:?}"))
+  }));
+  // The runtime has to be in its polling state first, exactly as Tauri is when
+  // app code closes a window between two iterations.
+  <ElectronRuntime as Runtime<()>>::run_iteration(runtime, |_event: RunEvent<()>| {});
+  w!((third) close()).expect("close third window");
+
+  let deadline = Instant::now() + Duration::from_secs(10);
+  let mut destroyed = false;
+  while Instant::now() < deadline {
+    <ElectronRuntime as Runtime<()>>::run_iteration(runtime, |_event: RunEvent<()>| {});
+    destroyed = seen
+      .lock()
+      .expect("event sink")
+      .iter()
+      .any(|event| event.contains("Destroyed"));
+    if destroyed {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  check(failures, "window_event destroyed", destroyed, true);
 }

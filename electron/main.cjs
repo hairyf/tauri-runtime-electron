@@ -318,8 +318,6 @@ const UNSUPPORTED_WINDOW_OPTIONS = [
   ['requestedBySceneIdentifier', undefined], // mobile only
   ['proxyUrl', undefined], // Electron proxies are per session, not per window
   ['dataDirectory', undefined], // Electron's userData path is app-wide
-  ['scrollBarStyle', 'default'], // needs an app-wide Chromium switch
-  ['zoomHotkeysEnabled', true], // no menu accelerators in this runtime
   ['generalAutofillEnabled', true],
   ['disableInputAccessoryView', false], // iOS / Mac Catalyst only
   ['allowLinkPreview', true], // iOS only
@@ -454,6 +452,25 @@ function applyWindowConfig(window, config, params) {
     window.webContents.on('did-finish-load', () => {
       window.webContents.executeJavaScript(
         "for (const type of ['dragenter', 'dragover', 'drop']) document.addEventListener(type, (event) => { event.preventDefault(); event.stopPropagation() }, true)",
+      )
+    })
+  }
+  if (config.zoomHotkeysEnabled === false) {
+    // Chromium zooms on Ctrl/⌘ + wheel and the zoom accelerators; Tauri's flag
+    // says this window must not, so cancel both at the source.
+    window.webContents.setVisualZoomLevelLimits(1, 1)
+    window.webContents.on('before-input-event', (event, input) => {
+      if (!(input.control || input.meta)) return
+      if (input.key === '+' || input.key === '-' || input.key === '=' || input.key === '0') {
+        event.preventDefault()
+      }
+    })
+  }
+  if (config.scrollBarStyle === 'fluentOverlay') {
+    // Electron has no per-window scrollbar switch; draw the overlay look instead.
+    window.webContents.on('did-finish-load', () => {
+      window.webContents.insertCSS(
+        '::-webkit-scrollbar { width: 8px; height: 8px } ::-webkit-scrollbar-track { background: transparent } ::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.45); border-radius: 4px }',
       )
     })
   }
@@ -817,7 +834,9 @@ function readGeometry(window) {
     minimized: window.isMinimized(),
     focused: window.isFocused(),
     visible: window.isVisible(),
-    fullscreen: window.isFullScreen(),
+    fullscreen:
+      window.isFullScreen() ||
+      (process.platform === 'darwin' && window.isSimpleFullScreen()),
     resizable: window.isResizable(),
     maximizable: maximizableState.get(window) ?? true,
     minimizable: minimizableState.get(window) ?? true,
@@ -939,9 +958,29 @@ function handle(method, params) {
     case 'window.unminimize':
       findWindow(params.windowId).restore()
       return null
-    case 'window.fullscreen':
-      findWindow(params.windowId).setFullScreen(params.fullscreen)
+    case 'window.fullscreen': {
+      const window = findWindow(params.windowId)
+      window.setFullScreen(params.fullscreen)
+      if (process.platform === 'darwin') {
+        // AppKit silently refuses the space switch when there is no usable
+        // space (VMs, CI runners, some multi-display setups). Simple fullscreen
+        // needs no space, so fall back to it instead of doing nothing.
+        setTimeout(() => {
+          if (params.fullscreen && !window.isFullScreen() && !window.isSimpleFullScreen()) {
+            window.setSimpleFullScreen(true)
+          } else if (!params.fullscreen && window.isSimpleFullScreen()) {
+            window.setSimpleFullScreen(false)
+          }
+        }, 600)
+      }
       return null
+    }
+    case 'window.setParentWindow': {
+      const child = findWindow(params.windowId)
+      const parent = findWindow(params.parentId)
+      if (child && parent) child.setParentWindow(parent)
+      return null
+    }
     case 'window.alwaysOnTop':
       findWindow(params.windowId).setAlwaysOnTop(params.alwaysOnTop)
       return null

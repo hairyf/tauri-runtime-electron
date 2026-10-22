@@ -182,7 +182,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn gtk_window(&self) -> Result<*mut std::ffi::c_void> {
-    unimplemented!()
+    Err(crate::runtime::create_window_err(
+      "Electron draws no GTK window".into(),
+    ))
   }
 
   #[cfg(any(
@@ -193,17 +195,23 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn default_vbox(&self) -> Result<*mut std::ffi::c_void> {
-    unimplemented!()
+    Err(crate::runtime::create_window_err(
+      "Electron draws no GTK box".into(),
+    ))
   }
 
   #[cfg(target_os = "android")]
   fn activity_name(&self) -> Result<String> {
-    unimplemented!()
+    Err(crate::runtime::create_window_err(
+      "Electron does not run on Android".into(),
+    ))
   }
 
   #[cfg(target_os = "ios")]
   fn scene_identifier(&self) -> Result<String> {
-    unimplemented!()
+    Err(crate::runtime::create_window_err(
+      "Electron does not run on iOS".into(),
+    ))
   }
 
   fn window_handle(
@@ -531,6 +539,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   /// `window.create` already carries it, so only a post-creation change is out
   /// of reach.
   fn set_title_bar_style(&self, _style: tauri_utils::TitleBarStyle) -> Result<()> {
+    // No Electron equivalent: BrowserWindow.titleBarStyle is creation-time only.
     crate::unsupported::report("Window::set_title_bar_style");
     Ok(())
   }

@@ -9,32 +9,32 @@ Do not edit by hand — re-run the script.
 | ⚠️ accepted then ignored | returns success, drops the request, logs once (`unsupported`) |
 | ⚠️ only some platforms | works on Windows; reports and skips elsewhere |
 | ⚠️ silently ignored | returns a success value and drops the request — **the dangerous kind** |
+| 🚫 no Electron equivalent | Electron has no such API; the body says so and reports once |
 | ⛔ refused | returns an error / `todo!` |
 | ❌ missing | required by the trait, not implemented at all |
 
 ## Summary
 
-| trait | members | ✅ | ⚠️ | ⛔ | ❌ |
-| --- | --- | --- | --- | --- | --- |
-| Runtime | 20 | 18 | 2 | 0 | 0 |
-| RuntimeHandle | 22 | 17 | 1 | 4 | 0 |
-| EventLoopProxy | 1 | 1 | 0 | 0 | 0 |
-| RuntimeInitAttrs | 1 | 1 | 0 | 0 | 0 |
-| WindowDispatch | 81 | 72 | 5 | 4 | 0 |
-| WebviewDispatch | 36 | 34 | 2 | 0 | 0 |
-| WindowBuilder | 47 | 44 | 3 | 0 | 0 |
-| **total** | **208** | **187** | **13** | **8** | **0** |
+| trait | members | ✅ | ⚠️ | 🚫 | ⛔ | ❌ |
+| --- | --- | --- | --- | --- | --- | --- |
+| Runtime | 20 | 19 | 0 | 1 | 0 | 0 |
+| RuntimeHandle | 22 | 17 | 0 | 1 | 4 | 0 |
+| EventLoopProxy | 1 | 1 | 0 | 0 | 0 | 0 |
+| RuntimeInitAttrs | 1 | 1 | 0 | 0 | 0 | 0 |
+| WindowDispatch | 81 | 72 | 4 | 1 | 4 | 0 |
+| WebviewDispatch | 36 | 34 | 0 | 2 | 0 | 0 |
+| WindowBuilder | 47 | 46 | 0 | 1 | 0 | 0 |
+| **total** | **208** | **190** | **4** | **6** | **8** | **0** |
 
 0 further members are omitted because the trait supplies a default body.
 
 ## Runtime
 
-18 of 20 implemented.
+19 of 20 implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | ⚠️ accepted then ignored | `src/runtime.rs:892` |
-| `run_iteration` | ⚠️ accepted then ignored | `src/runtime.rs:905` |
+| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1300` |
 
 ## RuntimeHandle
 
@@ -42,11 +42,11 @@ Do not edit by hand — re-run the script.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | ⚠️ accepted then ignored | `src/window_handle.rs:206` |
-| `find_class` | ⛔ refused | `src/window_handle.rs:211` |
-| `run_on_android_context` | ⛔ refused | `src/window_handle.rs:221` |
-| `fetch_data_store_identifiers` | ⛔ refused | `src/window_handle.rs:231` |
-| `remove_data_store` | ⛔ refused | `src/window_handle.rs:239` |
+| `set_device_event_filter` | 🚫 no Electron equivalent | `src/window_handle.rs:206` |
+| `find_class` | ⛔ refused | `src/window_handle.rs:212` |
+| `run_on_android_context` | ⛔ refused | `src/window_handle.rs:222` |
+| `fetch_data_store_identifiers` | ⛔ refused | `src/window_handle.rs:232` |
+| `remove_data_store` | ⛔ refused | `src/window_handle.rs:240` |
 
 ## EventLoopProxy
 
@@ -63,14 +63,14 @@ Every member is implemented.
 | member | status | where |
 | --- | --- | --- |
 | `gtk_window` | ⛔ refused | `src/window.rs:184` |
-| `default_vbox` | ⛔ refused | `src/window.rs:195` |
-| `activity_name` | ⛔ refused | `src/window.rs:200` |
-| `scene_identifier` | ⛔ refused | `src/window.rs:205` |
-| `set_decorations` | ⚠️ only some platforms | `src/window.rs:328` |
-| `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:428` |
-| `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:450` |
-| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:481` |
-| `set_title_bar_style` | ⚠️ accepted then ignored | `src/window.rs:533` |
+| `default_vbox` | ⛔ refused | `src/window.rs:197` |
+| `activity_name` | ⛔ refused | `src/window.rs:204` |
+| `scene_identifier` | ⛔ refused | `src/window.rs:211` |
+| `set_decorations` | ⚠️ only some platforms | `src/window.rs:336` |
+| `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:436` |
+| `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:458` |
+| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:489` |
+| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:541` |
 
 ## WebviewDispatch
 
@@ -78,16 +78,14 @@ Every member is implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `with_ios_webview` | ⚠️ accepted then ignored | `src/webview.rs:77` |
-| `reparent` | ⚠️ accepted then ignored | `src/webview.rs:232` |
+| `with_ios_webview` | 🚫 no Electron equivalent | `src/webview.rs:77` |
+| `reparent` | 🚫 no Electron equivalent | `src/webview.rs:233` |
 
 ## WindowBuilder
 
-44 of 47 implemented.
+46 of 47 implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `parent` | ⚠️ accepted then ignored | `src/window_builder.rs:265` |
-| `parent` | ⚠️ accepted then ignored | `src/window_builder.rs:265` |
-| `transient_for` | ⚠️ accepted then ignored | `src/window_builder.rs:278` |
+| `transient_for` | 🚫 no Electron equivalent | `src/window_builder.rs:282` |
 

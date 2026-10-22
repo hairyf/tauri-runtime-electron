@@ -204,6 +204,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   }
 
   fn set_device_event_filter(&self, _: DeviceEventFilter) {
+    // No Electron equivalent: there is no device event stream to filter.
     crate::unsupported::report("RuntimeHandle::set_device_event_filter");
   }
 

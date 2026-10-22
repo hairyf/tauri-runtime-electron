@@ -84,6 +84,9 @@ const squish = (text) =>
 
 function classify(body) {
   const code = squish(body)
+  // Stubs that Electron genuinely has no API for are not pending work: the
+  // body says so with a `no Electron equivalent` comment.
+  if (/no Electron equivalent/i.test(body)) return 'impossible'
   if (/^$|^self$|^Ok\(\(\)\)$|^Ok\(None\)$/.test(code)) return 'ignored'
   // A body that both does work and reports is only unsupported on some
   // targets (the `#[cfg(not(windows))]` branch).
@@ -148,6 +151,7 @@ const STATUS_LABEL = {
   logged: '⚠️ accepted then ignored',
   partial: '⚠️ only some platforms',
   ignored: '⚠️ silently ignored',
+  impossible: '🚫 no Electron equivalent',
   refused: '⛔ refused',
   missing: '❌ missing',
 }
@@ -157,6 +161,7 @@ let totals = {
   logged: 0,
   partial: 0,
   ignored: 0,
+  impossible: 0,
   refused: 0,
   missing: 0,
   inherited: 0,
@@ -175,7 +180,7 @@ for (const trait of traits) {
   const count = (status) => rows.filter((row) => row.status === status).length
   const header = `| ${trait} | ${rows.length} | ${count('implemented')} | ${
     count('logged') + count('ignored') + count('partial')
-  } | ${count('refused')} | ${count('missing')} |`
+  } | ${count('impossible')} | ${count('refused')} | ${count('missing')} |`
   sections.push({ trait, rows, header })
 }
 
@@ -193,24 +198,26 @@ const markdown = [
   '| ⚠️ accepted then ignored | returns success, drops the request, logs once (`unsupported`) |',
   '| ⚠️ only some platforms | works on Windows; reports and skips elsewhere |',
   '| ⚠️ silently ignored | returns a success value and drops the request — **the dangerous kind** |',
+  '| 🚫 no Electron equivalent | Electron has no such API; the body says so and reports once |',
   '| ⛔ refused | returns an error / `todo!` |',
   '| ❌ missing | required by the trait, not implemented at all |',
   '',
   '## Summary',
   '',
-  '| trait | members | ✅ | ⚠️ | ⛔ | ❌ |',
-  '| --- | --- | --- | --- | --- | --- |',
+  '| trait | members | ✅ | ⚠️ | 🚫 | ⛔ | ❌ |',
+  '| --- | --- | --- | --- | --- | --- | --- |',
   ...sections.map((section) => section.header),
   `| **total** | **${
     totals.implemented +
     totals.logged +
     totals.partial +
     totals.ignored +
+    totals.impossible +
     totals.refused +
     totals.missing
   }** | **${totals.implemented}** | **${totals.logged + totals.partial + totals.ignored}** | **${
-    totals.refused
-  }** | **${totals.missing}** |`,
+    totals.impossible
+  }** | **${totals.refused}** | **${totals.missing}** |`,
   '',
   `${totals.inherited} further members are omitted because the trait supplies a default body.`,
   '',

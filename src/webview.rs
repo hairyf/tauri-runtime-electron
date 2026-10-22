@@ -78,6 +78,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     &self,
     _f: F,
   ) -> Result<()> {
+    // No Electron equivalent: Electron does not run on iOS.
     crate::unsupported::report("Webview::with_ios_webview");
     Ok(())
   }
@@ -230,6 +231,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   /// A `<webview>` guest is anchored to the page that hosts it; Electron has no
   /// API to move a guest into another window.
   fn reparent(&self, _window_id: WindowId) -> Result<()> {
+    // No Electron equivalent: a <webview> guest cannot be moved to another window.
     crate::unsupported::report("Webview::reparent");
     Ok(())
   }

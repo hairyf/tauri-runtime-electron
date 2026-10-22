@@ -46,6 +46,9 @@ pub struct ElectronWindowBuilder {
   pub(crate) owner: Option<HWND>,
   #[cfg(windows)]
   pub(crate) parent: Option<HWND>,
+  /// Parent window (macOS keeps the NSWindow pointer until the window exists).
+  #[cfg(target_os = "macos")]
+  pub(crate) macos_parent: Option<*mut std::ffi::c_void>,
 }
 
 impl Default for ElectronWindowBuilder {
@@ -262,10 +265,11 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   #[cfg(target_os = "macos")]
-  fn parent(self, _parent: *mut std::ffi::c_void) -> Self {
-    // Electron only accepts a `BrowserWindow` as a parent, and the native
-    // pointer is a different (wrong-process) NSWindow.
-    self.unsupported("parent")
+  fn parent(mut self, parent: *mut std::ffi::c_void) -> Self {
+    // The pointer is one of our own windows: the runtime maps it back to a
+    // serial and Electron then calls `setParentWindow`.
+    self.macos_parent = Some(parent);
+    self
   }
 
   #[cfg(any(
@@ -276,6 +280,7 @@ impl WindowBuilder for ElectronWindowBuilder {
     target_os = "openbsd"
   ))]
   fn transient_for(self, _parent: *mut std::ffi::c_void) -> Self {
+    // No Electron equivalent: GTK parent handles mean nothing to Electron.
     // GTK parent handles mean nothing to Electron.
     self.unsupported("transient_for")
   }

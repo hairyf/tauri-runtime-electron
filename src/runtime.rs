@@ -725,196 +725,17 @@ fn with_identifier(mut attrs: Electron, identifier: String) -> Electron {
   attrs
 }
 
-impl<T: UserEvent> Runtime<T> for ElectronRuntime {
-  type WindowDispatcher = ElectronWindowDispatcher;
-  type WebviewDispatcher = ElectronWebviewDispatcher;
-  type Handle = ElectronRuntimeHandle;
-  type EventLoopProxy = EventProxy;
-  type RuntimeWebviewAttributes = ();
-  type RuntimeInitAttrs = Electron;
-  type WindowOpener = ();
-  type Webview = ();
-
-  fn new(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    let identifier = args.identifier.clone();
-    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
-  }
-
-  #[cfg(any(
-    windows,
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
-  fn new_any_thread(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    let identifier = args.identifier.clone();
-    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
-  }
-
-  fn create_proxy(&self) -> EventProxy {
-    EventProxy {
-      run_tx: self.context.run_tx.clone(),
-    }
-  }
-
-  fn handle(&self) -> Self::Handle {
-    ElectronRuntimeHandle {
-      context: self.context.clone(),
-    }
-  }
-
-  fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
-    &self,
-    pending: PendingWindow<T, Self>,
-    _after_window_creation: Option<F>,
-  ) -> Result<DetachedWindow<T, Self>> {
-    create_window_impl(&self.context, pending)
-  }
-
-  fn create_webview(
-    &self,
-    window_id: WindowId,
-    pending: PendingWebview<T, Self>,
-  ) -> Result<DetachedWebview<T, Self>> {
-    create_webview_impl(&self.context, window_id, pending)
-  }
-
-  fn primary_monitor(&self) -> Option<Monitor> {
-    let displays = self
-      .context
-      .ipc
-      .call("window.displays", json!({}), IPC_TIMEOUT)
-      .ok()?;
-    platform::monitor_from_value(&displays["primary"])
-  }
-
-  fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
-    let display = self
-      .context
-      .ipc
-      .call("window.displayForPoint", json!({ "x": x, "y": y }), IPC_TIMEOUT)
-      .ok()?;
-    platform::monitor_from_value(&display)
-  }
-
-  fn available_monitors(&self) -> Vec<Monitor> {
-    self
-      .context
-      .ipc
-      .call("window.displays", json!({}), IPC_TIMEOUT)
-      .ok()
-      .and_then(|displays| {
-        displays["displays"]
-          .as_array()
-          .map(|list| list.iter().filter_map(platform::monitor_from_value).collect())
-      })
-      .unwrap_or_default()
-  }
-
-  fn set_theme(&self, theme: Option<Theme>) {
-    let theme = match theme {
-      Some(Theme::Dark) => "dark",
-      Some(_) => "light",
-      None => "system",
-    };
-    if let Err(error) = self
-      .context
-      .ipc
-      .call("app.theme", json!({ "theme": theme }), IPC_TIMEOUT)
-    {
-      eprintln!("[electron] set theme failed: {error}");
-    }
-  }
-
-  // Electron exposes these application-level switches through `app`, not the
-  // window: macOS activation policy, dock icon visibility, and app show/hide.
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn set_activation_policy(&mut self, activation_policy: tauri_runtime::ActivationPolicy) {
-    let policy = match activation_policy {
-      tauri_runtime::ActivationPolicy::Regular => "regular",
-      tauri_runtime::ActivationPolicy::Accessory => "accessory",
-      tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
-      _ => "regular",
-    };
-    if let Err(error) = self.context.ipc.call(
-      "app.activationPolicy",
-      json!({ "policy": policy }),
-      IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] set activation policy failed: {error}");
-    }
-  }
-
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn set_dock_visibility(&mut self, visible: bool) {
-    if let Err(error) = self.context.ipc.call(
-      "app.dockVisibility",
-      json!({ "visible": visible }),
-      IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] set dock visibility failed: {error}");
-    }
-  }
-
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn set_activate_ignoring_other_apps(&mut self, ignore: bool) {
-    // There is no direct equivalent; focusing with `steal` is the closest.
-    if let Err(error) = self
-      .context
-      .ipc
-      .call("app.focus", json!({ "steal": ignore }), IPC_TIMEOUT)
-    {
-      eprintln!("[electron] focus app failed: {error}");
-    }
-  }
-
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn show(&self) {
-    if let Err(error) = self.context.ipc.call("app.show", json!({}), IPC_TIMEOUT) {
-      eprintln!("[electron] show app failed: {error}");
-    }
-  }
-
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn hide(&self) {
-    if let Err(error) = self.context.ipc.call("app.hide", json!({}), IPC_TIMEOUT) {
-      eprintln!("[electron] hide app failed: {error}");
-    }
-  }
-
-  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {
-    crate::unsupported::report("Runtime::set_device_event_filter");
-  }
-
-  #[cfg(any(
-    target_os = "macos",
-    windows,
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
-  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, _callback: F) {
-    crate::unsupported::report("Runtime::run_iteration");
-  }
-
-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
-    self.run(callback);
-
-    0
-  }
-
-  fn run<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) {
+impl ElectronRuntime {
+  /// Processes the events Electron has sent since the last call. `run` loops
+  /// over this forever; `run_iteration` calls it once and returns, which is what
+  /// Tauri's polling drivers need.
+  fn pump<T: UserEvent, F: FnMut(RunEvent<T>)>(&mut self, mut callback: &mut F, once: bool) {
+    // Polling drivers call this repeatedly: messages Tauri sends must queue for
+    // the next pump instead of running inline.
     self.is_running.store(true, Ordering::Relaxed);
-    callback(RunEvent::Ready);
+    if !once {
+      callback(RunEvent::Ready);
+    }
 
     'event_loop: loop {
       // Events pushed by the Electron process.
@@ -1293,13 +1114,217 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       // messages here; Electron owns its own process, so nothing else pumps them.
       pump_thread_messages();
 
+      if once {
+        break;
+      }
+
       std::thread::sleep(Duration::from_millis(10));
+    }
+
+    if once {
+      return;
     }
 
     self.is_running.store(false, Ordering::Relaxed);
     eprintln!("[electron] run loop finished, shutting the runtime down");
     self.context.ipc.shutdown();
     callback(RunEvent::Exit);
+  }
+
+}
+
+impl<T: UserEvent> Runtime<T> for ElectronRuntime {
+  type WindowDispatcher = ElectronWindowDispatcher;
+  type WebviewDispatcher = ElectronWebviewDispatcher;
+  type Handle = ElectronRuntimeHandle;
+  type EventLoopProxy = EventProxy;
+  type RuntimeWebviewAttributes = ();
+  type RuntimeInitAttrs = Electron;
+  type WindowOpener = ();
+  type Webview = ();
+
+  fn new(args: RuntimeInitArgs<Electron>) -> Result<Self> {
+    let identifier = args.identifier.clone();
+    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
+  }
+
+  #[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+  ))]
+  fn new_any_thread(args: RuntimeInitArgs<Electron>) -> Result<Self> {
+    let identifier = args.identifier.clone();
+    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
+  }
+
+  fn create_proxy(&self) -> EventProxy {
+    EventProxy {
+      run_tx: self.context.run_tx.clone(),
+    }
+  }
+
+  fn handle(&self) -> Self::Handle {
+    ElectronRuntimeHandle {
+      context: self.context.clone(),
+    }
+  }
+
+  fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
+    &self,
+    pending: PendingWindow<T, Self>,
+    _after_window_creation: Option<F>,
+  ) -> Result<DetachedWindow<T, Self>> {
+    create_window_impl(&self.context, pending)
+  }
+
+  fn create_webview(
+    &self,
+    window_id: WindowId,
+    pending: PendingWebview<T, Self>,
+  ) -> Result<DetachedWebview<T, Self>> {
+    create_webview_impl(&self.context, window_id, pending)
+  }
+
+  fn primary_monitor(&self) -> Option<Monitor> {
+    let displays = self
+      .context
+      .ipc
+      .call("window.displays", json!({}), IPC_TIMEOUT)
+      .ok()?;
+    platform::monitor_from_value(&displays["primary"])
+  }
+
+  fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
+    let display = self
+      .context
+      .ipc
+      .call("window.displayForPoint", json!({ "x": x, "y": y }), IPC_TIMEOUT)
+      .ok()?;
+    platform::monitor_from_value(&display)
+  }
+
+  fn available_monitors(&self) -> Vec<Monitor> {
+    self
+      .context
+      .ipc
+      .call("window.displays", json!({}), IPC_TIMEOUT)
+      .ok()
+      .and_then(|displays| {
+        displays["displays"]
+          .as_array()
+          .map(|list| list.iter().filter_map(platform::monitor_from_value).collect())
+      })
+      .unwrap_or_default()
+  }
+
+  fn set_theme(&self, theme: Option<Theme>) {
+    let theme = match theme {
+      Some(Theme::Dark) => "dark",
+      Some(_) => "light",
+      None => "system",
+    };
+    if let Err(error) = self
+      .context
+      .ipc
+      .call("app.theme", json!({ "theme": theme }), IPC_TIMEOUT)
+    {
+      eprintln!("[electron] set theme failed: {error}");
+    }
+  }
+
+  // Electron exposes these application-level switches through `app`, not the
+  // window: macOS activation policy, dock icon visibility, and app show/hide.
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn set_activation_policy(&mut self, activation_policy: tauri_runtime::ActivationPolicy) {
+    let policy = match activation_policy {
+      tauri_runtime::ActivationPolicy::Regular => "regular",
+      tauri_runtime::ActivationPolicy::Accessory => "accessory",
+      tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
+      _ => "regular",
+    };
+    if let Err(error) = self.context.ipc.call(
+      "app.activationPolicy",
+      json!({ "policy": policy }),
+      IPC_TIMEOUT,
+    ) {
+      eprintln!("[electron] set activation policy failed: {error}");
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn set_dock_visibility(&mut self, visible: bool) {
+    if let Err(error) = self.context.ipc.call(
+      "app.dockVisibility",
+      json!({ "visible": visible }),
+      IPC_TIMEOUT,
+    ) {
+      eprintln!("[electron] set dock visibility failed: {error}");
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn set_activate_ignoring_other_apps(&mut self, ignore: bool) {
+    // There is no direct equivalent; focusing with `steal` is the closest.
+    if let Err(error) = self
+      .context
+      .ipc
+      .call("app.focus", json!({ "steal": ignore }), IPC_TIMEOUT)
+    {
+      eprintln!("[electron] focus app failed: {error}");
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn show(&self) {
+    if let Err(error) = self.context.ipc.call("app.show", json!({}), IPC_TIMEOUT) {
+      eprintln!("[electron] show app failed: {error}");
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn hide(&self) {
+    if let Err(error) = self.context.ipc.call("app.hide", json!({}), IPC_TIMEOUT) {
+      eprintln!("[electron] hide app failed: {error}");
+    }
+  }
+
+  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {
+    // No Electron equivalent: Chromium owns the input pipeline and never hands
+    // this runtime a device event stream to filter.
+    crate::unsupported::report("Runtime::set_device_event_filter");
+  }
+
+  #[cfg(any(
+    target_os = "macos",
+    windows,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+  ))]
+  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, mut callback: F) {
+    self.pump(&mut callback, true);
+  }
+
+  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
+    self.run(callback);
+
+    0
+  }
+
+  fn run<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) {
+    let mut runtime = self;
+    runtime.pump(&mut callback, false);
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
@@ -1544,6 +1569,30 @@ pub(crate) fn create_window_impl<T: UserEvent>(
     }
     if let Some(owner) = window_builder.owner.or(window_builder.parent) {
       crate::window::imp::set_owner(handle, owner.0 as isize);
+    }
+  }
+
+  // Tauri hands over a raw NSWindow pointer; Electron only understands its own
+  // windows, so map the pointer back to the window it belongs to.
+  #[cfg(target_os = "macos")]
+  if let Some(parent) = window_builder.macos_parent {
+    let parent_serial = context
+      .native_handles
+      .borrow()
+      .iter()
+      .find(|(_, handle)| **handle == parent as isize)
+      .map(|(serial, _)| *serial);
+    match parent_serial {
+      Some(parent_serial) => {
+        if let Err(error) = context.ipc.call(
+          "window.setParentWindow",
+          json!({ "windowId": serial, "parentId": parent_serial }),
+          IPC_TIMEOUT,
+        ) {
+          eprintln!("[electron] window {label}: parenting failed: {error}");
+        }
+      }
+      None => crate::unsupported::report("WindowBuilder::parent (unknown window)"),
     }
   }
 

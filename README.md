@@ -71,13 +71,27 @@ fake success. Linux needs a display server, so CI runs the smoke example under
 `xvfb-run`.
 
 The smoke example asserts ~75 behaviours against two real windows and one guest
-webview: every setter that has a getter round-trips through it, and every other
-setter must at least reach Electron without an IPC error. Behaviour that only
-exists on macOS or Windows (maximize, minimize, fullscreen, decorations) is
-asserted there and skipped under xvfb, which has no window manager.
+webview: every setter that has a getter round-trips through it, every other
+setter must at least reach Electron without an IPC error, and a third window is
+closed to prove `run_iteration` actually delivers the destroy event. Behaviour
+that only exists on macOS or Windows (maximize, minimize, fullscreen,
+decorations) is asserted there and skipped under xvfb, which has no window
+manager.
 
 `source/tauri` and `source/electron` are pinned submodules kept for reading the
 upstream implementations; they are not built.
+
+## Running Tauri's Own Example
+
+```bash
+node scripts/api-example.mjs
+```
+
+That stages `source/tauri/examples/api` (frontend untouched), swaps its
+`src-tauri` runtime for this one, starts Vite on port 1420 and launches the app,
+so the whole of Tauri's API surface can be poked by hand. `--clean` wipes
+`.cache/api-example` first, `--no-install` skips the frontend install, and
+`--keep` leaves everything staged after exit. Ctrl+C stops both the app and Vite.
 
 ---
 
