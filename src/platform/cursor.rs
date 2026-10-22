@@ -73,22 +73,14 @@ mod imp {
   not(target_os = "android")
 ))]
 mod imp {
-  use gtk::gdk::prelude::{DeviceExt, SeatExt};
   use tauri_runtime::dpi::PhysicalPosition;
 
-  pub(super) fn warp(position: PhysicalPosition<i32>, _scale: f64) -> Result<(), String> {
-    // GDK is already linked for the window handle types, and gdk_device_warp is
-    // the only portable request: X11 moves the pointer, Wayland accepts the call
-    // and does nothing because the protocol has no warp.
-    let display =
-      gtk::gdk::Display::default().ok_or_else(|| "no display to warp the cursor on".to_string())?;
-    let seat = display
-      .default_seat()
-      .ok_or_else(|| "the display has no seat".to_string())?;
-    let pointer = seat
-      .pointer()
-      .ok_or_else(|| "the seat has no pointer".to_string())?;
-    pointer.warp(&display.default_screen(), position.x, position.y);
-    Ok(())
+  pub(super) fn warp(_position: PhysicalPosition<i32>, _scale: f64) -> Result<(), String> {
+    // GDK's display is initialized only by a GTK main loop, and this runtime
+    // never runs one: gdk::Display::default() panics with "GDK has not been
+    // initialized" instead of returning None. Opening a second X connection
+    // behind GTK's back would fight the toolkit for the pointer, and Wayland
+    // has no warp request at all, so this stays a logged gap.
+    Err("an Electron window has no GTK display to warp the cursor on".to_string())
   }
 }

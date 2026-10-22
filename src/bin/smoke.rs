@@ -429,6 +429,12 @@ fn visibility_checks(window: &Window, failures: &mut Vec<String>) {
 }
 
 fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
+  if !cfg!(any(windows, target_os = "macos")) {
+    // Warping needs a native call the runtime can make: Win32 on Windows,
+    // CoreGraphics on macOS. A Linux window has neither.
+    println!("skip cursor_position: only Windows and macOS can warp the cursor");
+    return;
+  }
   let Ok(start) = <ElectronRuntimeHandle as RuntimeHandle<()>>::cursor_position(handle) else {
     failures.push("cursor_position: cannot read the starting position".into());
     return;

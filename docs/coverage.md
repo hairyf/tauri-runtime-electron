@@ -23,14 +23,14 @@ round-trips (set it, read it back), on Windows, macOS and Linux in CI.
 | --- | --- | --- | --- |
 | Windows | yes | yes | local runs and CI; the Win32 handle carries decorations, drag and the cursor |
 | macOS | yes | in CI | `fetch_data_store_identifiers` panics; AppKit handle is handed back; cursor warp via CoreGraphics |
-| Linux | yes | in CI (xvfb) | `display_handle` reports `Xlib(None)`, so wgpu/GL interop cannot work; cursor warp needs X11, Wayland has none |
+| Linux | yes | in CI (xvfb) | `display_handle` reports `Xlib(None)`, so wgpu/GL interop cannot work; the cursor cannot be warped without a GTK display, so `set_cursor_position` logs a gap |
 | Android / iOS | no | no | not supported: the platform branches reference `jni`/`objc` without a dependency |
 
 ## Native code
 
 | file | why it cannot be Electron IPC |
 | --- | --- |
-| `src/platform/cursor.rs` | Electron has no cursor API; `SetCursorPos`, `CGWarpMouseCursorPosition` and a GDK warp |
+| `src/platform/cursor.rs` | Electron has no cursor API; `SetCursorPos` on Windows and `CGWarpMouseCursorPosition` on macOS |
 | `src/platform/dpi.rs` | a host that is not DPI aware has its coordinates scaled, which puts `SetCursorPos` near the corner |
 | `src/window.rs` `imp` | `set_decorations`, `send_to_bottom` and `start_dragging` are `GetWindowLongPtrW`/`SendMessageW` calls |
 
