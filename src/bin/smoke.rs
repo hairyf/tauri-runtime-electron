@@ -103,10 +103,13 @@ fn main() -> ExitCode {
     ..Default::default()
   };
 
-  let mut pending = match PendingWindow::<(), ElectronRuntime>::new(
-    <ElectronWindowBuilder as tauri_runtime::window::WindowBuilder>::with_config(&config),
-    "smoke",
-  ) {
+  // The size travels through the builder *setter*, not through the config:
+  // Tauri's own `inner_size` does the same, and a setter that forgets to store
+  // the value is a window that comes up the wrong size.
+  let builder = <ElectronWindowBuilder as tauri_runtime::window::WindowBuilder>::with_config(&config);
+  let builder =
+    <ElectronWindowBuilder as tauri_runtime::window::WindowBuilder>::inner_size(builder, 320.0, 240.0);
+  let mut pending = match PendingWindow::<(), ElectronRuntime>::new(builder, "smoke") {
     Ok(pending) => pending,
     Err(error) => {
       eprintln!("[smoke] cannot build the window: {error}");
@@ -220,6 +223,20 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
     Ok(_) => failures.push("available_monitors is empty".into()),
     Err(error) => failures.push(format!("available_monitors: {error}")),
   }
+
+  // The creation size travelled through a builder setter, the way Tauri's own
+  // `inner_size` does; a runtime that drops it comes up at Electron's default.
+  let scale = WindowDispatch::<()>::scale_factor(window).unwrap_or(1.0);
+  expect_size(
+    failures,
+    "inner_size from the builder",
+    PhysicalSize::new(
+      (320.0 * scale).round() as u32,
+      (240.0 * scale).round() as u32,
+    ),
+    10,
+    || WindowDispatch::<()>::inner_size(window),
+  );
 
   set(failures, "set_size", || {
     WindowDispatch::<()>::set_size(window, Size::Physical(PhysicalSize::new(420, 320)))

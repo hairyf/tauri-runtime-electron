@@ -341,6 +341,9 @@ async function createWindow(params) {
   }
   const window = new BrowserWindow({
     title: params.title ?? 'Electron Runtime',
+    // Tauri sizes windows by their content, and `window.size` below resizes the
+    // content too: without this the frame would eat the first few pixels.
+    useContentSize: true,
     width: params.width ?? 800,
     height: params.height ?? 600,
     x: params.x ?? undefined,
