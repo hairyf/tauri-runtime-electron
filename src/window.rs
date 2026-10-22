@@ -183,7 +183,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn gtk_window(&self) -> Result<*mut std::ffi::c_void> {
+  fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
     unimplemented!()
   }
 
@@ -194,7 +194,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn default_vbox(&self) -> Result<*mut std::ffi::c_void> {
+  fn default_vbox(&self) -> Result<gtk::Box> {
     unimplemented!()
   }
 
