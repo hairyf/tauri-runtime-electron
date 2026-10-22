@@ -70,6 +70,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   }
 
   fn request_exit(&self, _code: i32) -> Result<()> {
+    // Tauri's `Message::Exit` carries no code, so this runtime always exits 0.
     self.context.send_message(Message::Exit)
   }
 

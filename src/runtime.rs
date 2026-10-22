@@ -927,6 +927,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               continue;
             };
             if window_closed(&self.context, id, &mut callback) {
+              eprintln!("[electron] last window closed, exiting the loop (serial {serial})");
               break 'event_loop;
             }
           }
@@ -1202,7 +1203,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               });
             handler(&label, request, responder);
           }
-          Some("ipc.closed") => break 'event_loop,
+          Some("ipc.closed") => {
+            break 'event_loop;
+          }
           _ => {}
         }
       }
@@ -1212,13 +1215,13 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
         match message {
           Message::Task(task) => task(),
           Message::CloseWindow(id) => {
-            if close_window(&self.context, id, &mut callback) {
+            if close_window(&self.context, id, &mut callback) {
               break 'event_loop;
             }
           }
           Message::DestroyWindow(id) => {
             let removed = self.context.windows.borrow_mut().remove(&id).is_some();
-            if removed && exit_if_empty(&self.context, &mut callback) {
+            if removed && exit_if_empty(&self.context, &mut callback) {
               break 'event_loop;
             }
           }

@@ -1211,7 +1211,9 @@ app.whenReady().then(async () => {
     send({ event: 'ipc.closed' })
     app.quit()
   })
-  socket.on('error', () => app.quit())
+  socket.on('error', () => {
+    app.quit()
+  })
 })
 
 // The Rust side owns the lifetime: no window means keep running until the

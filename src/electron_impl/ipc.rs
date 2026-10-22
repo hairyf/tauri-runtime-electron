@@ -141,6 +141,11 @@ impl Ipc {
       .and_then(Value::as_str)
       .unwrap_or("unknown")
       .to_string();
+    // Reading the handshake put a timeout on this socket, and the reader thread
+    // blocks on the same socket: clear it, or an idle app looks disconnected.
+    stream
+      .set_read_timeout(None)
+      .map_err(|e| format!("failed to reset the IPC read timeout: {e}"))?;
 
     let writer = stream
       .try_clone()
@@ -164,8 +169,12 @@ impl Ipc {
         loop {
           line.clear();
           match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(_) => {}
+            Err(error) => {
+              eprintln!("[electron] ipc reader failed: {error}");
+              break;
+            }
           }
           let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
