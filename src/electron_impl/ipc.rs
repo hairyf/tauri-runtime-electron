@@ -14,7 +14,7 @@ use std::{
   process::{Child, Command},
   sync::{
     atomic::{AtomicU64, Ordering},
-    mpsc::{channel, Receiver, Sender, SyncSender},
+    mpsc::{channel, Receiver, Sender},
     Arc, Mutex,
   },
   time::{Duration, Instant},
