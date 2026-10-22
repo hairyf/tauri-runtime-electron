@@ -1,0 +1,372 @@
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { verifyApi } from './verify-api.mjs'
+import { verifyDrag, verifyIsolation, verifyMultiwebview } from './verify-embedded.mjs'
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8')
+const json = (value) => JSON.stringify(value)
+
+async function text(t, target, selector) {
+  return t.evaluate(target, `document.querySelector(${json(selector)})?.textContent ?? ''`)
+}
+
+async function setValue(t, target, selector, value) {
+  await t.evaluate(
+    target,
+    `(() => {
+      const element = document.querySelector(${json(selector)})
+      if (!element) throw new Error(${json(`missing ${selector}`)})
+      element.focus()
+      element.value = ${json(value)}
+      element.dispatchEvent(new Event('input', { bubbles: true }))
+      element.dispatchEvent(new Event('change', { bubbles: true }))
+    })()`,
+  )
+}
+
+async function click(t, target, selector) {
+  await t.click(target, selector)
+}
+
+async function clickButton(t, target, label) {
+  await t.button(target, label)
+}
+
+async function labelOf(t, target) {
+  return t.evaluate(target, 'window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label ?? null')
+}
+
+async function targetByLabel(t, label, timeoutMs = 20000) {
+  return t.target(
+    async (candidate) => candidate.type === 'page' && (await labelOf(t, candidate)) === label,
+    timeoutMs,
+  )
+}
+
+async function invoke(t, target, name, args = {}) {
+  return t.evaluate(
+    target,
+    `(async () => {
+      try {
+        return { ok: true, value: await window.__TAURI__.core.invoke(${json(name)}, ${json(args)}) }
+      } catch (error) {
+        return { ok: false, error: String(error) }
+      }
+    })()`,
+  )
+}
+
+async function sendMessage(t, source, label, message) {
+  await setValue(t, source, '#send-label', label)
+  await setValue(t, source, '#send-message', message)
+  await click(t, source, '#send-message-form button')
+}
+
+const missing = (command, key) =>
+  `Err(invalid args \`${key}\` for command \`${command}\`: command ${command} missing required key ${key})`
+
+const commandNames = [
+  'borrow_cmd',
+  'raw_request',
+  'window_label',
+  'simple_command',
+  'stateful_command',
+  'async_simple_command',
+  'async_simple_command_snake',
+  'future_simple_command',
+  'async_stateful_command',
+  'simple_command_with_result',
+  'future_simple_command_snake',
+  'future_simple_command_with_return_snake',
+  'future_simple_command_with_result_snake',
+  'force_async_snake',
+  'force_async_with_result_snake',
+  'simple_command_with_result_snake',
+  'stateful_command_with_result_snake',
+  'stateful_command_with_result',
+  'async_simple_command_with_result',
+  'future_simple_command_with_return',
+  'future_simple_command_with_result',
+  'async_stateful_command_with_result',
+  'command_arguments_wild',
+  'command_arguments_struct',
+  'command_arguments_tuple_struct',
+  'renamed_command',
+  'renamed_command_new',
+  'renamed_command_in_mod',
+  'renamed_command_in_mod_new',
+]
+
+function commandExpected(name, supplied) {
+  if (name === 'renamed_command') return 'Err(Command renamed_command not found)'
+  if (name === 'renamed_command_in_mod') return 'Err(Command renamed_command_in_mod not found)'
+  if (name === 'raw_request') return `Ok(${read('source/tauri/examples/commands/README.md')})`
+  if (name === 'window_label' || name === 'command_arguments_wild') return 'Ok(null)'
+  if (name === 'renamed_command_new' || name === 'renamed_command_in_mod_new') return 'Ok(null)'
+  if (name === 'stateful_command' || name === 'async_stateful_command') return 'Ok(null)'
+  if (name === 'command_arguments_struct' || name === 'command_arguments_tuple_struct') {
+    return supplied
+      ? 'Ok(null)'
+      : missing(name, name === 'command_arguments_struct' ? 'person' : 'inlinePerson')
+  }
+  if (name === 'stateful_command_with_result' || name === 'stateful_command_with_result_snake') {
+    return supplied ? 'Ok(value)' : 'Err(FooError)'
+  }
+  if (name === 'async_stateful_command_with_result') return supplied ? 'Ok(value)' : 'Ok()'
+  if (
+    name === 'simple_command' ||
+    name === 'async_simple_command' ||
+    name === 'async_simple_command_snake' ||
+    name === 'future_simple_command' ||
+    name === 'future_simple_command_snake'
+  ) {
+    return supplied ? 'Ok(null)' : missing(name, name.endsWith('snake') ? 'the_argument' : 'theArgument')
+  }
+  const key = name.endsWith('snake') ? 'the_argument' : 'theArgument'
+  return supplied ? 'Ok(value)' : missing(name, key)
+}
+
+async function expectCommand(t, target, name) {
+  await t.evaluate(
+    target,
+    `(() => {
+      for (const selector of ['#response', '#response-optional']) {
+        const element = document.querySelector(selector)
+        if (element) element.textContent = ''
+      }
+    })()`,
+  )
+  // One click deliberately issues the two source-defined invokes: provided args
+  // into #response and an empty object into #response-optional.
+  await clickButton(t, target, `Run ${name}`)
+  await t.wait(
+    target,
+    `({ response: document.querySelector('#response')?.textContent ?? '', optional: document.querySelector('#response-optional')?.textContent ?? '' })`,
+    (value) => value.response !== '' && value.optional !== '',
+    20000,
+  )
+  const result = await t.evaluate(target, `({ response: document.querySelector('#response').textContent, optional: document.querySelector('#response-optional').textContent })`)
+  t.check(`${name} with args response`, result.response, commandExpected(name, true))
+  t.check(`${name} without args response`, result.optional, commandExpected(name, false))
+}
+
+export const cases = {
+  api: verifyApi,
+  drag: verifyDrag,
+  isolation: verifyIsolation,
+  multiwebview: verifyMultiwebview,
+  async helloworld(t) {
+    const target = t.main
+    t.check('helloworld initial message', await text(t, target, '#message'), '')
+    await setValue(t, target, '#name', 'Ferris')
+    await click(t, target, '#form button')
+    await t.wait(target, `document.querySelector('#message')?.textContent ?? ''`, (value) => value.length > 0)
+    t.check('helloworld greeting', await text(t, target, '#message'), 'Hello Ferris, You have been greeted from Rust!')
+    await t.capture(target, 'helloworld-greeting')
+    t.note('helloworld native menu', 'The default native menu is not exposed through page CDP.')
+  },
+
+  async commands(t) {
+    const target = t.main
+    await t.wait(target, 'document.querySelectorAll("#container button").length', (value) => value === 29)
+    t.check('commands button count', await t.evaluate(target, 'document.querySelectorAll("#container button").length'), 29)
+    await t.capture(target, 'commands-initial')
+
+    for (const name of commandNames) {
+      await expectCommand(t, target, name)
+      if (['borrow_cmd', 'raw_request', 'stateful_command_with_result', 'renamed_command', 'renamed_command_new'].includes(name)) {
+        await t.evaluate(target, 'scrollTo(0, 0)')
+        await t.capture(target, `commands-${name}`)
+      }
+    }
+
+    const extras = [
+      ['borrow_cmd_async', { theArgument: 'value' }, 'value'],
+      ['force_async', { theArgument: 'value' }, 'value'],
+      ['force_async_with_result', { theArgument: 'value' }, 'value'],
+      ['cmd', { argument: 'value' }, null],
+      ['invoke', { argument: 'value' }, null],
+      ['message', { argument: 'value' }, null],
+      ['resolver', { argument: 'value' }, null],
+    ]
+    for (const [name, args, expected] of extras) {
+      const result = await invoke(t, target, name, args)
+      t.check(`${name} extra handler succeeds`, result, { ok: true, value: expected })
+    }
+    await t.capture(target, 'commands-final')
+  },
+
+  async state(t) {
+    const target = t.main
+    await t.wait(target, `document.querySelector('#counter')?.textContent`, (value) => value !== '')
+    t.check('state initial count', await text(t, target, '#counter'), '0')
+    await clickButton(t, target, 'Increment')
+    await clickButton(t, target, 'Increment')
+    await t.wait(target, `document.querySelector('#counter')?.textContent`, (value) => value === '2')
+    t.check('state increments', await text(t, target, '#counter'), '2')
+    await t.capture(target, 'state-two')
+
+    await t.command(target, 'Page.reload', { ignoreCache: false })
+    await t.wait(target, `document.querySelector('#counter')?.textContent`, (value) => value === '2')
+    t.check('state survives frontend reload', await text(t, target, '#counter'), '2')
+    await clickButton(t, target, 'Decrement')
+    await clickButton(t, target, 'Decrement')
+    await clickButton(t, target, 'Decrement')
+    await t.wait(target, `document.querySelector('#counter')?.textContent`, (value) => value === '-1')
+    t.check('state decrements below zero', await text(t, target, '#counter'), '-1')
+    await clickButton(t, target, 'Reset')
+    await t.wait(target, `document.querySelector('#counter')?.textContent`, (value) => value === '0')
+    t.check('state reset', await text(t, target, '#counter'), '0')
+    await t.capture(target, 'state-reset')
+  },
+
+  async multiwindow(t) {
+    const main = await targetByLabel(t, 'Main')
+    const secondary = await targetByLabel(t, 'Secondary')
+    const third = await targetByLabel(t, 'Third')
+    t.check('multiwindow initial labels', (await Promise.all([main, secondary, third].map((target) => labelOf(t, target)))).sort(), ['Main', 'Secondary', 'Third'])
+    t.check('multiwindow initial page count', (await t.targets()).filter((target) => target.type === 'page').length, 3)
+    await t.capture(main, 'multiwindow-main-initial')
+    await t.capture(secondary, 'multiwindow-secondary-initial')
+
+    const mainBefore = await text(t, main, '#messages-view')
+    await sendMessage(t, main, 'Secondary', 'from Main')
+    await t.wait(secondary, `document.querySelector('#messages-view')?.textContent ?? ''`, (value) => value.includes('from Main'))
+    t.check('multiwindow targeted Secondary receives', (await text(t, secondary, '#messages-view')).includes('from Main'), true)
+    t.check('multiwindow Main is not receiver', await text(t, main, '#messages-view'), mainBefore)
+
+    await sendMessage(t, secondary, 'Main', 'from Secondary')
+    await t.wait(main, `document.querySelector('#messages-view')?.textContent ?? ''`, (value) => value.includes('from Secondary'))
+    t.check('multiwindow Main receives', (await text(t, main, '#messages-view')).includes('from Secondary'), true)
+    t.check('multiwindow Third is not receiver', (await text(t, third, '#messages-view')).includes('from Secondary'), false)
+    await t.capture(secondary, 'multiwindow-secondary-received')
+    await t.capture(main, 'multiwindow-main-received')
+
+    await setValue(t, main, '#new-label', 'Fourth')
+    await setValue(t, main, '#new-title', 'QA Fourth')
+    await click(t, main, '#new-window-form button')
+    const fourth = await targetByLabel(t, 'Fourth')
+    await t.wait(fourth, `document.querySelector('#messages-view')?.textContent ?? ''`, (value) => typeof value === 'string')
+    await sendMessage(t, main, 'Fourth', 'from Main to Fourth')
+    await t.wait(fourth, `document.querySelector('#messages-view')?.textContent ?? ''`, (value) => value.includes('from Main to Fourth'))
+    t.check('multiwindow Fourth receives', (await text(t, fourth, '#messages-view')).includes('from Main to Fourth'), true)
+    await t.capture(fourth, 'multiwindow-fourth-received')
+
+    await t.command(fourth, 'Page.close', {})
+    await t.target(async (candidate) => {
+      if (candidate.id !== main.id) return false
+      const remaining = (await t.targets()).filter((target) => target.type === 'page')
+      return remaining.length === 3 && !remaining.some((target) => target.id === fourth.id)
+    }, 15000)
+    t.check('multiwindow Fourth target closes', (await t.targets()).some((target) => target.id === fourth.id), false)
+    t.note('multiwindow native titles', 'Configured titles are native-window properties; page CDP cannot inspect them.')
+  },
+
+  async resources(t) {
+    const target = t.main
+    const expected = read('source/tauri/examples/resources/src-tauri/assets/index.js')
+    await t.wait(target, `document.querySelector('#content')?.textContent ?? ''`, (value) => value.includes("console.log('hello world')"))
+    const actualPath = await text(t, target, '#path')
+    const actualContent = await text(t, target, '#content')
+    t.check('resources path resolves to asset', actualPath.split('\\').join('/').endsWith('/assets/index.js'), true)
+    t.check('resources exact asset content', actualContent, expected)
+    t.check('resources content is nonempty', actualContent.length > 0, true)
+    await t.capture(target, 'resources-read')
+    t.note('resources packaged install', 'Development verification only; packaged resource staging/installation requires the build runner.')
+  },
+
+  async ['run-return'](t) {
+    const target = t.main
+    await t.wait(target, `document.body.innerText.trim()`, (value) => value === 'Welcome to Tauri!')
+    await t.capture(target, 'run-return-before-close')
+    await t.command(target, 'Page.close', {})
+    const code = await t.closed()
+    t.check('run-return exit code', code, 0)
+    t.check('run-return resumes after event loop', t.output().includes('I run after exit'), true)
+  },
+
+  async splashscreen(t) {
+    const splash = await t.target((target) => target.type === 'page' && target.url.includes('splashscreen.html'), 20000)
+    await t.capture(splash, 'splashscreen-early')
+    const main = await targetByLabel(t, 'main')
+    await t.wait(main, `document.body.innerText.trim()`, (value) => value === 'This is the main window!', 10000)
+    await t.wait(main, `document.querySelector('h1')?.textContent ?? ''`, (value) => value === 'This is the main window!', 10000)
+    t.check('splashscreen main content', await text(t, main, 'h1'), 'This is the main window!')
+    await t.target(async (candidate) => candidate.id === main.id && !(await t.targets()).some((item) => item.id === splash.id), 10000)
+    const remainingSplash = (await t.targets()).filter((target) => target.type === 'page' && target.url.includes('splashscreen.html'))
+    t.check('splashscreen closes after timeout', remainingSplash.length, 0)
+    await t.capture(main, 'splashscreen-main')
+    t.note('splashscreen native visibility', 'CDP proves page transition and target destruction; native hidden/visible flags require the desktop runner.')
+  },
+
+  async ['file-associations'](t) {
+    const target = t.main
+    const fixtures = t.fileFixtures
+    assert(Array.isArray(fixtures) && fixtures.length === 2, 'file association fixtures must contain exactly two paths')
+    await t.wait(target, 'Array.isArray(window.openedFiles)', (value) => value === true)
+    t.check('file associations direct argv paths', await t.evaluate(target, 'window.openedFiles'), fixtures)
+    t.check('file associations rendered paths', await text(t, target, '#files'), fixtures.join('\n'))
+    await t.capture(target, 'file-associations-fixtures')
+    t.note('file associations OS registration', 'Direct executable-argument verification only; packaged/native Open-with registration is untested.')
+  },
+
+  async streaming(t) {
+    const target = t.main
+    const video = await t.wait(
+      target,
+      `(async () => {
+        const element = document.querySelector('#video_source')
+        if (!element || !element.currentSrc || !Number.isFinite(element.duration) || element.duration <= 0 || element.readyState < 2) return null
+        element.muted = true
+        let frames = 0
+        const frame = () => { frames += 1; if (frames < 3 && element.requestVideoFrameCallback) element.requestVideoFrameCallback(frame) }
+        if (element.requestVideoFrameCallback) element.requestVideoFrameCallback(frame)
+        const before = element.currentTime
+        await element.play()
+        const deadline = performance.now() + 10000
+        while (performance.now() < deadline && (element.currentTime <= before || frames < 1)) await new Promise((resolve) => setTimeout(resolve, 50))
+        return { src: element.currentSrc, duration: element.duration, before, after: element.currentTime, frames, readyState: element.readyState }
+      })()`,
+      (value) => value && value.duration > 0 && value.after > value.before && value.frames > 0,
+      90000,
+    )
+    t.check('streaming duration is positive', video.duration > 0, true)
+    t.check('streaming playback currentTime increases', video.after > video.before, true)
+    t.check('streaming has decoded video frames', video.frames > 0, true)
+
+    const seek = await t.evaluate(
+      target,
+      `(async () => {
+        const element = document.querySelector('#video_source')
+        const targetTime = Math.min(element.duration / 2, Math.max(0.1, element.duration - 0.1))
+        element.currentTime = targetTime
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('seek timed out')), 10000)
+          element.addEventListener('seeked', () => { clearTimeout(timer); resolve() }, { once: true })
+        })
+        return { requested: targetTime, actual: element.currentTime }
+      })()`,
+      20000,
+    )
+    t.check('streaming seek reaches requested time', Math.abs(seek.actual - seek.requested) < 0.25, true)
+
+    const videoPath = path.join(t.root, '.cache', 'examples', t.name, 'streaming_example_test_video.mp4')
+    assert(fs.existsSync(videoPath), `streaming source file is missing: ${videoPath}`)
+    const bytes = fs.readFileSync(videoPath)
+    const range = await t.evaluate(
+      target,
+      `(async () => {
+        const response = await fetch(${json(video.src)}, { headers: { Range: 'bytes=0-15' } })
+        return { status: response.status, contentRange: response.headers.get('content-range'), bytes: [...new Uint8Array(await response.arrayBuffer())] }
+      })()`,
+      20000,
+    )
+    t.check('streaming range status', range.status, 206)
+    t.check('streaming range content-range', range.contentRange, `bytes 0-15/${bytes.length}`)
+    t.check('streaming range bytes', range.bytes, [...bytes.subarray(0, 16)])
+    await t.capture(target, 'streaming-playing')
+  },
+}

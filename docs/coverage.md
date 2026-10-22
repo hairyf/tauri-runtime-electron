@@ -78,8 +78,8 @@ Every member is implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `with_ios_webview` | 🚫 no Electron equivalent | `src/webview.rs:77` |
-| `reparent` | 🚫 no Electron equivalent | `src/webview.rs:233` |
+| `with_ios_webview` | 🚫 no Electron equivalent | `src/webview.rs:76` |
+| `reparent` | 🚫 no Electron equivalent | `src/webview.rs:232` |
 
 ## WindowBuilder
 

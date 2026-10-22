@@ -19,6 +19,7 @@ const net = require('node:net')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
 
 const logFile = path.join(os.tmpdir(), 'tauri-runtime-electron.log')
 function log(...args) {
@@ -89,6 +90,16 @@ if (!port) {
 // app instead of Electron itself; the window icon travels with the creation
 // request (the runtime extracts it from the executable when it is bundled).
 const appIdentifier = readArg('--tauri-identifier') || undefined
+
+// Verification hook: `TAURI_RUNTIME_ELECTRON_DEBUG_PORT=9222` exposes the
+// DevTools protocol so a test driver can read the DOM and take real screenshots
+// of every window and guest. Switches must be appended before `ready`.
+if (process.env.TAURI_RUNTIME_ELECTRON_DEBUG_PORT) {
+  app.commandLine.appendSwitch(
+    'remote-debugging-port',
+    process.env.TAURI_RUNTIME_ELECTRON_DEBUG_PORT,
+  )
+}
 
 // Chromium names its profile after the executable, and every app here runs the
 // same cached `electron.exe`, so without this every Tauri app on this runtime
@@ -450,7 +461,7 @@ function applyWindowConfig(window, config, params) {
   if (config.dragDropEnabled === false) {
     // Electron has no window-level drop switch; block the page's drop events.
     window.webContents.on('did-finish-load', () => {
-      window.webContents.executeJavaScript(
+      window.webContents.mainFrame.executeJavaScript(
         "for (const type of ['dragenter', 'dragover', 'drop']) document.addEventListener(type, (event) => { event.preventDefault(); event.stopPropagation() }, true)",
       )
     })
@@ -540,6 +551,7 @@ async function createWindow(params) {
     : undefined
   log('window.create', JSON.stringify({ windowId, label: params.label }))
   const window = new BrowserWindow(browserWindowOptions(config, params, iconImage, iconPath))
+  trackDocument(window.webContents)
   windows.set(windowId, window)
   closableState.set(window, config.closable !== false)
   decoratedState.set(window, config.decorations !== false)
@@ -596,6 +608,10 @@ async function createWindow(params) {
 
   const webview = params.webview
   if (webview) return loadWebview(window, webview)
+  // A `Window` without a webview still needs a document: its children are
+  // `<webview>` guests appended to this page, and executeJavaScript never
+  // settles on a webContents that has never navigated.
+  window.loadURL('about:blank').catch((error) => log('about:blank failed', serializeError(error)))
   return { windowId }
 }
 
@@ -637,7 +653,7 @@ function wireWebviewEvents(contents, webviewId) {
 function writeInitPreload(webviewId, initScripts) {
   const scripts = initScripts ?? []
   if (!scripts.length) return path.join(__dirname, 'preload.cjs')
-  const file = path.join(os.tmpdir(), `tauri-runtime-electron-preload-${webviewId}.cjs`)
+  const file = path.join(os.tmpdir(), `tauri-runtime-electron-preload-${process.pid}-${webviewId}.cjs`)
   const source = `'use strict'
 const { contextBridge, ipcRenderer, webFrame } = require('electron')
 contextBridge.exposeInMainWorld('ipc', {
@@ -657,53 +673,143 @@ for (const source of ${JSON.stringify(scripts)}) {
   return file
 }
 
+// Only the bundled app's root needs an explicit entry file. External URLs and
+// isolation schemes have their own routing (isolation serves its document at /).
+function webviewUrl(url) {
+  const parsed = new URL(url)
+  if (parsed.protocol === 'tauri:' && parsed.pathname === '/') {
+    parsed.pathname = '/index.html'
+    return parsed.href
+  }
+  return url
+}
+
 function loadWebview(window, webview) {
-  const { webviewId, url } = webview
+  const { webviewId } = webview
+  const url = webviewUrl(webview.url)
   webviews.set(webviewId, window)
   webviewByContents.set(window.webContents.id, webviewId)
   recordPolicy(webviewId, webview.policy)
   wireWebviewEvents(window.webContents, webviewId)
   // Do not await: the page may need a `protocol.request` round trip to the Rust
   // runtime, which only starts pumping events after this call returns.
+  log('loadURL', url)
   window.loadURL(url).catch((error) => log('loadURL failed', url, serializeError(error)))
   return { windowId: webviewId }
 }
 
-/**
- * Additional webviews on an already loaded window are real Chromium guests:
- * a `<webview>` element appended to the page, exactly how an app would embed
- * one itself.
- */
-function attachWebviewElement(window, webview) {
-  const { webviewId, url, initScripts } = webview
+// DOM readiness is independent of outstanding images, streams and subframes.
+const readyDocuments = new WeakSet()
+function trackDocument(contents) {
+  contents.on('did-start-navigation', (details) => {
+    if (details.isMainFrame && !details.isSameDocument) readyDocuments.delete(contents)
+  })
+  contents.on('dom-ready', () => readyDocuments.add(contents))
+}
+
+function pageReady(window) {
+  const contents = window.webContents
+  if (contents.isDestroyed()) return Promise.reject(new Error('window page was destroyed'))
+  if (readyDocuments.has(contents)) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const finish = (error) => {
+      clearTimeout(timer)
+      contents.off('dom-ready', onReady)
+      contents.off('destroyed', onDestroyed)
+      contents.off('did-fail-load', onFailure)
+      if (error) reject(error)
+      else resolve()
+    }
+    const onReady = () => finish()
+    const onDestroyed = () => finish(new Error('window page was destroyed'))
+    const onFailure = (_event, code, description, _url, isMainFrame) => {
+      if (isMainFrame) finish(new Error(`window page failed to load: ${code} ${description}`))
+    }
+    const timer = setTimeout(() => finish(new Error('window page did not become ready')), 10000)
+    contents.once('dom-ready', onReady)
+    contents.once('destroyed', onDestroyed)
+    contents.on('did-fail-load', onFailure)
+  })
+}
+
+// Runs in the host renderer. Percentages keep all four coordinates proportional
+// when auto resize is enabled; fixed views retain CSS pixel bounds.
+function placeGuest(element, bounds, autoResize) {
+  bounds ??= element.getBoundingClientRect()
+  autoResize ??= element.dataset.tauriAutoResize === 'true'
+  const length = (value, total) => autoResize ? `${100 * value / total}%` : `${value}px`
+  Object.assign(element.style, {
+    position: 'absolute', right: 'auto', bottom: 'auto',
+    left: length(bounds.x, innerWidth), top: length(bounds.y, innerHeight),
+    width: length(bounds.width, innerWidth), height: length(bounds.height, innerHeight),
+  })
+  element.dataset.tauriAutoResize = String(autoResize)
+}
+
+function guestBounds(window, bounds) {
+  if (!bounds) {
+    const [width, height] = window.getContentSize()
+    return { x: 0, y: 0, width, height }
+  }
+  return {
+    x: toDip(window, bounds.position, 'x'), y: toDip(window, bounds.position, 'y'),
+    width: toDip(window, bounds.size, 'width'), height: toDip(window, bounds.size, 'height'),
+  }
+}
+
+async function attachWebviewElement(window, webview) {
+  const { webviewId, url, initScripts, bounds, autoResize } = webview
   webviews.set(webviewId, window)
   recordPolicy(webviewId, webview.policy)
   const elementId = `tauri-webview-${webviewId}`
-  const code = `(async () => {
+  // Creating the element is all this call may wait for: the guest asks the Rust
+  // runtime for its page (`tauri://` goes through the protocol round trip), and
+  // the runtime is blocked in this very call until it answers. Waiting for the
+  // guest to load here would deadlock; the load reports itself later through the
+  // usual webview events.
+  const code = `(() => {
     const element = document.createElement('webview')
     element.id = ${JSON.stringify(elementId)}
     element.setAttribute('webpreferences', 'contextIsolation=yes,sandbox=yes')
-    element.setAttribute('preload', ${JSON.stringify(writeInitPreload(webviewId, initScripts))})
-    element.src = ${JSON.stringify(url)}
-    element.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;'
+    element.setAttribute('preload', ${JSON.stringify(pathToFileURL(writeInitPreload(webviewId, initScripts)).href)})
+    element.dataset.tauriSource = ${JSON.stringify(webviewUrl(url))}
+    element.src = 'about:blank'
+    ;(${placeGuest.toString()})(element, ${JSON.stringify(guestBounds(window, bounds))}, ${Boolean(autoResize)})
     document.body.appendChild(element)
-    // The guest id only exists once the element is attached and loaded.
-    await new Promise((resolve, reject) => {
-      element.addEventListener('dom-ready', resolve, { once: true })
-      setTimeout(() => reject(new Error('webview dom-ready timed out')), 10000)
-    })
-    return element.getWebContentsId()
+    return true
   })()`
-  return window.webContents
-    .executeJavaScript(code, true)
-    .then((contentsId) => {
-      if (typeof contentsId === 'number') {
-        webviewByContents.set(contentsId, webviewId)
-        guestContentsIds.set(webviewId, contentsId)
-        wireWebviewEvents(webContents.fromId(contentsId), webviewId)
-      }
-      return { webviewId }
-    })
+  await pageReady(window)
+  let cleanup
+  const attached = new Promise((resolve, reject) => {
+    cleanup = () => {
+      clearTimeout(timer)
+      window.webContents.off('did-attach-webview', onAttach)
+      window.webContents.off('destroyed', onDestroyed)
+    }
+    const onAttach = (_event, guest) => {
+      cleanup()
+      // Register before guest navigation can send its first IPC message.
+      webviewByContents.set(guest.id, webviewId)
+      guestContentsIds.set(webviewId, guest.id)
+      wireWebviewEvents(guest, webviewId)
+      // Navigation needs the Rust loop, so acknowledge attachment immediately.
+      guest.loadURL(webviewUrl(url)).catch((error) => log('guest load failed', webviewId, serializeError(error)))
+      resolve(guest)
+    }
+    const onDestroyed = () => { cleanup(); reject(new Error('window page was destroyed')) }
+    const timer = setTimeout(() => { cleanup(); reject(new Error('guest did not attach to the window page')) }, 10000)
+    window.webContents.on('did-attach-webview', onAttach)
+    window.webContents.once('destroyed', onDestroyed)
+  })
+  try {
+    // WebContents.executeJavaScript waits for all loading resources; the frame
+    // API can run as soon as this document's DOM is ready.
+    const [guest] = await Promise.all([attached, window.webContents.mainFrame.executeJavaScript(code, true)])
+    log('webview.attach', webviewId, 'attached', guest.id)
+    return { webviewId }
+  } finally {
+    cleanup()
+  }
 }
 
 /** The webContents that belongs to `webviewId`: the window page or a guest. */
@@ -741,7 +847,7 @@ function readWebviewBounds(webviewId) {
     }
   }
   const elementId = `tauri-webview-${webviewId}`
-  return window.webContents
+  return pageReady(window).then(() => window.webContents.mainFrame
     .executeJavaScript(
       `(() => {
         const element = document.getElementById(${JSON.stringify(elementId)})
@@ -750,19 +856,18 @@ function readWebviewBounds(webviewId) {
         return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
       })()`,
       true
-    )
+    ))
     .then((rect) => {
       const origin = window.getContentBounds()
       const toPhysical = (value) => Math.round(value * scaleFactor)
-      const clamp = (value, max) => Math.max(0, Math.min(value, max))
       return {
         scaleFactor,
         bounds: rect
           ? {
-              x: toPhysical(origin.x + rect.x),
-              y: toPhysical(origin.y + rect.y),
-              width: clamp(toPhysical(rect.width), toPhysical(origin.width)),
-              height: clamp(toPhysical(rect.height), toPhysical(origin.height)),
+              x: toPhysical(rect.x),
+              y: toPhysical(rect.y),
+              width: toPhysical(rect.width),
+              height: toPhysical(rect.height),
             }
           : { x: 0, y: 0, width: 0, height: 0 },
         contentBounds: { x: 0, y: 0, width: toPhysical(origin.width), height: toPhysical(origin.height) },
@@ -882,16 +987,18 @@ function setWindowPosition(window, params) {
 }
 
 function handle(method, params) {
+  if (process.env.TAURI_RUNTIME_ELECTRON_DEBUG) log('ipc', method, JSON.stringify(params).slice(0, 200))
   switch (method) {
     case 'window.create':
       return createWindow(params)
     case 'webview.create': {
       const window = windows.get(params.windowId)
       if (!window) throw new Error(`unknown window ${params.windowId}`)
-      // The first webview of a window owns the page; later ones are guests.
+      // `window.create` already hosts the page when its payload carries a
+      // webview, so a later `webview.create` is always an additional guest.
+      // A plain `Window` hosts no page at all: its children are guests too.
       if (!mainWebview.has(params.windowId)) {
         mainWebview.set(params.windowId, params.webviewId)
-        return loadWebview(window, params)
       }
       return attachWebviewElement(window, params)
     }
@@ -1043,7 +1150,12 @@ function handle(method, params) {
       return null
     }
     case 'webview.navigate':
-      return contentsFor(params.webviewId).loadURL(params.url).then(() => null)
+      log('webview.navigate', params.url)
+      // Like creation, navigation may request a Rust-backed custom protocol.
+      // Acknowledge dispatch, not completion: the caller must keep pumping it.
+      contentsFor(params.webviewId).loadURL(webviewUrl(params.url))
+        .catch((error) => log('navigate failed', params.url, serializeError(error)))
+      return null
     case 'webview.openUrl': {
       // `NewWindowResponse::Allow`: the engine, not Tauri, owns this window.
       const popup = new BrowserWindow({
@@ -1058,11 +1170,16 @@ function handle(method, params) {
       contentsFor(params.webviewId).reload()
       return null
     case 'webview.setAutoResize': {
-      const contents = contentsFor(params.webviewId)
-      if (typeof contents.setAutoResize === 'function') {
-        contents.setAutoResize({ width: params.autoResize, height: params.autoResize })
-      }
-      return null
+      if (!guestContentsIds.has(params.webviewId)) return null
+      const window = findWebview(params.webviewId)
+      const elementId = `tauri-webview-${params.webviewId}`
+      return pageReady(window)
+        .then(() => window.webContents.mainFrame.executeJavaScript(`(() => {
+          const element = document.getElementById(${JSON.stringify(elementId)})
+          if (!element) throw new Error('unknown webview element')
+          ;(${placeGuest.toString()})(element, null, ${Boolean(params.autoResize)})
+        })()`, true))
+        .then(() => null)
     }
     case 'webview.goBack':
       // canGoBack()/goBack() on webContents are deprecated; the history object is not.
@@ -1235,20 +1352,17 @@ function handle(method, params) {
     case 'webview.setBounds': {
       const window = findWebview(params.webviewId)
       if (!guestContentsIds.has(params.webviewId)) return null
-      const scale = scaleOf(window)
-      const dip = (value) => Math.round(value / scale)
       const elementId = `tauri-webview-${params.webviewId}`
-      const style = `position:absolute;left:${dip(params.x)}px;top:${dip(params.y)}px;width:${dip(
-        params.width
-      )}px;height:${dip(params.height)}px`
-      return window.webContents
-        .executeJavaScript(
+      const bounds = guestBounds(window, params)
+      return pageReady(window)
+        .then(() => window.webContents.mainFrame.executeJavaScript(
           `(() => {
             const el = document.getElementById(${JSON.stringify(elementId)})
-            if (el) el.style.cssText = ${JSON.stringify(style)}
+            if (!el) throw new Error('unknown webview element')
+            ;(${placeGuest.toString()})(el, ${JSON.stringify(bounds)})
           })()`,
-          true
-        )
+          true,
+        ))
         .then(() => null)
     }
     case 'webview.visibility': {
@@ -1260,28 +1374,28 @@ function handle(method, params) {
       }
       const elementId = `tauri-webview-${params.webviewId}`
       const visible = JSON.stringify(Boolean(params.visible))
-      return window.webContents
+      return pageReady(window).then(() => window.webContents.mainFrame
         .executeJavaScript(
           `(() => {
             const el = document.getElementById(${JSON.stringify(elementId)})
             if (el) el.style.visibility = ${visible} ? 'visible' : 'hidden'
           })()`,
           true
-        )
+        ))
         .then(() => null)
     }
     case 'webview.backgroundColor': {
       const window = findWebview(params.webviewId)
       if (!guestContentsIds.has(params.webviewId)) return null
       const elementId = `tauri-webview-${params.webviewId}`
-      return window.webContents
+      return pageReady(window).then(() => window.webContents.mainFrame
         .executeJavaScript(
           `(() => {
             const el = document.getElementById(${JSON.stringify(elementId)})
             if (el) el.style.backgroundColor = ${JSON.stringify(params.color ?? 'transparent')}
           })()`,
           true
-        )
+        ))
         .then(() => null)
     }
     case 'webview.focus': {
@@ -1291,11 +1405,11 @@ function handle(method, params) {
         return null
       }
       const elementId = `tauri-webview-${params.webviewId}`
-      return window.webContents
+      return pageReady(window).then(() => window.webContents.mainFrame
         .executeJavaScript(
           `(() => { document.getElementById(${JSON.stringify(elementId)})?.focus() })()`,
           true
-        )
+        ))
         .then(() => null)
     }
     case 'webview.print': {
@@ -1310,11 +1424,11 @@ function handle(method, params) {
       }
       const window = findWebview(params.webviewId)
       const elementId = `tauri-webview-${params.webviewId}`
-      return window.webContents
+      return pageReady(window).then(() => window.webContents.mainFrame
         .executeJavaScript(
           `(() => { document.getElementById(${JSON.stringify(elementId)})?.remove() })()`,
           true
-        )
+        ))
         .then(() => {
           webviewByContents.delete(guestId)
           guestContentsIds.delete(params.webviewId)
@@ -1347,7 +1461,11 @@ function handle(method, params) {
       const { scheme } = params
       if (registeredSchemes.has(scheme)) return null
       registeredSchemes.add(scheme)
-      protocol.handle(scheme, (request) => dispatchProtocol(scheme, request))
+      // A protocol Request cannot identify its native caller. Commands must
+      // use the authenticated tauri-ipc bridge, never the first scheme owner.
+      protocol.handle(scheme, scheme === 'ipc'
+        ? () => new Response('Use native IPC', { status: 403 })
+        : (request) => dispatchProtocol(scheme, request))
       return null
     }
     case 'protocol.respond': {
@@ -1377,6 +1495,7 @@ function onLine(line) {
   Promise.resolve()
     .then(() => handle(message.method, message.params ?? {}))
     .then((result) => {
+      if (process.env.TAURI_RUNTIME_ELECTRON_DEBUG) log('ipc done', message.method)
       send({ id: message.id, result: result ?? null })
     })
     .catch((error) => {
@@ -1387,13 +1506,14 @@ function onLine(line) {
 
 ipcMain.on('tauri-ipc', (event, data) => {
   const webviewId = webviewByContents.get(event.sender.id)
-  if (webviewId === undefined) {
-    log('ipc message from unknown contents', event.sender.id)
+  const frame = event.senderFrame
+  if (webviewId === undefined || !frame || frame !== event.sender.mainFrame || typeof data !== 'string') {
+    log('ipc message from unknown contents or subframe', event.sender.id)
     return
   }
   send({
     event: 'ipc.message',
-    params: { webviewId, url: event.sender.getURL(), body: data },
+    params: { webviewId, url: frame.url, body: data },
   })
 })
 

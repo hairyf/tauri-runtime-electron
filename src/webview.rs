@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use crate::runtime::{ElectronRuntime, Message, RuntimeContext, IPC_TIMEOUT, create_webview_err};
+use crate::runtime::{
+  ElectronRuntime, Message, RuntimeContext, IPC_TIMEOUT, create_webview_err,
+  position_payload, size_payload,
+};
 use serde_json::{json, Value};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -34,16 +37,12 @@ impl ElectronWebviewDispatcher {
 
   /// Moves and resizes a guest by restyling its `<webview>` element.
   fn apply_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
-    let position = bounds.position.to_physical::<i32>(1.0);
-    let size = bounds.size.to_physical::<u32>(1.0);
     self
       .webview_call(
         "webview.setBounds",
         json!({
-          "x": position.x,
-          "y": position.y,
-          "width": size.width,
-          "height": size.height,
+          "position": position_payload(bounds.position),
+          "size": size_payload(bounds.size),
         }),
       )
       .map(|_| ())
@@ -214,13 +213,13 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
 
   fn set_size(&self, size: Size) -> Result<()> {
     let mut bounds = self.rectangle()?;
-    bounds.size = Size::Physical(size.to_physical::<u32>(1.0));
+    bounds.size = size;
     self.apply_bounds(bounds)
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
     let mut bounds = self.rectangle()?;
-    bounds.position = Position::Physical(position.to_physical::<i32>(1.0));
+    bounds.position = position;
     self.apply_bounds(bounds)
   }
 

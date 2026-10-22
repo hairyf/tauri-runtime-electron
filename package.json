@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "example": "node scripts/example.mjs",
-    "coverage": "node scripts/coverage.mjs"
+    "coverage": "node scripts/coverage.mjs",
+    "verify:examples": "node scripts/verify-examples.mjs"
   }
 }

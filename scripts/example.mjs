@@ -3,9 +3,11 @@
 //
 //   pnpm example <name>          # or: node scripts/example.mjs <name>
 //   pnpm example --list
+//   pnpm example <name> --build-only
+//   pnpm example file-associations -- <file paths>
 //
 // Each example is staged under .cache/examples/<name>, its runtime is swapped
-// for this crate, and `cargo run` starts it. Examples with a Vite frontend get
+// for this crate, and the built binary starts it. Examples with a Vite frontend get
 // the dev server on :1420; the rest embed their `frontendDist` at build time.
 // Ctrl+C stops the app, cargo and Vite.
 
@@ -19,9 +21,26 @@ const examplesDir = path.join(repoRoot, 'source', 'tauri', 'examples')
 const cacheRoot = path.join(repoRoot, '.cache', 'examples')
 const PORT = 1420
 
-const args = process.argv.slice(2)
-const flags = new Set(args.filter((arg) => arg.startsWith('--')))
-const name = args.find((arg) => !arg.startsWith('--'))
+export function parseArgs(args) {
+  const separator = args.indexOf('--')
+  const options = separator < 0 ? args : args.slice(0, separator)
+  const flags = new Set(options.filter((arg) => arg.startsWith('-')))
+  for (const flag of flags) {
+    if (!['--list', '--clean', '--no-install', '--build-only', '--debug'].includes(flag)) {
+      throw new Error(`unknown option ${flag}; put app arguments after --`)
+    }
+  }
+  const names = options.filter((arg) => !arg.startsWith('-'))
+  if (names.length > 1) throw new Error('expected one example name; put app arguments after --')
+  if (names[0] && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(names[0])) {
+    throw new Error('example name must be a name from --list, not a path')
+  }
+  return { name: names[0], flags, appArgs: separator < 0 ? [] : args.slice(separator + 1) }
+}
+
+let flags = new Set()
+let name
+let appArgs = []
 
 let viteProc = null
 let cargoProc = null
@@ -29,12 +48,12 @@ let shuttingDown = false
 let tauriFeatures = ['unstable', 'tray-icon', 'image-png', 'image-ico', 'devtools']
 let exampleResources = []
 
-function listExamples() {
-  const names = fs
+export function exampleNames() {
+  return fs
     .readdirSync(examplesDir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
     .map((entry) => entry.name)
-    .filter((entry) => entry !== 'cef' && entry !== 'README.md')
+    .filter((entry) => entry !== 'cef')
     .filter((entry) => {
       const dir = path.join(examplesDir, entry)
       return (
@@ -42,7 +61,11 @@ function listExamples() {
         fs.existsSync(path.join(dir, 'main.rs'))
       )
     })
-  console.log(`usage: pnpm example <name>\n\nrunnable examples:\n  ${names.join('\n  ')}`)
+    .sort()
+}
+
+function listExamples() {
+  console.log(`usage: pnpm example <name> [--build-only] [-- app arguments]\n\nrunnable examples:\n  ${exampleNames().join('\n  ')}\n\ncef: CEF-specific APIs cannot be swapped to Electron`)
 }
 
 function fail(message) {
@@ -77,44 +100,40 @@ function ensureExampleSource() {
   if (result.status !== 0) fail('could not check out source/tauri (are you offline?)')
 }
 
-function stageConf(confPath, useVite) {
-  const conf = JSON.parse(read(confPath))
+export function configure(conf, useVite) {
   conf.$schema = 'https://schema.tauri.app/config/3'
   conf.identifier = `com.tauri.${conf.identifier.replace(/[^a-z0-9.]/gi, '-')}`
-  conf.productName = `${conf.productName ?? name} (Electron)`
+  conf.productName = `${conf.productName ?? conf.identifier} (Electron)`
+  conf.build ??= {}
   conf.build.beforeDevCommand = ''
   conf.build.beforeBuildCommand = ''
-  if (useVite) {
-    conf.build.devUrl = `http://localhost:${PORT}`
-  } else {
-    delete conf.build.devUrl
-  }
-  // The CLI plugin is not registered by these apps, isolation needs a runtime
-  // feature this one does not have, and the IPC transport is outside the CSP.
-  delete conf.plugins
-  delete conf.app.security.pattern
-  conf.app.security.csp = null
+  if (useVite) conf.build.devUrl = `http://localhost:${PORT}`
+  else delete conf.build.devUrl
+  conf.bundle ??= {}
   conf.bundle.active = false
-  conf.bundle.icon =
-    conf.bundle.icon
-      ?.map((icon) => path.basename(icon))
-      .filter((icon) => fs.existsSync(path.join(path.dirname(confPath), '..', '.icons', icon))) ??
-    []
-  // Remember what the example bundles so it can be staged next to the binary,
-  // then keep only the mapping this runtime needs to find Electron.
-  exampleResources = Array.isArray(conf.bundle.resources)
-    ? conf.bundle.resources
-    : Object.keys(conf.bundle.resources ?? {}).map((key) => key)
-  conf.bundle.resources = { 'target/electron': 'runtime' }
+  return conf
+}
+
+function stageConf(confPath, useVite) {
+  const conf = configure(JSON.parse(read(confPath)), useVite)
+  conf.bundle.icon = (conf.bundle.icon ?? [])
+    .map((icon) => path.basename(icon))
+    .filter((icon) => fs.existsSync(path.join(path.dirname(confPath), icon)))
+  // Keep security policy and resource targets exactly as the example declared.
+  // The runtime build script already stages Electron into the shared target.
+  exampleResources = conf.bundle.resources ?? []
   write(confPath, JSON.stringify(conf, null, 2) + '\n')
-  // tauri-build refuses features the config does not allow, so follow the config.
+  // tauri-build checks both dependencies against the security configuration.
   tauriFeatures = ['unstable', 'tray-icon', 'image-png', 'image-ico', 'devtools']
   if (conf.app?.security?.assetProtocol?.enable) tauriFeatures.push('protocol-asset')
-  if (conf.app?.macOSPrivateApi) tauriFeatures.push('macos-private-api')
+  if (conf.app?.security?.pattern?.use === 'isolation') tauriFeatures.push('isolation')
 }
 
 function patchRuntime(file) {
-  const source = read(file)
+  const original = read(file)
+  // `main.rs` frequently only calls into `lib.rs`, which is where the builder is.
+  if (!original.includes('tauri_runtime_wry')) return
+  const source = original
     .replaceAll('tauri_runtime_wry::Wry::default()', 'tauri_runtime_electron::Electron::default()')
     // The examples live inside the Tauri workspace, so they point at the
     // config through a relative path that does not exist once staged.
@@ -129,6 +148,31 @@ function crateName() {
   return name.replace(/[^a-z0-9]+/gi, '_')
 }
 
+export function appManifest(original, exampleName, features) {
+  const tauri = `tauri = { version = "=3.0.0-alpha.5", features = ${JSON.stringify(features)} }`
+  const build = `tauri-build = { version = "=3.0.0-alpha.4", features = ${JSON.stringify(['codegen', ...features.filter((feature) => feature === 'isolation')])} }`
+  const runtime = `tauri-runtime-electron = { path = ${JSON.stringify(repoRoot.replaceAll('\\', '/'))} }`
+  // Keep upstream lib names, plugin dependencies, target tables and cfg features;
+  // only workspace/runtime dependencies need to become standalone dependencies.
+  return original.split(/(?=^\[[^\n]+\])/m).map((section) => {
+    const heading = section.match(/^\[([^\n]+)\]/)?.[1]
+    if (/^(?:dev-)?dependencies\.tauri(?:-runtime-(?:wry|cef))?$/.test(heading ?? '')) return ''
+    if (heading === 'package') return section.replace(/^name\s*=.*$/m, `name = ${JSON.stringify(exampleName)}`)
+    if (heading === 'build-dependencies') {
+      return section.replace(/^tauri-build\s*=\s*\{[^}]*\}/m, build)
+    }
+    if (heading === 'dependencies') {
+      return section.replace(/^tauri(?:-runtime-(?:wry|cef))?\s*=\s*\{[^}]*\}[^\S\n]*\n?/gm, '')
+        .replace('[dependencies]', `[dependencies]\n${tauri}\n${runtime}`)
+    }
+    if (heading === 'features') {
+      return section.replace(/^default\s*=.*$/m, 'default = []')
+        .replace(/^(wry|cef)\s*=.*$/gm, '$1 = []')
+    }
+    return section
+  }).join('') + `\n[[bin]]\nname = ${JSON.stringify(exampleName)}\npath = "src/main.rs"\n`
+}
+
 function manifest(rustSources, extraDeps, binPath) {
   const source = rustSources.map((file) => read(file)).join('\n')
   const deps = [
@@ -139,6 +183,9 @@ function manifest(rustSources, extraDeps, binPath) {
   ]
   if (/\bhttp::/.test(source)) deps.push('http = "1"')
   if (/\bhttp_range::/.test(source)) deps.push('http-range = "0.1"')
+  if (/\bpercent_encoding::/.test(source)) deps.push('percent-encoding = "2"')
+  if (/\bgetrandom::/.test(source)) deps.push('getrandom = "0.3"')
+  if (/\burl::/.test(source)) deps.push('url = "2"')
   const repoPath = repoRoot.replaceAll('\\', '/')
   return `[package]
 name = "${crateName()}"
@@ -156,7 +203,7 @@ default = []
 cef = []
 
 [build-dependencies]
-tauri-build = { version = "3.0.0-alpha.4", features = ["codegen"] }
+tauri-build = { version = "=3.0.0-alpha.4", features = ${JSON.stringify(['codegen', ...tauriFeatures.filter((feature) => feature === 'isolation')])} }
 
 [dependencies]
 ${deps.join('\n')}
@@ -189,8 +236,8 @@ function stageFlat(dir, dst) {
   for (const entry of entries) copyTree(path.join(dir, entry), path.join(dst, entry))
   const mainRs = path.join(dst, 'main.rs')
   patchRuntime(mainRs)
-  stageConf(path.join(dst, 'tauri.conf.json'), false)
   copyCrateIcons(dst)
+  stageConf(path.join(dst, 'tauri.conf.json'), false)
   write(path.join(dst, 'build.rs'), BUILD_RS)
   write(path.join(dst, 'Cargo.toml'), manifest([mainRs], [], 'main.rs'))
   return dst
@@ -217,7 +264,6 @@ function stageApp(dir, dst) {
   }
 
   const sampleDir = path.join(tauriDir, 'tauri-plugin-sample')
-  const extra = []
   if (fs.existsSync(sampleDir)) {
     const sampleManifest = path.join(sampleDir, 'Cargo.toml')
     write(
@@ -232,11 +278,19 @@ function stageApp(dir, dst) {
           'tauri-plugin = { version = "3.0.0-alpha.4", features = ["build"] }',
         ),
     )
-    extra.push('tauri-plugin-sample = { path = "./tauri-plugin-sample/" }')
   }
   copyCrateIcons(tauriDir)
   stageConf(path.join(tauriDir, 'tauri.conf.json'), hasVite(dst))
-  write(path.join(tauriDir, 'Cargo.toml'), manifest(rustSources, extra, 'src/main.rs'))
+  const cargo = path.join(tauriDir, 'Cargo.toml')
+  write(cargo, appManifest(read(cargo), crateName(), tauriFeatures))
+  const packageFile = path.join(dst, 'package.json')
+  if (fs.existsSync(packageFile)) {
+    const pkg = JSON.parse(read(packageFile))
+    if (pkg.dependencies?.['@tauri-apps/api']) {
+      pkg.dependencies['@tauri-apps/api'] = '3.0.0-alpha.3'
+      write(packageFile, JSON.stringify(pkg, null, 2) + '\n')
+    }
+  }
   return tauriDir
 }
 
@@ -246,12 +300,17 @@ function hasVite(dir) {
 
 function stage() {
   ensureExampleSource()
-  const source = path.join(examplesDir, name)
-  if (!fs.existsSync(source)) {
+  if (name === 'cef') fail('cef uses CEF-specific extension APIs and cannot be swapped to Electron')
+  if (!exampleNames().includes(name)) {
     listExamples()
-    process.exit(1)
+    fail(`unknown example ${name}`)
   }
-  const dst = path.join(cacheRoot, name)
+  const source = path.join(examplesDir, name)
+  const dst = path.resolve(cacheRoot, name)
+  if (path.dirname(dst) !== cacheRoot || fs.lstatSync(source).isSymbolicLink()) {
+    fail('example paths must stay inside the worktree')
+  }
+  if (fs.existsSync(dst) && fs.lstatSync(dst).isSymbolicLink()) fail('staging directory must not be a symlink')
   if (flags.has('--clean')) fs.rmSync(dst, { recursive: true, force: true })
   fs.mkdirSync(dst, { recursive: true })
   console.log(`[example] staging ${path.relative(repoRoot, dst)}`)
@@ -356,14 +415,49 @@ function stageResources(crate, binDir) {
   }
 }
 
+function prepareVideo(crate) {
+  if (name !== 'streaming') return
+  const file = path.join(crate, 'streaming_example_test_video.mp4')
+  const valid = () => {
+    if (!fs.existsSync(file)) return false
+    const fd = fs.openSync(file, 'r')
+    try {
+      const header = Buffer.alloc(12)
+      return fs.readSync(fd, header) === 12 && header.toString('ascii', 4, 8) === 'ftyp'
+    } finally { fs.closeSync(fd) }
+  }
+  if (valid()) return
+  // Upstream curl accepts an HTTP proxy's error page as a successful download.
+  // Fetch the same fixture over HTTPS and fail before launching on bad data.
+  const url = read(path.join(crate, 'main.rs')).match(/"(http:\/\/commondatastorage[^\"]+\.mp4)"/)?.[1]
+  if (!url) fail('upstream streaming video URL changed')
+  const temp = file + '.part'
+  const result = spawnSync('curl', ['--fail', '--location', '--retry', '2', '--max-time', '180', '--output', temp, url.replace('http:', 'https:')], { stdio: 'inherit' })
+  if (result.error || result.status !== 0) fail('streaming fixture download failed')
+  fs.renameSync(temp, file)
+  if (!valid()) fail('streaming fixture is not an MP4 file')
+}
+
 function runApp(crate) {
   console.log(`\n[example] Tauri ${name} example on the Electron runtime\n`)
-  const build = spawnSync('cargo', ['build'], { cwd: crate, stdio: 'inherit' })
+  prepareVideo(crate)
+  // One target directory for every example: dependencies are compiled once
+  // instead of once per example (a full tauri build is ~2 GB).
+  const targetDir = path.join(cacheRoot, 'target')
+  const build = spawnSync('cargo', ['build'], {
+    cwd: crate,
+    stdio: 'inherit',
+    env: { ...process.env, CARGO_TARGET_DIR: targetDir },
+  })
   if (build.status !== 0) fail('cargo build failed')
-  const binDir = path.join(crate, 'target', 'debug')
+  const binDir = path.join(targetDir, 'debug')
   stageResources(crate, binDir)
   const binary = path.join(binDir, crateName() + (process.platform === 'win32' ? '.exe' : ''))
-  cargoProc = spawn(binary, [], {
+  if (flags.has('--build-only')) {
+    console.log(`[example] built ${binary}`)
+    return
+  }
+  cargoProc = spawn(binary, appArgs, {
     cwd: crate,
     stdio: 'inherit',
     detached: process.platform !== 'win32',
@@ -378,12 +472,13 @@ function runApp(crate) {
 }
 
 async function main() {
+  ;({ flags, name, appArgs } = parseArgs(process.argv.slice(2)))
   if (flags.has('--list') || !name) {
     listExamples()
     return
   }
   const { crate, frontend } = stage()
-  if (hasVite(frontend)) {
+  if (!flags.has('--build-only') && hasVite(frontend)) {
     if (!flags.has('--no-install')) installDeps(frontend)
     await assertPortFree()
     startVite(frontend)
@@ -392,15 +487,16 @@ async function main() {
   runApp(crate)
 }
 
-process.on('SIGINT', () => shutdown(0))
-process.on('SIGTERM', () => shutdown(0))
-if (process.platform !== 'win32') process.on('SIGHUP', () => shutdown(0))
-process.on('exit', () => {
-  kill(viteProc)
-  kill(cargoProc)
-})
-
-main().catch((error) => {
-  if (flags.has('--debug')) console.error(error)
-  fail(error.message)
-})
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.on('SIGINT', () => shutdown(0))
+  process.on('SIGTERM', () => shutdown(0))
+  if (process.platform !== 'win32') process.on('SIGHUP', () => shutdown(0))
+  process.on('exit', () => {
+    kill(viteProc)
+    kill(cargoProc)
+  })
+  main().catch((error) => {
+    if (flags.has('--debug')) console.error(error)
+    fail(error.message)
+  })
+}

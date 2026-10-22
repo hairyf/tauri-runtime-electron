@@ -121,8 +121,29 @@ upstream workspace normally supplies, and launches it — so any of Tauri's
 examples can be poked at by hand. Examples with a Vite frontend (`api`) get the
 dev server on port 1420; the rest keep their `frontendDist` assets.
 
-`--clean` wipes the staged copy first and `--no-install` skips the frontend
-install. Ctrl+C stops the app, cargo and Vite.
+`--clean` wipes the staged copy first, `--build-only` compiles without opening
+windows, and `--no-install` skips the frontend install. Pass application arguments
+after `--`, for example `pnpm example file-associations -- "C:/files/hello world.txt"`.
+Ctrl+C stops the app, cargo and Vite. The original isolation pattern, CSP,
+capabilities and resource declarations are retained; the streaming fixture is
+fetched over HTTPS and checked for an MP4 header before use.
+
+For reproducible actions and keyframes on a Windows desktop:
+
+```bash
+pnpm verify:examples                  # all 13 examples
+pnpm verify:examples commands state   # selected examples
+node scripts/verify-runtime.mjs       # offline helper regressions, not UI proof
+```
+
+The acceptance driver uses real application controls, checks Rust responses,
+window events, native drags/resizes, isolation ciphertext and decoded video
+frames, and saves screenshots plus JSON evidence under `.cache/acceptance`.
+Every screenshot starts with `inspected: false`; automated assertions alone do
+not establish a visual pass. Missing external pages, unavailable devices and
+native features outside a check's scope are recorded as `UNVERIFIED`.
+The CI Windows desktop job uploads the complete evidence even when a case fails;
+the three-platform smoke jobs remain separate from this desktop acceptance.
 
 ---
 

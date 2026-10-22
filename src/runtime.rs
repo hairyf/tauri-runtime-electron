@@ -1523,7 +1523,7 @@ pub(crate) fn create_window_impl<T: UserEvent>(
     payload["webview"] = json!({
       "webviewId": webview_id,
       "url": context.resolve_url(&webview.webview_attributes.url),
-      "initScripts": initialization_scripts(webview),
+      "initScripts": initialization_scripts(webview)?,
       "policy": policy,
     });
   }
@@ -1695,7 +1695,12 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     "windowId": serial,
     "webviewId": webview_id,
     "url": url,
-    "initScripts": initialization_scripts(&pending),
+    "initScripts": initialization_scripts(&pending)?,
+    "bounds": pending.webview_attributes.bounds.map(|bounds| json!({
+      "position": position_payload(bounds.position),
+      "size": size_payload(bounds.size),
+    })),
+    "autoResize": pending.webview_attributes.auto_resize,
     "policy": { "download": download, "permission": permission },
   });
   context
@@ -1770,13 +1775,31 @@ fn register_ipc_handler<T: UserEvent>(
 
 fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
   pending: &PendingWebview<T, R>,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
   pending
     .webview_attributes
     .initialization_scripts
     .iter()
-    .map(|script| script.script.clone())
+    .map(|script| native_ipc_script(&script.script))
     .collect()
+}
+
+fn native_ipc_script(script: &str) -> Result<String> {
+  // Electron's protocol Request has no trusted webview/frame identity. Use
+  // Tauri's own postMessage transport, whose sender Electron authenticates.
+  // Keep its invoke key, isolation encryption and binary/channel handling.
+  if script.contains("const __TAURI_INVOKE_KEY__ =")
+    && script.contains("const fetchChannelDataCommand =")
+    && script.contains("Object.defineProperty(window.__TAURI_INTERNALS__, 'postMessage'")
+  {
+    let marker = "let customProtocolIpcFailed = false";
+    if script.matches(marker).count() != 1 {
+      return Err(create_webview_err("Tauri IPC transport changed; native sender attribution requires an update".into()));
+    }
+    Ok(script.replacen(marker, "let customProtocolIpcFailed = true", 1))
+  } else {
+    Ok(script.to_owned())
+  }
 }
 
 /// Scheme+host of `url`, e.g. `tauri://localhost` — the origin Tauri sees for
@@ -1917,6 +1940,16 @@ fn termination_reason(reason: &str) -> WebContentProcessTerminationReason {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn selects_native_ipc_without_changing_user_scripts() {
+    let source = "const __TAURI_INVOKE_KEY__ = 'key';\nconst fetchChannelDataCommand = 'channel';\nlet customProtocolIpcFailed = false;\nObject.defineProperty(window.__TAURI_INTERNALS__, 'postMessage', {});";
+    let native = native_ipc_script(source).unwrap();
+    assert_eq!(native, source.replace("let customProtocolIpcFailed = false", "let customProtocolIpcFailed = true"));
+    assert!(native_ipc_script(&source.replace("let customProtocolIpcFailed = false", "let changed = false")).is_err());
+    let user_script = "let customProtocolIpcFailed = false";
+    assert_eq!(native_ipc_script(user_script).unwrap(), user_script);
+  }
 
   #[test]
   fn maps_electron_termination_reasons() {

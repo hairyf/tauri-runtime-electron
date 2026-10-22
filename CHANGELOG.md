@@ -23,10 +23,10 @@ follow [Semantic Versioning](https://semver.org/).
   RPCs; the first webview of a window is its page, and every later one is
   attached as an Electron `<webview>` element, so it is an out-of-process iframe
   and host-page DOM can cover it.
-- Tauri IPC over the `ipc://` custom scheme: `window.__TAURI_INTERNALS__` is
-  provided by Tauri's initialization script, `ipc://` requests are bridged to
-  `PendingWebview::ipc_handler` callbacks, and the request `Origin` header is
-  rewritten to the page origin so Tauri's ACL treats the call as local.
+- Tauri IPC uses its native `window.ipc.postMessage` transport. Electron supplies
+  the sender webview and main-frame URL; invoke keys, isolation encryption and
+  channel responses remain handled by Tauri. Unattributed `ipc://` requests are
+  refused instead of being dispatched as the first registered webview.
 - Custom scheme protocol handlers (`tauri://`, plugin schemes) are registered
   before the window loads and answered from the Rust run loop, so production
   builds serve embedded assets without a dev server.

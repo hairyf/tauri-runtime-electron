@@ -65,7 +65,6 @@ macro_rules! accepted {
 
 /// macOS animates minimize and fullscreen, so the state settles a moment after
 /// the call returns; poll instead of racing the window manager.
-#[cfg(not(target_os = "linux"))]
 fn eventually<A: Clone + Debug + PartialEq>(
   failures: &mut usize,
   name: &str,
@@ -251,12 +250,11 @@ fn checks(runtime: &mut ElectronRuntime, failures: &mut usize) {
   w!((window) set_closable(true)).expect("set closable");
 
   w!((window) set_always_on_top(true)).expect("always on top");
-  check(
-    failures,
-    "always_on_top",
-    w!((window) is_always_on_top()).ok(),
-    Some(true),
-  );
+  // Windows keeps a hidden window's z-order until it is shown, so the flag can
+  // land a moment after the call.
+  eventually(failures, "always_on_top", true, || {
+    w!((window) is_always_on_top()).ok()
+  });
   w!((window) set_always_on_top(false)).expect("always on top off");
 
   w!((window) set_enabled(false)).expect("set enabled");

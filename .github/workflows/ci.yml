@@ -57,8 +57,7 @@ jobs:
           node scripts/coverage.mjs
           git diff --exit-code docs/coverage.md
 
-  # Drives a real Electron window and asserts every setter through its getter.
-  # This is the only job that proves a window can actually be opened.
+  # Drives real Electron windows and round-trips setters through their getters.
   smoke:
     name: smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -105,3 +104,52 @@ jobs:
       - name: Smoke test (Linux, headless)
         if: runner.os == 'Linux'
         run: xvfb-run --auto-servernum cargo run --example smoke
+
+  examples:
+    name: examples (Windows desktop)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      # The official examples and their policies are the acceptance specification.
+      - run: git submodule update --init --depth 1 source/tauri
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache example dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cache/examples/target
+            ~/AppData/Local/electron/Cache
+          key: windows-examples-${{ hashFiles('Cargo.toml', 'scripts/example.mjs') }}
+          restore-keys: windows-examples-
+
+      - name: Offline regression checks
+        run: |
+          node scripts/verify-runtime.mjs
+          node scripts/verify-api.mjs --self-check
+          node scripts/verify-embedded.mjs --self-check
+          node --check scripts/verify-examples.mjs
+          node --check scripts/example.mjs
+
+      # Native drag/resize and real decoded video frames supplement page CDP.
+      # Screenshot inspection remains separate from automated assertion results.
+      - name: Official example actions and keyframes
+        run: node scripts/verify-examples.mjs
+
+      - name: Upload example evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: official-example-evidence
+          path: .cache/acceptance
+          if-no-files-found: error
+          retention-days: 14
