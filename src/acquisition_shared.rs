@@ -268,12 +268,27 @@ pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     let kind = entry.file_type().map_err(|error| error.to_string())?;
     if kind.is_dir() {
       copy_dir(&entry.path(), &target)?;
+    } else if kind.is_symlink() {
+      copy_symlink(entry.path(), &target)?;
     } else {
       fs::copy(entry.path(), &target)
         .map_err(|error| format!("{}: {error}", entry.path().display()))?;
     }
   }
   Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(from: PathBuf, to: &Path) -> Result<(), String> {
+  let link = fs::read_link(&from).map_err(|error| format!("{}: {error}", from.display()))?;
+  std::os::unix::fs::symlink(&link, to).map_err(|error| format!("{}: {error}", to.display()))
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(from: PathBuf, to: &Path) -> Result<(), String> {
+  fs::copy(&from, to)
+    .map(|_| ())
+    .map_err(|error| format!("{}: {error}", from.display()))
 }
 
 /// Ensures a cached Electron distribution with our main-process scripts next to

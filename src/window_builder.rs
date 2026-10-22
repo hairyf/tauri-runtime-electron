@@ -271,7 +271,11 @@ impl WindowBuilder for ElectronWindowBuilder {
 
   #[cfg(target_os = "macos")]
   fn traffic_light_position<P: Into<Position>>(mut self, position: P) -> Self {
-    self.config.traffic_light_position = Some(position.into().to_logical(1.0));
+    let logical = position.into().to_logical::<f64>(1.0);
+    self.config.traffic_light_position = Some(tauri_utils::config::LogicalPosition {
+      x: logical.x,
+      y: logical.y,
+    });
     self
   }
 
