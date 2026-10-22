@@ -282,20 +282,6 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::set_focus(window),
     || WindowDispatch::<()>::is_focused(window),
   );
-  expect_applied(
-    failures,
-    "is_minimized",
-    true,
-    || WindowDispatch::<()>::minimize(window),
-    || WindowDispatch::<()>::is_minimized(window),
-  );
-  expect_applied(
-    failures,
-    "is_minimized back",
-    false,
-    || WindowDispatch::<()>::unminimize(window),
-    || WindowDispatch::<()>::is_minimized(window),
-  );
 
   // The window asks for always-on-top while it is created, which is how an app
   // usually does it; the setter then has to turn it off and back on.
@@ -384,6 +370,23 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
   expect(failures, "theme", Theme::Dark, || {
     WindowDispatch::<()>::theme(window)
   });
+
+  // Minimization runs last: on macOS it re-derives the window style, and the
+  // getters above read that style.
+  expect_applied(
+    failures,
+    "is_minimized",
+    true,
+    || WindowDispatch::<()>::minimize(window),
+    || WindowDispatch::<()>::is_minimized(window),
+  );
+  expect_applied(
+    failures,
+    "is_minimized back",
+    false,
+    || WindowDispatch::<()>::unminimize(window),
+    || WindowDispatch::<()>::is_minimized(window),
+  );
 }
 
 fn visibility_checks(window: &Window, failures: &mut Vec<String>) {
