@@ -86,7 +86,7 @@ fails when it goes stale.
 That page lists what is *wired*; it cannot prove anything *works*. `cargo test` does:
 [`src/bin/smoke.rs`](src/bin/smoke.rs) opens a real window, loads a page into it, then
 sets and reads back every capability (title, geometry, decorations, maximize, theme,
-visibility, cursor, script evaluation, navigation, devtools, close). CI runs it on
+visibility, cursor, zoom, script evaluation, navigation, devtools, close). CI runs it on
 Windows, macOS and Linux (under `xvfb-run`), so a platform that silently stops
 honouring a setter fails the build instead of a user's app.
 
@@ -97,7 +97,7 @@ honouring a setter fails the build instead of a user's app.
 * **Release Builds**: Ensure `devUrl` is absent from `tauri.conf.json` so Tauri embeds frontend assets.
 * **Environment**: `DebugEnvironment::Auto` honors Chromium flags in debug builds and restricts them in release builds.
 * **Custom Menu**: `electron/main.cjs` automatically builds a default context menu for every `webContents` (link/editing/clipboard, history, reload, inspect).
-* **Native Window**: `Electron` hands its Win32/macOS/X11 handle back to Tauri, so host-side code that needs one works unchanged: application and window menus, window effects (`Mica`/`Acrylic`, vibrancy), `set_decorations` at runtime, `start_dragging`, `start_resize_dragging`, `set_cursor_position`, always-on-bottom and `window.hwnd()`. Dragging and resizing are Win32 non-client drags; dragging is only wired on Windows, so apps that need a frameless drag elsewhere should keep a `-webkit-app-region: drag` title bar. Public globals stay unavailable: `with_webview` gets `()` and `Window::gtk_window`/`default_vbox` are not implemented.
+* **Native Window**: `Electron` hands its Win32/macOS/X11 handle back to Tauri, so host-side code that needs one works unchanged: application and window menus, window effects (`Mica`/`Acrylic`, vibrancy), `set_decorations` at runtime, `start_dragging`, `start_resize_dragging`, `set_cursor_position`, `set_always_on_top`, always-on-bottom and `window.hwnd()`. Dragging and resizing are Win32 non-client drags; dragging is only wired on Windows, so apps that need a frameless drag elsewhere should keep a `-webkit-app-region: drag` title bar. The cursor *icon* and *visibility* are page state, so they are written as CSS on the document instead of being dropped. Public globals stay unavailable: `with_webview` gets `()` and `Window::gtk_window`/`default_vbox` are not implemented.
 * **Asset Protocol**: the `ipc`, `tauri` and `asset` schemes are registered as privileged before Electron starts, so `convertFileSrc` + `fetch` work once the app enables the `protocol-asset` feature and an `assetProtocol` scope.
 * **Multiple Windows**: every `WebviewWindowBuilder` becomes its own Electron `BrowserWindow` with its own webview serial, so extra windows are created, closed and tracked exactly like the main one (closing a child keeps the app alive unless it was the last window).
 * **New Window Requests**: `on_new_window` runs on the Rust side, so a page calling `window.open` can be handled by returning `NewWindowResponse::Create` (navigate that window) or `Allow` (Electron opens a plain browser window). Electron can only answer `setWindowOpenHandler` synchronously, so the call is denied up front and the page's `window.open` returns `null` — slower but the only shape that lets Tauri own the decision.
