@@ -70,6 +70,12 @@ as `[electron] unsupported, ignored: <api>` on first use instead of returning a
 fake success. Linux needs a display server, so CI runs the smoke example under
 `xvfb-run`.
 
+The smoke example asserts ~75 behaviours against two real windows and one guest
+webview: every setter that has a getter round-trips through it, and every other
+setter must at least reach Electron without an IPC error. Behaviour that only
+exists on macOS or Windows (maximize, minimize, fullscreen, decorations) is
+asserted there and skipped under xvfb, which has no window manager.
+
 `source/tauri` and `source/electron` are pinned submodules kept for reading the
 upstream implementations; they are not built.
 

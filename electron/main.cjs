@@ -158,7 +158,7 @@ const decoratedState = new WeakMap()
 const maximizableState = new WeakMap()
 /** BrowserWindow -> same, for minimize. */
 const minimizableState = new WeakMap()
-/** BrowserWindow -> key of the injected page-wide `cursor` rule. */
+/** BrowserWindow -> `{ css, key }` of the injected page-wide `cursor` rule. */
 const cursorCssKey = new WeakMap()
 /** webviewId -> BrowserWindow */
 const webviews = new Map()
@@ -456,16 +456,28 @@ function applyWindowConfig(window, config, params) {
   }
 }
 
+/** Applies the remembered `cursor` rule; `null` removes it. */
+async function applyWindowCursorCss(window) {
+  const state = cursorCssKey.get(window)
+  if (!state) return
+  if (state.key) {
+    const key = state.key
+    state.key = undefined
+    await window.webContents.removeInsertedCSS(key).catch(() => {})
+  }
+  if (!state.css) return
+  try {
+    state.key = await window.webContents.insertCSS(state.css, { cssOrigin: 'user' })
+  } catch {
+    // The window has no render frame yet (nothing navigated). `dom-ready`
+    // applies the rule as soon as the first page exists.
+  }
+}
+
 /** Replaces the page-wide `cursor` rule; `null` removes it. */
 async function setWindowCursorCss(window, css) {
-  const previous = cursorCssKey.get(window)
-  if (previous) {
-    cursorCssKey.delete(window)
-    await window.webContents.removeInsertedCSS(previous).catch(() => {})
-  }
-  if (!css) return
-  const key = await window.webContents.insertCSS(css, { cssOrigin: 'user' })
-  cursorCssKey.set(window, key)
+  cursorCssKey.set(window, { css, key: cursorCssKey.get(window)?.key })
+  await applyWindowCursorCss(window)
 }
 
 async function createWindow(params) {
@@ -512,6 +524,10 @@ async function createWindow(params) {
     event.preventDefault()
     send({ event: 'window.closeRequested', params: { windowId } })
   })
+
+  // A cursor rule needs a render frame; a window created before its first page
+  // navigated applies the remembered one here.
+  window.webContents.on('dom-ready', () => applyWindowCursorCss(window))
 
   window.on('closed', () => {
     closeAllowed.delete(windowId)
