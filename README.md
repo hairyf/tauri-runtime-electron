@@ -84,10 +84,11 @@ same method. It is generated from source (`node scripts/coverage.mjs --write`) a
 fails when it goes stale.
 
 That page lists what is *wired*; it cannot prove anything *works*. `cargo test` does:
-[`src/bin/smoke.rs`](src/bin/smoke.rs) opens a real window, then sets and reads back
-every capability (title, geometry, decorations, maximize, theme, visibility, cursor,
-close). CI runs it on Windows, macOS and Linux (under `xvfb-run`), so a platform that
-silently stops honouring a setter fails the build instead of a user's app.
+[`src/bin/smoke.rs`](src/bin/smoke.rs) opens a real window, loads a page into it, then
+sets and reads back every capability (title, geometry, decorations, maximize, theme,
+visibility, cursor, script evaluation, navigation, devtools, close). CI runs it on
+Windows, macOS and Linux (under `xvfb-run`), so a platform that silently stops
+honouring a setter fails the build instead of a user's app.
 
 ---
 

@@ -22,12 +22,16 @@ use std::{
 };
 
 use tauri_runtime::{
-  RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, WindowDispatch,
+  RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, WebviewDispatch, WindowDispatch,
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
-  window::{PendingWindow, RawWindow, WindowEvent},
+  webview::{PendingWebview, WebviewAttributes},
+  window::{DetachedWindow, PendingWindow, RawWindow, WindowEvent},
 };
 use tauri_runtime_electron::{ElectronRuntime, ElectronRuntimeHandle, ElectronWindowBuilder};
-use tauri_utils::{Theme, config::WindowConfig};
+use tauri_utils::{
+  Theme,
+  config::{WebviewUrl, WindowConfig},
+};
 
 /// How long a setter may take to become visible to the getter. Every window
 /// manager is asynchronous, so an immediate read would flake; a silent no-op
@@ -35,8 +39,15 @@ use tauri_utils::{Theme, config::WindowConfig};
 const SETTLE: Duration = Duration::from_secs(5);
 
 /// The concrete dispatcher types, with the event type pinned to `()`.
-type Window = <ElectronRuntime as Runtime<()>>::WindowDispatcher;
-type Handle = <ElectronRuntime as Runtime<()>>::Handle;
+ type Window = <ElectronRuntime as Runtime<()>>::WindowDispatcher;
+ type Webview = <ElectronRuntime as Runtime<()>>::WebviewDispatcher;
+ type Handle = <ElectronRuntime as Runtime<()>>::Handle;
+
+/// The first page the window loads.
+const PAGE: &str = "data:text/html,<title>smoke-page</title><p>smoke</p>";
+
+/// The page `navigate` sends the window to; its title proves the load happened.
+const SECOND_PAGE: &str = "data:text/html,<title>smoke-second</title><p>second</p>";
 
 fn main() -> ExitCode {
   let runtime = match <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs::default()) {
@@ -87,7 +98,7 @@ fn main() -> ExitCode {
     ..Default::default()
   };
 
-  let pending = match PendingWindow::<(), ElectronRuntime>::new(
+  let mut pending = match PendingWindow::<(), ElectronRuntime>::new(
     <ElectronWindowBuilder as tauri_runtime::window::WindowBuilder>::with_config(&config),
     "smoke",
   ) {
@@ -97,21 +108,41 @@ fn main() -> ExitCode {
       return ExitCode::FAILURE;
     }
   };
+  match PendingWebview::<(), ElectronRuntime>::new(
+    WebviewAttributes::new(WebviewUrl::App("index.html".into())),
+    "smoke-page",
+  ) {
+    Ok(mut webview) => {
+      // The window loads this page itself, so the checks below can eval against
+      // a document that really exists.
+      webview.url = PAGE.to_string();
+      pending.set_webview(webview);
+    }
+    Err(error) => {
+      eprintln!("[smoke] cannot build the webview: {error}");
+      return ExitCode::FAILURE;
+    }
+  }
   // A fn pointer is higher-ranked over the handle lifetime, so it satisfies `Fn(RawWindow)`.
   let after: Option<fn(RawWindow<'_>)> = None;
-  let window = match <ElectronRuntimeHandle as RuntimeHandle<()>>::create_window(
-    &handle,
-    pending,
-    after,
+  let detached = match <ElectronRuntimeHandle as RuntimeHandle<()>>::create_window(
+    &handle, pending, after,
   ) {
-    Ok(window) => window.dispatcher,
+    Ok(window) => window,
     Err(error) => {
       eprintln!("[smoke] cannot create the window: {error}");
       return ExitCode::FAILURE;
     }
   };
+  let DetachedWindow {
+    dispatcher: window,
+    webview,
+    ..
+  } = detached;
+  let webview = webview.map(|detached| detached.webview.dispatcher);
 
   window_checks(&window, &handle, &mut failures);
+  webview_checks(webview.as_ref(), &mut failures);
 
   // Closing has to reach the event loop, otherwise the process outlives the test.
   set(&mut failures, "close", || WindowDispatch::<()>::close(&window));
@@ -325,6 +356,80 @@ fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
     }
     thread::sleep(Duration::from_millis(25));
   }
+}
+
+/// The window's own webview: script evaluation, navigation and devtools all
+/// travel through the main process, so each check proves a renderer round trip.
+fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
+  let Some(webview) = webview else {
+    failures.push("webview: the window was created without its webview".into());
+    return;
+  };
+
+  expect_eval(failures, "eval_script", "2", webview, "1 + 1");
+  expect_eval(
+    failures,
+    "loaded page",
+    "smoke-page",
+    webview,
+    "document.title",
+  );
+
+  expect(failures, "url", PAGE.to_string(), || {
+    WebviewDispatch::<()>::url(webview)
+  });
+  set(failures, "navigate", || {
+    WebviewDispatch::<()>::navigate(webview, SECOND_PAGE.parse().unwrap())
+  });
+  expect(failures, "url after navigate", SECOND_PAGE.to_string(), || {
+    WebviewDispatch::<()>::url(webview)
+  });
+  // The mirrored url above could be a lie; this reads the document instead.
+  expect_eval(failures, "navigated", "smoke-second", webview, "document.title");
+
+  WebviewDispatch::<()>::open_devtools(webview);
+  expect(failures, "devtools open", true, || {
+    WebviewDispatch::<()>::is_devtools_open(webview)
+  });
+  WebviewDispatch::<()>::close_devtools(webview);
+  expect(failures, "devtools closed", false, || {
+    WebviewDispatch::<()>::is_devtools_open(webview)
+  });
+}
+
+/// Evaluates `script` in the page until it returns `want`, so a page that is
+/// still loading does not fail the check.
+fn expect_eval(
+  failures: &mut Vec<String>,
+  name: &str,
+  want: &str,
+  webview: &Webview,
+  script: &str,
+) {
+  CHECKS.fetch_add(1, Ordering::Relaxed);
+  let start = Instant::now();
+  let mut last = String::from("<no result>");
+  let (tx, rx) = channel::<String>();
+  while start.elapsed() < SETTLE {
+    let tx = tx.clone();
+    let called = WebviewDispatch::<()>::eval_script_with_callback(webview, script, move |value| {
+      let _ = tx.send(value);
+    });
+    if let Err(error) = called {
+      failures.push(format!("{name}: {error}"));
+      return;
+    }
+    if let Ok(value) = rx.recv_timeout(Duration::from_millis(500)) {
+      // The callback stringifies JSON, so a text result keeps its quotes.
+      last = value.trim_matches('"').to_string();
+      if last == want {
+        println!("ok   {name} `{script}` = {last} in {:?}", start.elapsed());
+        return;
+      }
+    }
+    thread::sleep(Duration::from_millis(250));
+  }
+  failures.push(format!("{name}: `{script}` returned {last:?}, want {want:?}"));
 }
 
 /// Records a setter failure; setters have no return value to compare.
