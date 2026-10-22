@@ -167,7 +167,7 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   #[cfg(target_os = "macos")]
-  fn parent(self, parent: *mut std::ffi::c_void) -> Self {
+  fn parent(self, _parent: *mut std::ffi::c_void) -> Self {
     self
   }
 
@@ -188,22 +188,22 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   #[cfg(target_os = "macos")]
-  fn title_bar_style(self, style: TitleBarStyle) -> Self {
+  fn title_bar_style(self, _style: TitleBarStyle) -> Self {
     self
   }
 
   #[cfg(target_os = "macos")]
-  fn traffic_light_position<P: Into<Position>>(self, position: P) -> Self {
+  fn traffic_light_position<P: Into<Position>>(self, _position: P) -> Self {
     self
   }
 
   #[cfg(target_os = "macos")]
-  fn hidden_title(self, transparent: bool) -> Self {
+  fn hidden_title(self, _transparent: bool) -> Self {
     self
   }
 
   #[cfg(target_os = "macos")]
-  fn tabbing_identifier(self, identifier: &str) -> Self {
+  fn tabbing_identifier(self, _identifier: &str) -> Self {
     self
   }
 
