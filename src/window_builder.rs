@@ -9,6 +9,9 @@ use tauri_runtime::{
 use tauri_utils::{Theme, config::WindowConfig};
 
 #[cfg(target_os = "macos")]
+use tauri_runtime::Position;
+
+#[cfg(target_os = "macos")]
 use tauri_utils::TitleBarStyle;
 
 #[cfg(windows)]

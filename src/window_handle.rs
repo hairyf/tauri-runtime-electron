@@ -40,6 +40,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       tauri_runtime::ActivationPolicy::Regular => "regular",
       tauri_runtime::ActivationPolicy::Accessory => "accessory",
       tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
+      _ => "regular",
     };
     self
       .context

@@ -824,6 +824,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       tauri_runtime::ActivationPolicy::Regular => "regular",
       tauri_runtime::ActivationPolicy::Accessory => "accessory",
       tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
+      _ => "regular",
     };
     if let Err(error) = self.context.ipc.call(
       "app.activationPolicy",

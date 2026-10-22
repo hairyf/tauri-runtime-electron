@@ -183,17 +183,32 @@ fn expected_digest(url: &str, name: &str) -> Result<Option<String>, String> {
 }
 
 fn digest(path: &Path) -> Result<String, String> {
-  // Windows and POSIX disagree on both the tool and the flag order.
-  let output = if cfg!(windows) {
-    Command::new("certutil")
-      .args(["-hashfile", &path.display().to_string(), "SHA256"])
-      .output()
+  // Windows and POSIX disagree on the tool, the flag order and even whether
+  // the digest is printed first, so try the common ones and pick the digest.
+  let path_display = path.display().to_string();
+  let candidates: [(&str, &[&str]); 3] = if cfg!(windows) {
+    [
+      ("certutil", &["-hashfile", &path_display, "SHA256"]),
+      ("sha256sum", &[&path_display]),
+      ("openssl", &["dgst", "-sha256", &path_display]),
+    ]
   } else {
-    Command::new("shasum")
-      .args(["-a", "256", &path.display().to_string()])
-      .output()
+    [
+      ("shasum", &["-a", "256", &path_display]),
+      ("sha256sum", &[&path_display]),
+      ("openssl", &["dgst", "-sha256", &path_display]),
+    ]
+  };
+  let mut output = None;
+  for (program, args) in candidates {
+    if let Ok(result) = Command::new(program).args(args).output() {
+      if result.status.success() {
+        output = Some(result);
+        break;
+      }
+    }
   }
-  .map_err(|error| format!("sha256: {error}"))?;
+  let output = output.ok_or_else(|| "no sha256 tool available".to_string())?;
   let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
   text
     .lines()

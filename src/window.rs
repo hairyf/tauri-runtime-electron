@@ -404,7 +404,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   #[cfg(target_os = "macos")]
   fn set_simple_fullscreen(&self, enable: bool) -> Result<()> {
-    self.set_fullscreen(enable)
+    self.window_call("window.simpleFullscreen", json!({ "fullscreen": enable }))
   }
 
   fn set_focus(&self) -> Result<()> {
