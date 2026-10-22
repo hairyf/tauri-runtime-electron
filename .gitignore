@@ -6,4 +6,7 @@ node_modules
 target
 .eslintcache
 .temp/
-source/
+# Reference checkouts live under source/; only the pinned submodules are tracked.
+/source/*
+!/source/tauri
+!/source/electron
