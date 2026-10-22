@@ -165,6 +165,13 @@ fn main() -> ExitCode {
     cursor_style_checks(&window, webview, &mut failures);
   }
 
+  // An idle app must stay connected: the handshake read used to leave a timeout
+  // on the socket, and a minute of quiet then looked like a dead Electron.
+  thread::sleep(Duration::from_secs(61));
+  set(&mut failures, "still connected after a minute", || {
+    WindowDispatch::<()>::set_title(&window, "smoke-idle")
+  });
+
   // Closing has to reach the event loop, otherwise the process outlives the test.
   set(&mut failures, "close", || WindowDispatch::<()>::close(&window));
   expect_named(&mut failures, "closed event", "destroyed", || {
