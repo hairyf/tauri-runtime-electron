@@ -68,6 +68,14 @@ impl Ipc {
       .arg("--port")
       .arg(port.to_string())
       .args(extra_args);
+    // Electron names its profile "Electron" for every app built on this runtime,
+    // so two running apps would share one profile, cache and lock.
+    if let Some(owner) = std::env::current_exe()
+      .ok()
+      .and_then(|exe| exe.file_name().map(|name| name.to_owned()))
+    {
+      command.env("TAURI_RUNTIME_ELECTRON_OWNER", owner);
+    }
     #[cfg(windows)]
     {
       use std::os::windows::process::CommandExt;

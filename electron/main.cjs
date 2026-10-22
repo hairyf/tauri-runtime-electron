@@ -20,6 +20,12 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
+// Electron keys its profile by app name, and that name is "Electron" for every
+// app built on this runtime: without this, two running apps would share one
+// profile, cache and lock.
+const owner = process.env.TAURI_RUNTIME_ELECTRON_OWNER
+if (owner) app.setPath('userData', path.join(app.getPath('appData'), owner))
+
 const logFile = path.join(os.tmpdir(), 'tauri-runtime-electron.log')
 function log(...args) {
   fs.appendFileSync(logFile, `${new Date().toISOString()} ${args.join(' ')}\n`)
