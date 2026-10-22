@@ -131,7 +131,12 @@ function crateName() {
 
 function manifest(rustSources, extraDeps, binPath) {
   const source = rustSources.map((file) => read(file)).join('\n')
-  const deps = ['serde = { version = "1", features = ["derive"] }', 'serde_json = "1"', 'log = "0.4"']
+  const deps = [
+    'serde = { version = "1", features = ["derive"] }',
+    'serde_json = "1"',
+    'log = "0.4"',
+    'tauri-utils = "~3.0.0-alpha.4"',
+  ]
   if (/\bhttp::/.test(source)) deps.push('http = "1"')
   if (/\bhttp_range::/.test(source)) deps.push('http-range = "0.1"')
   const repoPath = repoRoot.replaceAll('\\', '/')
