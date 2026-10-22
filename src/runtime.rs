@@ -75,6 +75,20 @@ pub(crate) fn create_webview_err(message: String) -> Error {
   Error::CreateWebview(io_err(message))
 }
 
+/// Reports a trait member this backend cannot honour, once per method.
+///
+/// A stub that quietly returns `Ok(())` is the failure mode this crate is most
+/// likely to ship: the app looks fine and nothing happens. Callers that loop
+/// (`set_cursor_icon` on every hover) must not fill the console, hence the
+/// once-per-method gate.
+pub(crate) fn unsupported(method: &'static str, reason: &str) {
+  static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+    std::sync::LazyLock::new(Default::default);
+  if REPORTED.lock().is_ok_and(|mut seen| seen.insert(method)) {
+    eprintln!("[electron] {method} is not implemented: {reason}");
+  }
+}
+
 /// Tauri sizes are physical or logical; the Electron side converts to DIPs.
 pub(crate) fn size_payload(size: Size) -> Value {
   match size {
@@ -435,6 +449,7 @@ impl ElectronRuntime {
   }
 
   fn start(attrs: Electron, custom_schemes: &[&str]) -> Result<Self> {
+    crate::platform::dpi::enable_per_monitor_v2();
     let binary = attrs.resolve_binary();
     // Task Manager and Explorer name and icon a process after its executable,
     // so the Electron binary borrows the application's resources.
@@ -865,7 +880,12 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     }
   }
 
-  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {}
+  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {
+    unsupported(
+      "Runtime::set_device_event_filter",
+      "Electron reports no raw device events",
+    );
+  }
 
   #[cfg(any(
     target_os = "macos",
@@ -876,6 +896,8 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
+  // Electron pumps its own event loop in the main process; there is nothing to
+  // iterate here, and callers invoke this in a loop so it must stay silent.
   fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, _callback: F) {}
 
   fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {

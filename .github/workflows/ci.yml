@@ -58,8 +58,41 @@ jobs:
       - name: Check
         run: cargo check --all-targets
 
+      # These open a real Electron window and assert every capability
+      # round-trips, so a platform that silently stops working fails here
+      # instead of in a user's app. Linux has no display on the runners, hence
+      # the virtual one.
       - name: Test
-        run: cargo test
+        if: runner.os != 'Linux'
+        run: cargo test -- --nocapture
+
+      - name: Test under a virtual display
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' cargo test -- --nocapture
 
       - name: Build
         run: cargo build --lib
+
+  # The docs are generated from the pinned `source/tauri` submodule, so this job
+  # fails whenever the implementation and docs/coverage.md disagree. That is what
+  # keeps stubs and panics visible in the PR diff instead of only in the source.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Check docs/coverage.md is current
+        run: node scripts/coverage.mjs --check
+
+      - name: Summarize coverage
+        if: always()
+        run: |
+          {
+            echo '### tauri-runtime coverage'
+            echo '```'
+            node scripts/coverage.mjs
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

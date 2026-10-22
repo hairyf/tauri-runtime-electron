@@ -117,7 +117,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       ))
     });
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    unimplemented!();
+    unimplemented!("tauri-runtime-electron: unsupported target, no display handle available");
   }
 
   fn primary_monitor(&self) -> Result<Option<Monitor>> {
@@ -196,7 +196,10 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   }
 
   fn set_device_event_filter(&self, _: DeviceEventFilter) {
-    // no-op
+    crate::runtime::unsupported(
+      "RuntimeHandle::set_device_event_filter",
+      "Electron reports no raw device events",
+    );
   }
 
   #[cfg(target_os = "android")]
@@ -206,7 +209,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     activity: &jni::objects::JObject<'_>,
     name: impl Into<String>,
   ) -> std::result::Result<jni::objects::JClass<'a>, jni::errors::Error> {
-    todo!()
+    todo!("tauri-runtime-electron: Android is not a supported target")
   }
 
   #[cfg(target_os = "android")]
@@ -216,7 +219,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       + Send
       + 'static,
   {
-    todo!()
+    todo!("tauri-runtime-electron: Android is not a supported target")
   }
 
   #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -224,7 +227,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     &self,
     _cb: F,
   ) -> Result<()> {
-    todo!()
+    todo!("tauri-runtime-electron: Electron sessions have no WKWebView data store to enumerate")
   }
 
   #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -233,7 +236,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     _uuid: [u8; 16],
     _cb: F,
   ) -> Result<()> {
-    todo!()
+    todo!("tauri-runtime-electron: Electron sessions have no WKWebView data store to remove")
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {

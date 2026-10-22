@@ -114,18 +114,18 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(self.geometry()?["resizable"].as_bool().unwrap_or(true))
   }
 
-  // Electron only exposes these as write-only setters; track the requested
-  // value on the Rust side instead of asking the main process.
+  // Electron's getters exist on macOS and Windows only; elsewhere the flag is
+  // always true, which is what the setter already cannot change.
   fn is_maximizable(&self) -> Result<bool> {
-    Ok(true)
+    Ok(self.geometry()?["maximizable"].as_bool().unwrap_or(true))
   }
 
   fn is_minimizable(&self) -> Result<bool> {
-    Ok(true)
+    Ok(self.geometry()?["minimizable"].as_bool().unwrap_or(true))
   }
 
   fn is_closable(&self) -> Result<bool> {
-    Ok(true)
+    Ok(self.geometry()?["closable"].as_bool().unwrap_or(true))
   }
 
   fn is_visible(&self) -> Result<bool> {
@@ -184,7 +184,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
-    unimplemented!()
+    unimplemented!("tauri-runtime-electron: Electron owns the window, so there is no GTK window")
   }
 
   #[cfg(any(
@@ -195,17 +195,17 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn default_vbox(&self) -> Result<gtk::Box> {
-    unimplemented!()
+    unimplemented!("tauri-runtime-electron: Electron has no GTK widget tree")
   }
 
   #[cfg(target_os = "android")]
   fn activity_name(&self) -> Result<String> {
-    unimplemented!()
+    unimplemented!("tauri-runtime-electron: Android is not a supported target")
   }
 
   #[cfg(target_os = "ios")]
   fn scene_identifier(&self) -> Result<String> {
-    unimplemented!()
+    unimplemented!("tauri-runtime-electron: iOS is not a supported target")
   }
 
   fn window_handle(
@@ -331,11 +331,17 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     #[cfg(windows)]
     {
       imp::set_decorations(self.context.native_handle(self.id)?, decorations);
-      Ok(())
+      self
+        .window_call("window.decorations", json!({ "value": decorations }))
+        .map(|_| ())
     }
     #[cfg(not(windows))]
     {
       let _ = decorations;
+      crate::runtime::unsupported(
+        "WindowDispatch::set_decorations",
+        "Electron cannot change the frame after creation",
+      );
       Ok(())
     }
   }
@@ -425,18 +431,28 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   // Electron has no cursor control API; the renderer sets `cursor` in CSS.
   fn set_cursor_grab(&self, _grab: bool) -> Result<()> {
+    crate::runtime::unsupported("WindowDispatch::set_cursor_grab", "Electron has no cursor API");
     Ok(())
   }
 
   fn set_cursor_visible(&self, _visible: bool) -> Result<()> {
+    crate::runtime::unsupported("WindowDispatch::set_cursor_visible", "Electron has no cursor API");
     Ok(())
   }
 
   fn set_cursor_icon(&self, _icon: CursorIcon) -> Result<()> {
+    crate::runtime::unsupported("WindowDispatch::set_cursor_icon", "Electron has no cursor API");
     Ok(())
   }
 
-  fn set_cursor_position<Pos: Into<Position>>(&self, _position: Pos) -> Result<()> {
+  fn set_cursor_position<Pos: Into<Position>>(&self, position: Pos) -> Result<()> {
+    let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
+    let physical = position.into().to_physical::<i32>(scale);
+    // Electron exposes no way to move the cursor, so this is the one cursor
+    // capability the OS has to do; the others have no Tauri getter to verify.
+    if let Err(reason) = crate::platform::cursor::warp(physical, scale) {
+      crate::runtime::unsupported("WindowDispatch::set_cursor_position", &reason);
+    }
     Ok(())
   }
 
@@ -452,11 +468,30 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       Ok(())
     }
     #[cfg(not(windows))]
-    Ok(())
+    {
+      crate::runtime::unsupported(
+        "WindowDispatch::start_dragging",
+        "only the Win32 handle can start a native drag",
+      );
+      Ok(())
+    }
   }
 
-  fn start_resize_dragging(&self, _direction: tauri_runtime::ResizeDirection) -> Result<()> {
-    Ok(())
+  fn start_resize_dragging(&self, direction: tauri_runtime::ResizeDirection) -> Result<()> {
+    #[cfg(windows)]
+    {
+      imp::start_resize_dragging(self.context.native_handle(self.id)?, direction);
+      Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+      let _ = direction;
+      crate::runtime::unsupported(
+        "WindowDispatch::start_resize_dragging",
+        "only the Win32 handle can start a native resize drag",
+      );
+      Ok(())
+    }
   }
 
   fn set_progress_bar(&self, progress_state: ProgressBarState) -> Result<()> {
@@ -496,6 +531,10 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   // Electron applies the title bar style only while creating the window.
   fn set_title_bar_style(&self, _style: tauri_utils::TitleBarStyle) -> Result<()> {
+    crate::runtime::unsupported(
+      "WindowDispatch::set_title_bar_style",
+      "Electron only reads titleBarStyle while creating the window",
+    );
     Ok(())
   }
 
@@ -582,10 +621,12 @@ mod imp {
   use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
   use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
   use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, HTCAPTION, HWND_BOTTOM, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    GetWindowLongPtrW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
+    HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
     SetWindowLongPtrW, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION, WS_THICKFRAME,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE, SWP_NOMOVE, SWP_NOSIZE,
   };
+  use tauri_runtime::ResizeDirection;
 
   fn hwnd(handle: isize) -> HWND {
     HWND(handle as *mut std::ffi::c_void)
@@ -631,15 +672,40 @@ mod imp {
   }
 
   pub(super) fn start_dragging(handle: isize) {
-    let window = hwnd(handle);
     // SAFETY: the canonical frameless-drag trick; the message is handled by the
     // window's non-client path and only starts a move loop.
     unsafe {
       let _ = ReleaseCapture();
       SendMessageW(
-        window,
+        hwnd(handle),
         WM_NCLBUTTONDOWN,
         Some(WPARAM(HTCAPTION as usize)),
+        Some(LPARAM(0)),
+      );
+    }
+  }
+
+  /// Resizes the way dragging a frame edge does, by handing the window the
+  /// matching non-client resize code.
+  pub(super) fn start_resize_dragging(handle: isize, direction: ResizeDirection) {
+    let hit = match direction {
+      ResizeDirection::East => HTRIGHT,
+      ResizeDirection::North => HTTOP,
+      ResizeDirection::NorthEast => HTTOPRIGHT,
+      ResizeDirection::NorthWest => HTTOPLEFT,
+      ResizeDirection::South => HTBOTTOM,
+      ResizeDirection::SouthEast => HTBOTTOMRIGHT,
+      ResizeDirection::SouthWest => HTBOTTOMLEFT,
+      ResizeDirection::West => HTLEFT,
+    };
+    // SAFETY: same contract as `start_dragging`, with a resize code instead of
+    // a caption code.
+    unsafe {
+      let _ = ReleaseCapture();
+      SendMessageW(
+        hwnd(handle),
+        WM_NCLBUTTONDOWN,
+        Some(WPARAM(hit as usize)),
         Some(LPARAM(0)),
       );
     }

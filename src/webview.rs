@@ -95,6 +95,10 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   /// Electron guests have no native handle to hand out: they are `<webview>`
   /// elements composited by the renderer, so callers get `()` boxed.
   fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
+    crate::runtime::unsupported(
+      "WebviewDispatch::with_webview",
+      "Electron guests have no native handle to hand out",
+    );
     f(Box::new(()));
     Ok(())
   }
@@ -233,6 +237,10 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   /// A `<webview>` guest is anchored to the page that hosts it; Electron has no
   /// API to move a guest into another window.
   fn reparent(&self, _window_id: WindowId) -> Result<()> {
+    crate::runtime::unsupported(
+      "WebviewDispatch::reparent",
+      "an Electron <webview> guest cannot move to another window",
+    );
     Ok(())
   }
 

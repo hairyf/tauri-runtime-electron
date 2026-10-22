@@ -334,6 +334,9 @@ async function createWindow(params) {
     },
   })
   windows.set(windowId, window)
+  // Electron has no decorations getter, so remember what the window was created
+  // with; `window.decorations` updates it when the Win32 styles are toggled.
+  window.__tauriDecorations = params.decorations ?? true
   // The page webview of this window; later webviews on it become guests.
   if (params.webview) mainWebview.set(windowId, params.webview.webviewId)
   // Read this now: by the time `closed` fires the window and its webContents are
@@ -635,7 +638,12 @@ function readGeometry(window) {
     fullscreen: window.isFullScreen(),
     resizable: window.isResizable(),
     alwaysOnTop: window.isAlwaysOnTop(),
+    decorated: window.__tauriDecorations ?? true,
     title: window.getTitle(),
+    // Electron only ships these getters on macOS and Windows.
+    maximizable: window.isMaximizable?.() ?? true,
+    minimizable: window.isMinimizable?.() ?? true,
+    closable: window.isClosable?.() ?? true,
   }
 }
 
@@ -885,6 +893,11 @@ function handle(method, params) {
     }
     case 'window.shadow':
       findWindow(params.windowId).setHasShadow(params.value)
+      return null
+    case 'window.decorations':
+      // The frame itself is toggled from Rust through the Win32 styles; this only
+      // keeps readGeometry honest about it.
+      findWindow(params.windowId).__tauriDecorations = Boolean(params.value)
       return null
     case 'app.badgeLabel':
       // Only macOS has a dock badge label; Windows has the count above.

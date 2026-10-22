@@ -17,6 +17,9 @@ use tauri_runtime::{dpi::PhysicalRect, monitor::Monitor};
 
 use crate::runtime::{rect_position, rect_size};
 
+pub(crate) mod cursor;
+pub(crate) mod dpi;
+
 /// Maps the monitor JSON shape produced by `electron/main.cjs` onto Tauri's
 /// physical-pixel `Monitor`.
 pub(crate) fn monitor_from_value(value: &Value) -> Option<Monitor> {
