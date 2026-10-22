@@ -43,6 +43,17 @@ impl std::fmt::Debug for Ipc {
 }
 
 impl Ipc {
+  #[cfg(test)]
+  pub(crate) fn test_connection() -> Arc<Self> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let _peer = listener.accept().unwrap();
+    Arc::new(Self {
+      writer: Mutex::new(stream), pending: Mutex::new(HashMap::new()),
+      next_id: AtomicU64::new(1), child: Mutex::new(None), version: String::new(),
+    })
+  }
+
   /// Spawns `electron <main_script> --port <port>` and waits for the handshake.
   ///
   /// The returned receiver yields every notification the Electron side sends.

@@ -12,7 +12,6 @@ use crate::{
   window_builder::ElectronWindowBuilder,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
 use tauri_runtime::{
   Icon, ProgressBarState, ProgressBarStatus, Result, UserAttentionType, UserEvent, WindowDispatch,
   WindowEventId,
@@ -66,7 +65,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, f: F) -> WindowEventId {
     let id = self.context.next_window_event_id();
-    self.context.add_window_event_handler(self.id, id, Rc::new(f));
+    self.context.add_window_event_handler(self.id, id, f);
     id
   }
 
@@ -904,18 +903,28 @@ pub(crate) mod imp {
     LPARAM(((point.x as u16 as u32) | ((point.y as u16 as u32) << 16)) as isize)
   }
 
+  fn drag_message(hit: i32) -> (u32, WPARAM) {
+    use windows::Win32::UI::WindowsAndMessaging::{SC_MOVE, WM_SYSCOMMAND};
+    if hit == HTCAPTION as i32 {
+      (WM_SYSCOMMAND, WPARAM((SC_MOVE | 0x0002) as usize))
+    } else {
+      (WM_NCLBUTTONDOWN, WPARAM(hit as usize))
+    }
+  }
+
   fn start_non_client_drag(handle: isize, hit: i32) -> tauri_runtime::Result<()> {
     let window = hwnd(handle);
     let mut point = POINT::default();
-    // SAFETY: only read the cursor and post scalar messages to our own HWND.
-    // Capture belongs to Electron's UI thread. WM_CANCELMODE releases it there;
-    // ReleaseCapture on this Rust thread cannot do that. Posting the move also
-    // leaves the Rust IPC loop free while Electron runs its modal move loop.
+    let (message, wparam) = drag_message(hit);
+    // Chromium routes caption presses/moves through content event handlers first.
+    // Use its RunMoveLoop system command to enter native movement directly.
+    // SAFETY: cancel capture and post scalar messages on Electron's owning thread;
+    // posting leaves the Rust IPC loop free while Electron runs its modal move loop.
     trace_drag(window, hit, "before-post");
     let result = unsafe {
       GetCursorPos(&mut point)
         .and_then(|_| PostMessageW(Some(window), WM_CANCELMODE, WPARAM(0), LPARAM(0)))
-        .and_then(|_| PostMessageW(Some(window), WM_NCLBUTTONDOWN, WPARAM(hit as usize), cursor_lparam(point)))
+        .and_then(|_| PostMessageW(Some(window), message, wparam, cursor_lparam(point)))
         .map_err(|error| crate::runtime::create_window_err(error.to_string()))
     };
     trace_drag(window, hit, if result.is_ok() { "posted" } else { "post-failed" });
@@ -966,6 +975,11 @@ pub(crate) mod imp {
   #[cfg(test)]
   #[test]
   fn drag_cursor_coordinates_preserve_signed_screen_positions() {
+    use windows::Win32::UI::WindowsAndMessaging::{SC_MOVE, WM_SYSCOMMAND};
+    assert_eq!(drag_message(HTCAPTION as i32), (WM_SYSCOMMAND, WPARAM((SC_MOVE | 2) as usize)));
+    for hit in [HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT] {
+      assert_eq!(drag_message(hit as i32), (WM_NCLBUTTONDOWN, WPARAM(hit as usize)));
+    }
     for point in [POINT { x: 175, y: 385 }, POINT { x: -1920, y: -1080 }] {
       let packed = cursor_lparam(point).0 as u32;
       assert_eq!(packed as u16 as i16 as i32, point.x);

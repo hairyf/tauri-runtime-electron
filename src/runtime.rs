@@ -145,46 +145,65 @@ pub struct RuntimeContext {
   ///
   /// The handler is closed over the [`DetachedWebview`] it belongs to, so the
   /// map does not need to know the runtime's generic parameters.
-  ipc_handlers: Rc<RefCell<HashMap<u32, Rc<dyn Fn(Request<String>) + Send>>>>,
+  ipc_handlers: Arc<RefCell<HashMap<u32, Rc<dyn Fn(Request<String>) + Send>>>>,
   /// Tauri's page-load, title and new-window callbacks, by webview serial.
-  webview_handlers: Rc<RefCell<HashMap<u32, WebviewHandlers>>>,
+  webview_handlers: Arc<RefCell<HashMap<u32, WebviewHandlers>>>,
   /// Custom protocols registered by Tauri, served through Electron's
   /// `protocol.handle`.
-  protocol_handlers: Rc<RefCell<HashMap<String, (String, Rc<UriSchemeProtocolHandler>)>>>,
+  protocol_handlers: Arc<RefCell<HashMap<String, (String, Rc<UriSchemeProtocolHandler>)>>>,
   /// IPC responses retain their MIME type and the authenticated caller's label.
-  ipc_protocol_handlers: Rc<RefCell<HashMap<u32, (String, Rc<UriSchemeProtocolHandler>)>>>,
+  ipc_protocol_handlers: Arc<RefCell<HashMap<u32, (String, Rc<UriSchemeProtocolHandler>)>>>,
   /// Page origin per webview label, injected as the `Origin` header on
   /// custom-protocol requests (Electron reports the request URL instead).
-  webview_origins: Rc<RefCell<HashMap<String, String>>>,
+  webview_origins: Arc<RefCell<HashMap<String, String>>>,
   /// Download and permission callbacks, by webview serial. Electron asks for
   /// these asynchronously, so the run loop answers over IPC.
-  policy_handlers: Rc<RefCell<HashMap<u32, PolicyHandlers>>>,
+  policy_handlers: Arc<RefCell<HashMap<u32, PolicyHandlers>>>,
   /// Native window handle (HWND / NSView / X11 window) per window serial, asked
   /// from Electron once. Used for the Win32 tweaks Electron has no API for;
   /// `window_handle()` gives Tauri this handle everywhere except Windows menus,
   /// which need a window of the calling thread (see `window::imp`).
-  native_handles: Rc<RefCell<HashMap<u32, isize>>>,
+  native_handles: Arc<RefCell<HashMap<u32, isize>>>,
 }
 
-// SAFETY: we ensure this type is only used on the main thread.
+// SAFETY: Arc clones may cross threads; RefCell state and Rc callbacks are only
+// accessed on the runtime UI thread, through on_main_thread when called elsewhere.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for RuntimeContext {}
 
-// SAFETY: we ensure this type is only used on the main thread.
+// SAFETY: Arc clones may cross threads; RefCell state and Rc callbacks are only
+// accessed on the runtime UI thread, through on_main_thread when called elsewhere.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Sync for RuntimeContext {}
 
 impl RuntimeContext {
+  /// Only this thread may access the RefCells and their non-Sync callbacks.
+  fn on_main_thread<R: Send + 'static>(
+    &self,
+    task: impl FnOnce(&Self) -> R + Send + 'static,
+  ) -> Result<R> {
+    if std::thread::current().id() == self.main_thread_id {
+      return Ok(task(self));
+    }
+    let context = self.clone();
+    let (tx, rx) = sync_channel(1);
+    self.run_tx.send(Message::Task(Box::new(move || {
+      let _ = tx.send(task(&context));
+    }))).map_err(|_| Error::FailedToSendMessage)?;
+    rx.recv().map_err(|_| Error::FailedToReceiveMessage)
+  }
+
   pub(crate) fn send_message(&self, message: Message) -> Result<()> {
     // Tasks run inline on the main thread; everything else goes to the loop.
-    let message = match (std::thread::current().id() == self.main_thread_id, message) {
+    let is_main_thread = std::thread::current().id() == self.main_thread_id;
+    let message = match (is_main_thread, message) {
       (true, Message::Task(task)) => {
         task();
         return Ok(());
       }
       (_, message) => message,
     };
-    if self.is_running.load(Ordering::Relaxed) {
+    if !is_main_thread || self.is_running.load(Ordering::Relaxed) {
       self
         .run_tx
         .send(message)
@@ -224,12 +243,17 @@ impl RuntimeContext {
   }
 
   pub(crate) fn serial_for_window(&self, id: WindowId) -> Option<u32> {
-    self.windows.borrow().get(&id).map(|window| window.serial)
+    self.on_main_thread(move |context| {
+      context.windows.borrow().get(&id).map(|window| window.serial)
+    }).ok().flatten()
   }
 
   /// The native handle of a window, as Electron knows it. Cached because Tauri
   /// asks for it on every menu/effect/decoration call.
   pub(crate) fn native_handle(&self, id: WindowId) -> Result<isize> {
+    if std::thread::current().id() != self.main_thread_id {
+      return self.on_main_thread(move |context| context.native_handle(id))?;
+    }
     let serial = self
       .serial_for_window(id)
       .ok_or_else(|| create_window_err("window is gone".to_string()))?;
@@ -255,7 +279,7 @@ impl RuntimeContext {
   #[cfg(windows)]
   pub(crate) fn menu_owner_window(&self, id: WindowId) -> Result<isize> {
     if std::thread::current().id() != self.main_thread_id {
-      return Err(create_window_err("menu owner requires the runtime UI thread".into()));
+      return self.on_main_thread(move |context| context.menu_owner_window(id))?;
     }
     let mut windows = self.windows.borrow_mut();
     let window = windows.get_mut(&id).ok_or_else(|| create_window_err("window is gone".into()))?;
@@ -311,6 +335,13 @@ impl RuntimeContext {
 
   /// Updates the remembered origin after a navigation.
   pub(crate) fn set_webview_origin_by_serial(&self, serial: u32, url: &str) {
+    if std::thread::current().id() != self.main_thread_id {
+      let url = url.to_owned();
+      if let Err(error) = self.on_main_thread(move |context| context.set_webview_origin_by_serial(serial, &url)) {
+        eprintln!("[electron] failed to update webview origin: {error}");
+      }
+      return;
+    }
     let label = self.windows.borrow().values().find_map(|window| {
       window
         .webviews
@@ -351,10 +382,14 @@ impl RuntimeContext {
     &self,
     window_id: WindowId,
     event_id: WindowEventId,
-    handler: Rc<dyn Fn(&WindowEvent) + Send>,
+    handler: impl Fn(&WindowEvent) + Send + 'static,
   ) {
-    if let Some(window) = self.windows.borrow_mut().get_mut(&window_id) {
-      window.handlers.push((event_id, handler));
+    if let Err(error) = self.on_main_thread(move |context| {
+      if let Some(window) = context.windows.borrow_mut().get_mut(&window_id) {
+        window.handlers.push((event_id, Rc::new(handler)));
+      }
+    }) {
+      eprintln!("[electron] failed to register window handler: {error}");
     }
   }
 
@@ -362,17 +397,17 @@ impl RuntimeContext {
     &self,
     serial: u32,
     event_id: tauri_runtime::WebviewEventId,
-    handler: Rc<dyn Fn(&tauri_runtime::window::WebviewEvent) + Send>,
+    handler: impl Fn(&tauri_runtime::window::WebviewEvent) + Send + 'static,
   ) {
-    for window in self.windows.borrow_mut().values_mut() {
-      if let Some(webview) = window
-        .webviews
-        .iter_mut()
-        .find(|webview| webview.serial == serial)
-      {
-        webview.handlers.push((event_id, handler));
-        return;
+    if let Err(error) = self.on_main_thread(move |context| {
+      for window in context.windows.borrow_mut().values_mut() {
+        if let Some(webview) = window.webviews.iter_mut().find(|webview| webview.serial == serial) {
+          webview.handlers.push((event_id, Rc::new(handler)));
+          break;
+        }
       }
+    }) {
+      eprintln!("[electron] failed to register webview handler: {error}");
     }
   }
 
@@ -886,10 +921,9 @@ impl ElectronRuntime {
             let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
               continue;
             };
-            let handlers = self.context.webview_handlers.borrow();
-            if let Some(handler) = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.page_load.as_ref())
+            let handler = self.context.webview_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.page_load.clone());
+            if let Some(handler) = handler
             {
               let page_load = if name == "webview.loadStarted" {
                 PageLoadEvent::Started
@@ -905,10 +939,9 @@ impl ElectronRuntime {
               continue;
             };
             let title = params["title"].as_str().unwrap_or_default().to_string();
-            let handlers = self.context.webview_handlers.borrow();
-            if let Some(handler) = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.title.as_ref())
+            let handler = self.context.webview_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.title.clone());
+            if let Some(handler) = handler
             {
               handler(title);
             }
@@ -924,13 +957,9 @@ impl ElectronRuntime {
             let features = params["features"].as_str().unwrap_or_default();
             // Electron always denies the popup: the answer may create a Tauri
             // window (whose URL is loaded into it), allow a bare popup, or deny.
-            let response = {
-              let handlers = self.context.webview_handlers.borrow();
-              handlers
-                .get(&(serial as u32))
-                .and_then(|handlers| handlers.new_window.as_ref())
-                .map(|handler| handler(url.clone(), features))
-            };
+            let handler = self.context.webview_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.new_window.clone());
+            let response = handler.map(|handler| handler(url.clone(), features));
             match response {
               Some(NewWindowResponse::Create { window_id }) => {
                 let target = self.context.serial_for_window(window_id);
@@ -980,10 +1009,9 @@ impl ElectronRuntime {
               "[electron] webview {serial} process gone: {reason}",
               reason = termination.error_string.as_deref().unwrap_or("unknown")
             );
-            let handlers = self.context.webview_handlers.borrow();
-            if let Some(handler) = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.process_gone.as_ref())
+            let handler = self.context.webview_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.process_gone.clone());
+            if let Some(handler) = handler
             {
               handler(termination);
             }
@@ -1048,19 +1076,13 @@ impl ElectronRuntime {
               continue;
             };
             let kind = permission_kind(params["kind"].as_str().unwrap_or_default());
-            let response = {
-              let handlers = self.context.policy_handlers.borrow();
-              match (
-                kind,
-                handlers
-                  .get(&(serial as u32))
-                  .and_then(|handlers| handlers.permission.as_deref()),
-              ) {
-                (Some(kind), Some(handler)) => permission_response_name(handler(kind)),
-                // Tauri's `Default` means the runtime default; Electron's own
-                // default for an unhandled permission is to deny it.
-                _ => "default",
-              }
+            let handler = self.context.policy_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.permission.clone());
+            let response = match (kind, handler) {
+              (Some(kind), Some(handler)) => permission_response_name(handler(kind)),
+              // Tauri's `Default` means the runtime default; Electron's own
+              // default for an unhandled permission is to deny it.
+              _ => "default",
             };
             if let Err(error) = self.context.ipc.call(
               "webview.permissionResponse",
@@ -1589,6 +1611,9 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   pending: PendingWindow<T, ElectronRuntime>,
   after_window_creation: Option<F>,
 ) -> Result<DetachedWindow<T, ElectronRuntime>> {
+  if std::thread::current().id() != context.main_thread_id {
+    return context.on_main_thread(move |context| create_window_impl(context, pending, after_window_creation))?;
+  }
   let PendingWindow {
     label,
     window_builder,
@@ -1712,11 +1737,11 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       // Tauri resolves parent/owner through window_handle(), so translate our
       // per-window menu owner back to the actual Electron window.
       let parent_id = context.windows.borrow().iter().find_map(|(id, window)| {
-        window.menu_owner.as_ref().filter(|menu| menu.handle == owner.0 as isize).map(|_| *id)
+        window.menu_owner.as_ref().filter(|menu| menu.handle == owner).map(|_| *id)
       });
       let owner = match parent_id {
         Some(id) => context.native_handle(id)?,
-        None => owner.0 as isize,
+        None => owner,
       };
       crate::window::imp::set_owner(handle, owner);
     }
@@ -1730,7 +1755,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       .native_handles
       .borrow()
       .iter()
-      .find(|(_, handle)| **handle == parent as isize)
+      .find(|(_, handle)| **handle == parent)
       .map(|(serial, _)| *serial);
     match parent_serial {
       Some(parent_serial) => {
@@ -1839,6 +1864,9 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   window_id: WindowId,
   mut pending: PendingWebview<T, ElectronRuntime>,
 ) -> Result<DetachedWebview<T, ElectronRuntime>> {
+  if std::thread::current().id() != context.main_thread_id {
+    return context.on_main_thread(move |context| create_webview_impl(context, window_id, pending))?;
+  }
   let serial = context
     .serial_for_window(window_id)
     .ok_or_else(|| create_webview_err("window does not exist".into()))?;
@@ -2028,7 +2056,7 @@ pub(crate) struct WebviewHandlers {
 #[derive(Default)]
 pub(crate) struct PolicyHandlers {
   download: Option<Arc<DownloadHandler>>,
-  permission: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
+  permission: Option<Arc<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
 }
 
 impl PolicyHandlers {
@@ -2111,7 +2139,7 @@ fn register_policy_handlers<T: UserEvent>(
 ) -> (bool, bool) {
   let handlers = PolicyHandlers {
     download: pending.download_handler.take(),
-    permission: pending.permission_request_handler.take(),
+    permission: pending.permission_request_handler.take().map(Arc::from),
   };
   let wired = (handlers.download.is_some(), handlers.permission.is_some());
   if !handlers.is_empty() {
@@ -2154,6 +2182,52 @@ fn menu_command_enabled(menu: &Value, command: u32) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn worker_state_access_and_reentrant_handlers_stay_on_the_ui_thread() {
+    let (_events, event_rx) = channel();
+    let runtime = ElectronRuntime::init(Ipc::test_connection(), event_rx, None, None);
+    let context = runtime.context.clone();
+    let id = context.next_window_id();
+    context.windows.borrow_mut().insert(id, Window {
+      label: "worker".into(), serial: 42,
+      webviews: vec![Webview { serial: 7, label: "guest".into(), handlers: vec![] }],
+      handlers: vec![],
+      #[cfg(windows)]
+      menu_owner: None,
+    });
+    let main_thread = std::thread::current().id();
+    assert_eq!(context.on_main_thread(|_| std::thread::current().id()).unwrap(), main_thread);
+    let worker = std::thread::spawn(move || {
+      assert_eq!(context.serial_for_window(id), Some(42));
+      let events = context.clone();
+      context.add_window_event_handler(id, 1, move |_| {
+        assert_eq!(std::thread::current().id(), main_thread);
+        events.on_main_thread(|context| context.windows.borrow_mut().clear()).unwrap();
+      });
+      context.add_webview_event_handler(7, 2, |_| {});
+      context.set_webview_origin_by_serial(7, "https://example.com/path");
+      context.send_message(Message::Task(Box::new(move || {
+        assert_eq!(std::thread::current().id(), main_thread);
+      }))).unwrap();
+      context.on_main_thread(move |context| {
+        assert_eq!(std::thread::current().id(), main_thread);
+        assert_eq!(context.webview_origins.borrow().get("guest").map(String::as_str), Some("https://example.com"));
+        assert_eq!(context.windows.borrow()[&id].webviews[0].handlers.len(), 1);
+        context.emit_window_event(id, &WindowEvent::Destroyed);
+        assert!(context.windows.borrow().is_empty());
+      }).unwrap();
+    });
+    // A worker started during setup must queue tasks even before run() starts.
+    while !worker.is_finished() {
+      match runtime.run_rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(Message::Task(task)) => task(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+        _ => panic!("unexpected runtime task"),
+      }
+    }
+    worker.join().unwrap();
+  }
 
   #[test]
   fn validates_custom_scheme_names() {

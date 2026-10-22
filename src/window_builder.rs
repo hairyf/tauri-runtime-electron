@@ -43,12 +43,12 @@ pub struct ElectronWindowBuilder {
   pub(crate) unsupported: Vec<&'static str>,
   /// Owning window handle (Windows: sets the owner, not the parent).
   #[cfg(windows)]
-  pub(crate) owner: Option<HWND>,
+  pub(crate) owner: Option<isize>,
   #[cfg(windows)]
-  pub(crate) parent: Option<HWND>,
+  pub(crate) parent: Option<isize>,
   /// Parent window (macOS keeps the NSWindow pointer until the window exists).
   #[cfg(target_os = "macos")]
-  pub(crate) macos_parent: Option<*mut std::ffi::c_void>,
+  pub(crate) macos_parent: Option<isize>,
 }
 
 impl Default for ElectronWindowBuilder {
@@ -256,13 +256,13 @@ impl WindowBuilder for ElectronWindowBuilder {
 
   #[cfg(windows)]
   fn owner(mut self, owner: HWND) -> Self {
-    self.owner = Some(owner);
+    self.owner = Some(owner.0 as isize);
     self
   }
 
   #[cfg(windows)]
   fn parent(mut self, parent: HWND) -> Self {
-    self.parent = Some(parent);
+    self.parent = Some(parent.0 as isize);
     self
   }
 
@@ -270,7 +270,7 @@ impl WindowBuilder for ElectronWindowBuilder {
   fn parent(mut self, parent: *mut std::ffi::c_void) -> Self {
     // The pointer is one of our own windows: the runtime maps it back to a
     // serial and Electron then calls `setParentWindow`.
-    self.macos_parent = Some(parent);
+    self.macos_parent = Some(parent as isize);
     self
   }
 

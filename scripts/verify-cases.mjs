@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { verifyApi } from './verify-api.mjs'
-import { verifyDrag, verifyIsolation, verifyMultiwebview } from './verify-embedded.mjs'
+import { observer, verifyDrag, verifyIsolation, verifyMultiwebview } from './verify-embedded.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8')
@@ -159,6 +159,50 @@ async function expectCommand(t, target, name) {
       return [...new Uint8Array(response)]
     })()`)
     t.check('raw_request exact binary bytes', raw, [...fs.readFileSync(path.join(root, 'source/tauri/examples/commands/README.md'))])
+  }
+}
+
+// Probe through a real media request: the official CSP permits media-src, while
+// connect-src correctly refuses page fetches to this cross-origin resource.
+async function mediaRange(t, target, source, connect = observer) {
+  const url = new URL(source)
+  url.searchParams.set('__verify_range', String(Date.now()))
+  let resolve, reject, timer, cdp
+  const received = new Promise((ok, fail) => { resolve = ok; reject = fail })
+  // Attach the rejection handler before launching a request that may fail early.
+  received.catch(() => {})
+  cdp = await connect(target, ({ method, params }) => {
+    if (method !== 'Fetch.requestPaused') return
+    const request = { requestId: params.requestId }
+    const respond = async () => {
+      if (params.responseErrorReason) throw new Error(`media range request failed: ${params.responseErrorReason}`)
+      if (params.responseStatusCode !== undefined) {
+        const body = await cdp.send('Fetch.getResponseBody', request)
+        const headers = Object.fromEntries(params.responseHeaders.map(({ name, value }) => [name.toLowerCase(), value]))
+        await cdp.send('Fetch.continueRequest', request)
+        resolve({ status: params.responseStatusCode, contentRange: headers['content-range'],
+          contentLength: headers['content-length'], bytes: [...Buffer.from(body.body, body.base64Encoded ? 'base64' : 'utf8')] })
+      } else {
+        const headers = Object.entries(params.request.headers).filter(([name]) => name.toLowerCase() !== 'range')
+          .map(([name, value]) => ({ name, value }))
+        await cdp.send('Fetch.continueRequest', { ...request, headers: [...headers, { name: 'Range', value: 'bytes=0-15' }] })
+      }
+    }
+    respond().catch(reject)
+  })
+  try {
+    await cdp.send('Fetch.enable', { patterns: ['Request', 'Response'].map(requestStage => ({ urlPattern: url.href, resourceType: 'Media', requestStage })) })
+    timer = setTimeout(() => reject(new Error('media range response timed out')), 20000)
+    await t.evaluate(target, `(() => {
+      const video = document.createElement('video')
+      video.id = '__verify_range_media'; video.preload = 'auto'; video.muted = true
+      video.src = ${json(url.href)}; document.body.append(video); video.load()
+    })()`)
+    return await received
+  } finally {
+    clearTimeout(timer)
+    try { await cdp.send('Fetch.disable') } finally { cdp.close() }
+    await t.evaluate(target, `document.querySelector('#__verify_range_media')?.remove()`)
   }
 }
 
@@ -392,12 +436,17 @@ export const cases = {
       target,
       `(async () => {
         const element = document.querySelector('#video_source')
-        const targetTime = Math.min(element.duration / 2, Math.max(0.1, element.duration - 0.1))
+        const targetTime = Math.min(30, element.duration / 2)
         element.currentTime = targetTime
         await new Promise((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error('seek timed out')), 10000)
           element.addEventListener('seeked', () => { clearTimeout(timer); resolve() }, { once: true })
         })
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('seeked frame was not rendered')), 10000)
+          element.requestVideoFrameCallback(() => { clearTimeout(timer); element.pause(); resolve() })
+        })
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
         return { requested: targetTime, actual: element.currentTime }
       })()`,
       20000,
@@ -407,15 +456,11 @@ export const cases = {
     const videoPath = path.join(t.root, '.cache', 'examples', t.name, 'streaming_example_test_video.mp4')
     assert(fs.existsSync(videoPath), `streaming source file is missing: ${videoPath}`)
     const bytes = fs.readFileSync(videoPath)
-    const range = await t.evaluate(
-      target,
-      `(async () => {
-        const response = await fetch(${json(video.src)}, { headers: { Range: 'bytes=0-15' } })
-        return { status: response.status, contentRange: response.headers.get('content-range'), bytes: [...new Uint8Array(await response.arrayBuffer())] }
-      })()`,
-      20000,
-    )
+    await t.capture(target, 'streaming-seeked')
+    const range = await mediaRange(t, target, video.src)
+    fs.writeFileSync(path.join(t.dir, 'streaming-range.json'), JSON.stringify(range, null, 2))
     t.check('streaming range status', range.status, 206)
+    t.check('streaming range content-length', range.contentLength, '16')
     t.check('streaming range content-range', range.contentRange, `bytes 0-15/${bytes.length}`)
     t.check('streaming range bytes', range.bytes, [...bytes.subarray(0, 16)])
     await t.capture(target, 'streaming-playing')
@@ -424,6 +469,27 @@ export const cases = {
 
 // Offline verifier contract guard only; this does not verify any desktop app.
 if (process.argv.includes('--self-check') && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  let paused, rangeUrl, rangeHeaders, rangeClosed = false, rangeRemoved = false
+  const range = await mediaRange({ async evaluate(_target, expression) {
+    if (expression.includes("?.remove()")) { rangeRemoved = true; return }
+    paused({ method: 'Fetch.requestPaused', params: { requestId: 'range', request: { headers: { Range: 'bytes=0-', Accept: '*/*' } } } })
+  } }, {}, 'http://stream.localhost/video.mp4', async (_target, onEvent) => {
+    paused = onEvent
+    return { close() { rangeClosed = true }, async send(method, params) {
+      if (method === 'Fetch.enable') { rangeUrl = params.patterns[0].urlPattern; assert.deepEqual(params.patterns.map(p => p.requestStage), ['Request', 'Response']) }
+      if (method === 'Fetch.continueRequest' && params.headers) {
+        rangeHeaders = params.headers
+        paused({ method: 'Fetch.requestPaused', params: { requestId: 'range', responseStatusCode: 206, responseHeaders: [
+          { name: 'Content-Range', value: 'bytes 0-15/123' }, { name: 'Content-Length', value: '16' },
+        ] } })
+      }
+      if (method === 'Fetch.getResponseBody') return { body: Buffer.from(Array.from({ length: 16 }, (_, i) => i)).toString('base64'), base64Encoded: true }
+    } }
+  })
+  assert.equal(new URL(rangeUrl).pathname, '/video.mp4')
+  assert.deepEqual(rangeHeaders, [{ name: 'Accept', value: '*/*' }, { name: 'Range', value: 'bytes=0-15' }])
+  assert.deepEqual(range, { status: 206, contentRange: 'bytes 0-15/123', contentLength: '16', bytes: Array.from({ length: 16 }, (_, i) => i) })
+  assert(rangeClosed && rangeRemoved, 'range probe must release CDP and temporary media')
   const main = { id: 'main', type: 'page' }, splash = { id: 'splash', type: 'page', url: 'tauri://localhost/splashscreen.html' }
   const steps = []
   let closed = false

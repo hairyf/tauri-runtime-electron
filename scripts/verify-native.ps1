@@ -76,6 +76,10 @@ public static class NativeVerify {
         return name.ToString() == className;
     }
     public static bool ScopedPopup(IntPtr window) { return Own(window, "#32768") && IsWindowVisible(window); }
+    public static bool ScopedMenuWindow(IntPtr window) {
+        uint process; GetWindowThreadProcessId(window, out process);
+        return processes.Contains(process) && IsWindowVisible(window);
+    }
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint command);
     public static NativeMenuTrace[] MenuWindows() {
         var result = new List<NativeMenuTrace>();
@@ -108,24 +112,19 @@ public static class NativeVerify {
         }
         return null;
     }
-    public static long[] Popups() {
-        var handles = new List<long>();
-        Check(EnumWindows((window, data) => { if (ScopedPopup(window)) handles.Add(window.ToInt64()); return true; }, IntPtr.Zero));
-        return handles.ToArray();
-    }
     public static void ClickAt(int x, int y, bool right) {
         Cursor(x, y); Thread.Sleep(40);
         mouse_event(right ? 8u : 2u, 0, 0, 0, UIntPtr.Zero);
         try { Thread.Sleep(25); } finally { mouse_event(right ? 16u : 4u, 0, 0, 0, UIntPtr.Zero); }
     }
     public static void PopupClick(IntPtr window, int x, int y) {
-        if (!ScopedPopup(window) || GetAncestor(WindowFromPoint(new Point { x=x, y=y }), 2) != window)
+        if (!ScopedMenuWindow(window) || GetAncestor(WindowFromPoint(new Point { x=x, y=y }), 2) != window)
             throw new InvalidOperationException("Scoped popup item is obscured or no longer open.");
         ClickAt(x, y, false);
     }
     [DllImport("user32.dll")] static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
     public static void DismissPopup(IntPtr window) {
-        if (!ScopedPopup(window)) throw new InvalidOperationException("Scoped popup is no longer open.");
+        if (!ScopedMenuWindow(window)) throw new InvalidOperationException("Scoped popup is no longer open.");
         uint process; GetWindowThreadProcessId(GetForegroundWindow(), out process);
         if (!processes.Contains(process)) throw new InvalidOperationException("Foreground window is outside the scoped process tree.");
         keybd_event(0x1B, 0, 0, UIntPtr.Zero);
@@ -243,7 +242,10 @@ function Save-Rectangle($rect) {
 if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menubar','menubar-click','menu-diagnostics') -or ($Action -eq 'capture' -and $Surface -ne 'window')) {
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    function Bounds($rect) { @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
+    function Bounds($rect) {
+        if ($rect.IsEmpty -or ![double]::IsFinite($rect.X) -or ![double]::IsFinite($rect.Y) -or ![double]::IsFinite($rect.Width) -or ![double]::IsFinite($rect.Height)) { return $null }
+        @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height }
+    }
     if ($Action -eq 'menu-diagnostics') {
         $traces = @(foreach ($nativeWindow in [NativeVerify]::MenuWindows()) {
             $nodes = [Collections.Generic.List[object]]::new()
@@ -252,14 +254,19 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
             try {
                 $queue.Enqueue(@{ element=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$nativeWindow.handle); depth=0 })
                 while ($queue.Count -and $nodes.Count -lt 128) {
-                    $node = $queue.Dequeue(); $info = $node.element.Current
-                    $nodes.Add(@{ depth=$node.depth; role=$info.ControlType.ProgrammaticName; name=$info.Name; className=$info.ClassName; process=$info.ProcessId; handle=$info.NativeWindowHandle; offscreen=$info.IsOffscreen; bounds=(Bounds $info.BoundingRectangle) })
-                    if ($node.depth -ge 8) { continue }
-                    $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetFirstChild($node.element)
-                    while ($entry -and $nodes.Count+$queue.Count -lt 128) {
-                        $queue.Enqueue(@{ element=$entry; depth=$node.depth+1 })
-                        $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetNextSibling($entry)
-                    }
+                    $node = $queue.Dequeue()
+                    try {
+                        $info = $node.element.Current
+                        $nodes.Add(@{ depth=$node.depth; role=$info.ControlType.ProgrammaticName; name=$info.Name; className=$info.ClassName; process=$info.ProcessId; handle=$info.NativeWindowHandle; offscreen=$info.IsOffscreen; bounds=(Bounds $info.BoundingRectangle) })
+                        if ($node.depth -ge 8) { continue }
+                        $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetFirstChild($node.element)
+                        while ($entry -and $nodes.Count+$queue.Count -lt 128) {
+                            $queue.Enqueue(@{ element=$entry; depth=$node.depth+1 })
+                            $entry = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetNextSibling($entry)
+                        }
+                    } catch [System.Windows.Automation.ElementNotAvailableException] { $nodes.Add(@{ depth=$node.depth; error="ElementNotAvailable: $($_.Exception.Message)" }) }
+                      catch [System.Runtime.InteropServices.COMException] { $nodes.Add(@{ depth=$node.depth; error="COM $($_.Exception.HResult): $($_.Exception.Message)" }) }
+                      catch [System.Management.Automation.RuntimeException] { $nodes.Add(@{ depth=$node.depth; error=$_.Exception.Message }) }
                 }
             } catch [System.Windows.Automation.ElementNotAvailableException] { $errorText = "ElementNotAvailable: $($_.Exception.Message)" }
               catch [System.Runtime.InteropServices.COMException] { $errorText = "COM $($_.Exception.HResult): $($_.Exception.Message)" }
@@ -295,16 +302,26 @@ if ($Action -in @('popup','menu-click','dismiss','tray-state','tray-click','menu
         ConvertTo-Json -InputObject $result -Depth 8 -Compress; return
     }
     function Get-Popups {
-        foreach ($popupHandle in [NativeVerify]::Popups()) {
-            $element = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$popupHandle)
-            $menuCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem)
-            $items = @(foreach ($item in $element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $menuCondition)) {
-                $info = $item.Current; $pattern = $null; $checked = $null
-                if ($item.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) { $checked = $pattern.Current.ToggleState.ToString() }
-                else { $checked = [NativeVerify]::MenuChecked([IntPtr]$popupHandle, ($info.Name -split "`t")[0]) }
-                @{ name=($info.Name -split "`t")[0]; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=(Bounds $info.BoundingRectangle) }
-            })
-            @{ handle=$popupHandle; bounds=(Bounds $element.Current.BoundingRectangle); items=$items }
+        # Electron uses a Views MenuRunner desktop widget, not a Win32 #32768.
+        $menuRole = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Menu)
+        $itemRole = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem)
+        foreach ($nativeWindow in [NativeVerify]::MenuWindows() | Where-Object visible) {
+            try {
+                $popupHandle = [IntPtr]$nativeWindow.handle
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($popupHandle)
+                $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Element -bor [System.Windows.Automation.TreeScope]::Children, $menuRole)
+                if (!$element -or $element.Current.IsOffscreen) { continue }
+                $items = @(foreach ($item in $element.FindAll([System.Windows.Automation.TreeScope]::Children, $itemRole)) {
+                    $info = $item.Current; $pattern = $null; $checked = $null
+                    if ($item.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) { $checked = $pattern.Current.ToggleState.ToString() }
+                    elseif ($nativeWindow.className -ceq '#32768') { $checked = [NativeVerify]::MenuChecked($popupHandle, ($info.Name -split "`t")[0]) }
+                    elseif ($item.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$pattern)) {
+                        $checked = if ($pattern.Current.State -band 0x10) { 'On' } else { 'Off' }
+                    }
+                    @{ name=($info.Name -split "`t")[0]; enabled=$info.IsEnabled; offscreen=$info.IsOffscreen; checked=$checked; bounds=(Bounds $info.BoundingRectangle) }
+                })
+                if ($items.Count) { @{ handle=$nativeWindow.handle; bounds=(Bounds $element.Current.BoundingRectangle); items=$items } }
+            } catch [System.Windows.Automation.ElementNotAvailableException] { continue }
         }
     }
     if ($Action -in @('popup','menu-click','dismiss') -or ($Action -eq 'capture' -and $Surface -eq 'popup')) {

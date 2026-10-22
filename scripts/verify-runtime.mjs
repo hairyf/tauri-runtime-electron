@@ -190,7 +190,13 @@ try {
       Invoke-Expression $assignment.Extent.Text
       $roles = @($condition.GetConditions() | ForEach-Object Value)
       if ($roles.Count -ne 2 -or $roles[0] -ne [System.Windows.Automation.ControlType]::MenuItem.Id -or $roles[1] -ne [System.Windows.Automation.ControlType]::Button.Id) { throw 'Menubar must accept Win32 MenuItem and Electron popup Button' }
-      'PASS native menu selector: Win32 MenuItem and Electron Button (offline; no UI proof)'
+      $bounds = $menuAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Bounds' }, $true)
+      if (!$bounds) { throw 'Missing native menu bounds parser' }
+      Invoke-Expression $bounds.Extent.Text
+      if ($null -ne (Bounds ([System.Windows.Rect]::Empty))) { throw 'Empty menu bounds must remain null' }
+      $rect = Bounds ([System.Windows.Rect]::new(20,30,40,50))
+      if ($rect.x -ne 20 -or $rect.y -ne 30 -or $rect.width -ne 40 -or $rect.height -ne 50) { throw 'Finite menu bounds must remain unchanged' }
+      'PASS native menu selector and finite bounds (offline; no UI proof)'
     `], { cwd: root, stdio: 'inherit', timeout: 10000 })
     assert.equal(menuCheck.status, 0, menuCheck.error?.message ?? 'native menu selector regression')
   }
@@ -257,6 +263,19 @@ try {
     assert.equal(params.headers.range, 'bytes=0-')
     assert.equal(params.headers.origin, 'https://page.example')
   }
+  // Transport preserves a 16-byte range; it must not invent cross-origin fetch permission.
+  const prefixBytes = Uint8Array.from({ length: 16 }, (_, i) => i * 17)
+  protocolReply = { status: 206, headers: {
+    'content-type': 'video/mp4', 'content-length': '16', 'content-range': 'bytes 0-15/249224577',
+  }, body: Buffer.from(prefixBytes).toString('base64') }
+  const prefix = await protocolHandlers.get('http')(new Request('http://stream.localhost/video.mp4', { headers: { Range: 'bytes=0-15', Origin: 'tauri://localhost' } }))
+  assert.equal(protocolEvents.at(-1).params.headers.range, 'bytes=0-15')
+  assert.equal(prefix.status, 206)
+  assert.equal(prefix.headers.get('content-range'), 'bytes 0-15/249224577')
+  assert.equal(prefix.headers.get('content-length'), '16')
+  assert.equal(prefix.headers.get('access-control-allow-origin'), null)
+  assert.equal(prefix.headers.get('access-control-expose-headers'), null)
+  assert.deepEqual(new Uint8Array(await prefix.arrayBuffer()), prefixBytes)
   protocolReply = { status: 416, headers: { 'content-range': 'bytes */249224577' }, body: '' }
   const invalidRange = await protocolHandlers.get('http')(new Request('http://stream.localhost/video.mp4', { headers: { Range: 'bytes=249224577-' } }))
   assert.equal(invalidRange.status, 416)

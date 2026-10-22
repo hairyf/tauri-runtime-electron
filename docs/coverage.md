@@ -34,7 +34,7 @@ Do not edit by hand — re-run the script.
 
 | member | status | where |
 | --- | --- | --- |
-| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1416` |
+| `set_device_event_filter` | 🚫 no Electron equivalent | `src/runtime.rs:1438` |
 
 ## RuntimeHandle
 
@@ -62,15 +62,15 @@ Every member is implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `gtk_window` | ⛔ refused | `src/window.rs:184` |
-| `default_vbox` | ⛔ refused | `src/window.rs:197` |
-| `activity_name` | ⛔ refused | `src/window.rs:204` |
-| `scene_identifier` | ⛔ refused | `src/window.rs:211` |
-| `set_decorations` | ⚠️ only some platforms | `src/window.rs:342` |
-| `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:442` |
-| `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:464` |
-| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:494` |
-| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:545` |
+| `gtk_window` | ⛔ refused | `src/window.rs:183` |
+| `default_vbox` | ⛔ refused | `src/window.rs:196` |
+| `activity_name` | ⛔ refused | `src/window.rs:203` |
+| `scene_identifier` | ⛔ refused | `src/window.rs:210` |
+| `set_decorations` | ⚠️ only some platforms | `src/window.rs:341` |
+| `set_cursor_grab` | ⚠️ only some platforms | `src/window.rs:441` |
+| `set_cursor_position` | ⚠️ only some platforms | `src/window.rs:463` |
+| `start_resize_dragging` | ⚠️ only some platforms | `src/window.rs:493` |
+| `set_title_bar_style` | 🚫 no Electron equivalent | `src/window.rs:544` |
 
 ## WebviewDispatch
 
@@ -78,8 +78,8 @@ Every member is implemented.
 
 | member | status | where |
 | --- | --- | --- |
-| `with_ios_webview` | 🚫 no Electron equivalent | `src/webview.rs:76` |
-| `reparent` | 🚫 no Electron equivalent | `src/webview.rs:232` |
+| `with_ios_webview` | 🚫 no Electron equivalent | `src/webview.rs:75` |
+| `reparent` | 🚫 no Electron equivalent | `src/webview.rs:231` |
 
 ## WindowBuilder
 

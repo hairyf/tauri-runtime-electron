@@ -7,7 +7,6 @@ use crate::runtime::{
   position_payload, size_payload,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tauri_runtime::{
   Result, UserEvent, WebviewDispatch,
@@ -61,7 +60,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     f: F,
   ) -> tauri_runtime::WebviewEventId {
     let id = self.context.next_webview_event_id();
-    self.context.add_webview_event_handler(self.id, id, Rc::new(f));
+    self.context.add_webview_event_handler(self.id, id, f);
     id
   }
 

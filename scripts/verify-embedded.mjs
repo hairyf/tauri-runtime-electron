@@ -301,7 +301,7 @@ export async function verifyDrag(t) {
 
 // t.command opens a fresh socket per request. Isolation needs one retained CDP
 // session to observe original console calls, iframe contexts and transport bytes.
-async function observer(target, onEvent) {
+export async function observer(target, onEvent) {
   const socket = new WebSocket(target.webSocketDebuggerUrl), pending = new Map()
   let next = 1
   await new Promise((resolve, reject) => {

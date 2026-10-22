@@ -98,6 +98,11 @@ follow [Semantic Versioning](https://semver.org/).
   real API surface can be exercised by hand without touching `source/tauri`.
 
 ### Bug Fixes
+- Window creation, handler registration and shared-state reads from worker
+  threads are dispatched to the runtime UI thread. Callbacks release internal
+  borrows before invoking app code, so reentrant window operations remain valid.
+- Windows drag requests enter Chromium's native move loop through `SC_MOVE`;
+  resize requests keep their directional non-client messages.
 - Resource URL conversion uses registered HTTP/HTTPS aliases so Chromium parses
   the total `Content-Range` length of chunked video instead of treating the first
   chunk as the whole file. Custom handlers keep their canonical URI and request
@@ -129,8 +134,8 @@ follow [Semantic Versioning](https://semver.org/).
   now falls back to `build.devUrl` in debug builds.
 - Fix a deadlock when the first window loads a `tauri://` URL: `loadWebview` no
   longer awaits `loadURL`, so the Rust run loop can answer `protocol.request`.
-- Fix the IPC handler lookup missing registered handlers: the handler map is
-  shared through `Rc<RefCell<…>>` instead of being cloned per dispatcher.
+- Fix the IPC handler lookup missing registered handlers: dispatchers share the
+  handler map, and its contents are accessed on the runtime UI thread.
 - Fix `Runtime::cursor_position` returning a `(0, 0)` stub; it now asks
   Electron's `screen.getCursorScreenPoint`.
 - Fix frameless secondary windows showing a native title bar next to the app's
