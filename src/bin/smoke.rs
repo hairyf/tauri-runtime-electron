@@ -126,6 +126,11 @@ fn main() -> ExitCode {
       webview.ipc_handler = Some(Box::new(|_webview, request| {
         IPC.lock().unwrap().push(request.body().clone());
       }));
+      webview.on_page_load_handler = Some(Box::new(|_url, event| {
+        LOADS.lock().unwrap().push(format!("{event:?}"));
+      }));
+      webview.document_title_changed_handler =
+        Some(Box::new(|title| TITLES.lock().unwrap().push(title)));
       pending.set_webview(webview);
     }
     Err(error) => {
@@ -576,6 +581,14 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     "String(window.devicePixelRatio)",
   );
 
+  // The runtime reports the page's lifecycle to the handlers an app registers.
+  expect_named(failures, "page load finished", "Finished", || {
+    LOADS.lock().unwrap().clone()
+  });
+  expect_named(failures, "document title", "smoke-page", || {
+    TITLES.lock().unwrap().clone()
+  });
+
   // The page talks to the runtime the way a Tauri app's frontend does.
   let _ = eval_once(webview, "window.ipc.postMessage('ping')");
   let started = Instant::now();
@@ -790,3 +803,9 @@ static REPORT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// What the page posted through the IPC bridge, as the runtime received it.
 static IPC: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The page load events the runtime reported to the handler.
+static LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The document titles the runtime reported to the handler.
+static TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
