@@ -113,19 +113,17 @@ build instead of a user's app.
 pnpm example <name>
 ```
 
-`pnpm example` with no name lists the examples that can be built: `api`,
-`file-associations` and `resources` (`resources` and `file-associations` are self
-contained, so they run without any setup). Each run copies the example workspace into
-`target/examples/<name>/`, patches the copy onto this runtime, runs it, and deletes it
-again — `source/tauri` is only ever read.
+`pnpm example` with no name lists them: `api`, `commands`, `drag`,
+`file-associations`, `helloworld`, `isolation`, `multiwebview`, `multiwindow`,
+`resources`, `run-return`, `splashscreen`, `state`, `streaming`. The five with a Cargo
+project in `src-tauri` are copied as they are; the rest are documentation snippets, so
+the script writes the `Cargo.toml` and `build.rs` they never had, drops `wry` and
+`isolation` from their configuration, and points them at this runtime. Anything extra is
+copied into `target/example/`, patched there and deleted afterwards — `source/tauri` is
+only ever read.
 
-The `api` example drives menus, tray, dialogs, events, channels, plugins and most of the
-webview API, which makes it the broadest test we have. Its frontend is not checked in, so
-build it once first (needs network):
-
-```bash
-cd source/tauri/examples/api && pnpm install && pnpm build
-```
+An example whose frontend is not checked in (`api`) is built in the copy with
+`pnpm install` and `pnpm build`, which needs network.
 
 ---
 
