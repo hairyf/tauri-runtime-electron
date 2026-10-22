@@ -41,25 +41,25 @@ impl WindowBuilder for ElectronWindowBuilder {
     self
   }
 
-  fn position(self, x: f64, y: f64) -> Self {
+  fn position(self, _x: f64, _y: f64) -> Self {
     self
   }
 
-  fn inner_size(self, min_width: f64, min_height: f64) -> Self {
+  fn inner_size(self, _min_width: f64, _min_height: f64) -> Self {
     self
   }
 
-  fn min_inner_size(self, min_width: f64, min_height: f64) -> Self {
+  fn min_inner_size(self, _min_width: f64, _min_height: f64) -> Self {
     self
   }
 
-  fn max_inner_size(self, max_width: f64, max_height: f64) -> Self {
+  fn max_inner_size(self, _max_width: f64, _max_height: f64) -> Self {
     self
   }
 
   fn inner_size_constraints(
     self,
-    constraints: tauri_runtime::window::WindowSizeConstraints,
+    _constraints: tauri_runtime::window::WindowSizeConstraints,
   ) -> Self {
     self
   }
@@ -68,101 +68,101 @@ impl WindowBuilder for ElectronWindowBuilder {
     self
   }
 
-  fn prevent_overflow_with_margin(self, margin: tauri_runtime::dpi::Size) -> Self {
+  fn prevent_overflow_with_margin(self, _margin: tauri_runtime::dpi::Size) -> Self {
     self
   }
 
-  fn resizable(self, resizable: bool) -> Self {
+  fn resizable(self, _resizable: bool) -> Self {
     self
   }
 
-  fn maximizable(self, resizable: bool) -> Self {
+  fn maximizable(self, _resizable: bool) -> Self {
     self
   }
 
-  fn minimizable(self, resizable: bool) -> Self {
+  fn minimizable(self, _resizable: bool) -> Self {
     self
   }
 
-  fn closable(self, resizable: bool) -> Self {
+  fn closable(self, _resizable: bool) -> Self {
     self
   }
 
-  fn title<S: Into<String>>(self, title: S) -> Self {
+  fn title<S: Into<String>>(self, _title: S) -> Self {
     self
   }
 
-  fn fullscreen(self, fullscreen: bool) -> Self {
+  fn fullscreen(self, _fullscreen: bool) -> Self {
     self
   }
 
-  fn focused(self, focused: bool) -> Self {
+  fn focused(self, _focused: bool) -> Self {
     self
   }
 
-  fn focusable(self, focusable: bool) -> Self {
+  fn focusable(self, _focusable: bool) -> Self {
     self
   }
 
-  fn maximized(self, maximized: bool) -> Self {
+  fn maximized(self, _maximized: bool) -> Self {
     self
   }
 
-  fn visible(self, visible: bool) -> Self {
+  fn visible(self, _visible: bool) -> Self {
     self
   }
 
-  fn transparent(self, transparent: bool) -> Self {
+  fn transparent(self, _transparent: bool) -> Self {
     self
   }
 
-  fn decorations(self, decorations: bool) -> Self {
+  fn decorations(self, _decorations: bool) -> Self {
     self
   }
 
-  fn always_on_bottom(self, always_on_bottom: bool) -> Self {
+  fn always_on_bottom(self, _always_on_bottom: bool) -> Self {
     self
   }
 
-  fn always_on_top(self, always_on_top: bool) -> Self {
+  fn always_on_top(self, _always_on_top: bool) -> Self {
     self
   }
 
-  fn visible_on_all_workspaces(self, visible_on_all_workspaces: bool) -> Self {
+  fn visible_on_all_workspaces(self, _visible_on_all_workspaces: bool) -> Self {
     self
   }
 
-  fn content_protected(self, protected: bool) -> Self {
+  fn content_protected(self, _protected: bool) -> Self {
     self
   }
 
-  fn icon(self, icon: Icon<'_>) -> Result<Self> {
+  fn icon(self, _icon: Icon<'_>) -> Result<Self> {
     Ok(self)
   }
 
-  fn skip_taskbar(self, skip: bool) -> Self {
+  fn skip_taskbar(self, _skip: bool) -> Self {
     self
   }
 
-  fn window_classname<S: Into<String>>(self, classname: S) -> Self {
+  fn window_classname<S: Into<String>>(self, _classname: S) -> Self {
     self
   }
 
-  fn no_redirection_bitmap(self, enable: bool) -> Self {
+  fn no_redirection_bitmap(self, _enable: bool) -> Self {
     self
   }
 
-  fn shadow(self, enable: bool) -> Self {
-    self
-  }
-
-  #[cfg(windows)]
-  fn owner(self, owner: HWND) -> Self {
+  fn shadow(self, _enable: bool) -> Self {
     self
   }
 
   #[cfg(windows)]
-  fn parent(self, parent: HWND) -> Self {
+  fn owner(self, _owner: HWND) -> Self {
+    self
+  }
+
+  #[cfg(windows)]
+  fn parent(self, _parent: HWND) -> Self {
     self
   }
 
@@ -183,7 +183,7 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   #[cfg(windows)]
-  fn drag_and_drop(self, enabled: bool) -> Self {
+  fn drag_and_drop(self, _enabled: bool) -> Self {
     self
   }
 
@@ -207,7 +207,7 @@ impl WindowBuilder for ElectronWindowBuilder {
     self
   }
 
-  fn theme(self, theme: Option<Theme>) -> Self {
+  fn theme(self, _theme: Option<Theme>) -> Self {
     self
   }
 

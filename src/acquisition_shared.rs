@@ -268,6 +268,7 @@ pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Ensures a cached Electron distribution with our main-process scripts next to
 /// its executable, downloading it when necessary. Returns the executable.
+#[allow(dead_code)] // shared with the build script, which only stages the distribution.
 pub(crate) fn install(main_cjs: &str, preload_cjs: &str) -> Result<PathBuf, String> {
   let dist = match cached_dist() {
     Some(dist) => dist,

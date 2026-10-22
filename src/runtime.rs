@@ -4,7 +4,7 @@
 
 use crate::{
   electron_impl::ipc::Ipc, environment, environment::DebugEnvironment, locale, platform, switches,
-  webview::ElectronWebviewDispatcher, window, window::ElectronWindowDispatcher,
+  webview::ElectronWebviewDispatcher, window::ElectronWindowDispatcher,
   window_handle::ElectronRuntimeHandle,
 };
 use serde_json::{json, Value};
@@ -716,7 +716,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type Handle = ElectronRuntimeHandle;
   type EventLoopProxy = EventProxy;
   
-  fn new(args: RuntimeInitArgs) -> Result<Self> {
+  fn new(_args: RuntimeInitArgs) -> Result<Self> {
     Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
   }
 
@@ -728,7 +728,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn new_any_thread(args: RuntimeInitArgs) -> Result<Self> {
+  fn new_any_thread(_args: RuntimeInitArgs) -> Result<Self> {
     Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
   }
 
@@ -868,7 +868,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     }
   }
 
-  fn set_device_event_filter(&mut self, filter: DeviceEventFilter) {}
+  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {}
 
   #[cfg(any(
     target_os = "macos",
@@ -879,7 +879,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, callback: F) {}
+  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, _callback: F) {}
 
   fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
     self.run(callback);

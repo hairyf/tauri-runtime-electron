@@ -50,8 +50,11 @@ mod imp {
   }
 
   unsafe fn read_group_icon(module: HMODULE) -> Option<Vec<u8>> {
-    let group = find(module, RT_GROUP_ICON, APP_ICON)
-      .or_else(|| LEGACY_ICON_IDS.find_map(|id| find(module, RT_GROUP_ICON, id)))?;
+    let group = find(module, RT_GROUP_ICON, APP_ICON).or_else(|| {
+      LEGACY_ICON_IDS
+        .into_iter()
+        .find_map(|id| find(module, RT_GROUP_ICON, id))
+    })?;
     // GRPICONDIR: reserved, type, count, then count GRPICONDIRENTRY of 14 bytes:
     // width, height, colors, reserved, planes, bit count, bytes, id.
     if group.len() < 6 {
