@@ -325,6 +325,7 @@ async function createWindow(params) {
     frame: params.decorations ?? true,
     transparent: params.transparent ?? false,
     show: params.visible ?? true,
+    alwaysOnTop: params.alwaysOnTop ?? false,
     autoHideMenuBar: true,
     ...(icon ? { icon } : {}),
     webPreferences: {
@@ -750,6 +751,11 @@ function handle(method, params) {
     case 'window.alwaysOnTop':
       findWindow(params.windowId).setAlwaysOnTop(params.alwaysOnTop)
       return null
+    case 'window.cursor': {
+      // The cursor over the page is the page's, so CSS is where it lives.
+      const script = `document.documentElement.style.cursor = ${JSON.stringify(params.cursor)}`
+      return findWindow(params.windowId).webContents.executeJavaScript(script).then(() => null)
+    }
     case 'window.skipTaskbar':
       findWindow(params.windowId).setSkipTaskbar(params.skip)
       return null

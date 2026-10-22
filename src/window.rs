@@ -364,10 +364,17 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_always_on_top(&self, always_on_top: bool) -> Result<()> {
+    // Electron's setter is asynchronous through the compositor and does not take
+    // effect on a window this runtime created, so the z-order is set directly
+    // and its getter is not trusted.
+    #[cfg(windows)]
+    imp::set_always_on_top(self.context.native_handle(self.id)?, always_on_top);
+    #[cfg(not(windows))]
     self.window_call(
       "window.alwaysOnTop",
       json!({ "alwaysOnTop": always_on_top }),
-    )
+    )?;
+    Ok(())
   }
 
   fn set_visible_on_all_workspaces(&self, visible_on_all_workspaces: bool) -> Result<()> {
@@ -435,21 +442,19 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(())
   }
 
-  fn set_cursor_visible(&self, _visible: bool) -> Result<()> {
-    crate::runtime::unsupported("WindowDispatch::set_cursor_visible", "Electron has no cursor API");
-    Ok(())
+  fn set_cursor_visible(&self, visible: bool) -> Result<()> {
+    let cursor = if visible { "default" } else { "none" };
+    self.window_call("window.cursor", json!({ "cursor": cursor }))
   }
 
-  fn set_cursor_icon(&self, _icon: CursorIcon) -> Result<()> {
-    crate::runtime::unsupported("WindowDispatch::set_cursor_icon", "Electron has no cursor API");
-    Ok(())
+  fn set_cursor_icon(&self, icon: CursorIcon) -> Result<()> {
+    self.window_call("window.cursor", json!({ "cursor": css_cursor(icon) }))
   }
 
   fn set_cursor_position<Pos: Into<Position>>(&self, position: Pos) -> Result<()> {
     let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
     let physical = position.into().to_physical::<i32>(scale);
-    // Electron exposes no way to move the cursor, so this is the one cursor
-    // capability the OS has to do; the others have no Tauri getter to verify.
+    // Electron exposes no way to move the cursor, so the OS has to do this one.
     if let Err(reason) = crate::platform::cursor::warp(physical, scale) {
       crate::runtime::unsupported("WindowDispatch::set_cursor_position", &reason);
     }
@@ -589,6 +594,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn is_always_on_top(&self) -> Result<bool> {
+    #[cfg(windows)]
+    return Ok(imp::is_always_on_top(self.context.native_handle(self.id)?));
+    #[cfg(not(windows))]
     Ok(self.geometry()?["alwaysOnTop"].as_bool().unwrap_or(false))
   }
 
@@ -622,9 +630,11 @@ mod imp {
   use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
   use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOZORDER,
     SetWindowLongPtrW, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION, WS_THICKFRAME,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE, SWP_NOMOVE, SWP_NOSIZE,
+    GWL_EXSTYLE, WS_EX_TOPMOST,
   };
   use tauri_runtime::ResizeDirection;
 
@@ -645,6 +655,26 @@ mod imp {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
       );
     }
+  }
+
+  pub(super) fn set_always_on_top(handle: isize, always_on_top: bool) {
+    // SAFETY: z-order only, no geometry or focus change.
+    unsafe {
+      let _ = SetWindowPos(
+        hwnd(handle),
+        Some(if always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+      );
+    }
+  }
+
+  pub(super) fn is_always_on_top(handle: isize) -> bool {
+    let style = unsafe { GetWindowLongPtrW(hwnd(handle), GWL_EXSTYLE) } as u32;
+    style & WS_EX_TOPMOST.0 != 0
   }
 
   pub(super) fn set_decorations(handle: isize, decorations: bool) {
@@ -709,5 +739,48 @@ mod imp {
         Some(LPARAM(0)),
       );
     }
+  }
+}
+
+/// The page owns the cursor over its own content, which is where a user sees it,
+/// so a Tauri cursor icon becomes a CSS `cursor` value.
+fn css_cursor(icon: CursorIcon) -> &'static str {
+  match icon {
+    CursorIcon::Default | CursorIcon::Arrow => "default",
+    CursorIcon::Crosshair => "crosshair",
+    CursorIcon::Hand => "pointer",
+    CursorIcon::Move => "move",
+    CursorIcon::Text => "text",
+    CursorIcon::Wait => "wait",
+    CursorIcon::Help => "help",
+    CursorIcon::Progress => "progress",
+    CursorIcon::NotAllowed => "not-allowed",
+    CursorIcon::ContextMenu => "context-menu",
+    CursorIcon::Cell => "cell",
+    CursorIcon::VerticalText => "vertical-text",
+    CursorIcon::Alias => "alias",
+    CursorIcon::Copy => "copy",
+    CursorIcon::NoDrop => "no-drop",
+    CursorIcon::Grab => "grab",
+    CursorIcon::Grabbing => "grabbing",
+    CursorIcon::AllScroll => "all-scroll",
+    CursorIcon::ZoomIn => "zoom-in",
+    CursorIcon::ZoomOut => "zoom-out",
+    CursorIcon::EResize => "e-resize",
+    CursorIcon::NResize => "n-resize",
+    CursorIcon::NeResize => "ne-resize",
+    CursorIcon::NwResize => "nw-resize",
+    CursorIcon::SResize => "s-resize",
+    CursorIcon::SeResize => "se-resize",
+    CursorIcon::SwResize => "sw-resize",
+    CursorIcon::WResize => "w-resize",
+    CursorIcon::EwResize => "ew-resize",
+    CursorIcon::NsResize => "ns-resize",
+    CursorIcon::NeswResize => "nesw-resize",
+    CursorIcon::NwseResize => "nwse-resize",
+    CursorIcon::ColResize => "col-resize",
+    CursorIcon::RowResize => "row-resize",
+    // The enum is non-exhaustive; a cursor Tauri adds later still points.
+    _ => "default",
   }
 }

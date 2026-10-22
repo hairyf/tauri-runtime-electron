@@ -1430,6 +1430,7 @@ pub(crate) fn create_window_impl<T: UserEvent>(
       "decorations": config.decorations,
       "transparent": config.transparent,
       "visible": config.visible,
+      "alwaysOnTop": config.always_on_top,
     });
   }
   if let Some(icon) = &context.icon {

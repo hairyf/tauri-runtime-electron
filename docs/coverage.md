@@ -38,7 +38,7 @@ round-trips (set it, read it back), on Windows, macOS and Linux in CI.
 
 | trait | members | wired | stub | no-op | warned | panic | missing |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `WindowDispatch` | 81 | 69 | 0 | 0 | 8 | 4 | 0 |
+| `WindowDispatch` | 81 | 71 | 0 | 0 | 6 | 4 | 0 |
 | `WebviewDispatch` | 31 | 29 | 0 | 0 | 2 | 0 | 0 |
 | `Runtime` | 20 | 18 | 0 | 1 | 1 | 0 | 0 |
 | `RuntimeHandle` | 20 | 14 | 0 | 0 | 1 | 5 | 0 |
@@ -54,13 +54,11 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `WindowDispatch::activity_name` | `panic` | [src/window.rs:202](src/window.rs#L202) | implemented |
 | `WindowDispatch::scene_identifier` | `panic` | [src/window.rs:207](src/window.rs#L207) | implemented |
 | `WindowDispatch::set_decorations` | `warned` — Windows path wired | [src/window.rs:330](src/window.rs#L330) | implemented |
-| `WindowDispatch::set_cursor_grab` | `warned` | [src/window.rs:433](src/window.rs#L433) | implemented |
-| `WindowDispatch::set_cursor_visible` | `warned` | [src/window.rs:438](src/window.rs#L438) | implemented |
-| `WindowDispatch::set_cursor_icon` | `warned` | [src/window.rs:443](src/window.rs#L443) | implemented |
-| `WindowDispatch::set_cursor_position` | `warned` | [src/window.rs:448](src/window.rs#L448) | implemented |
-| `WindowDispatch::start_dragging` | `warned` — Windows path wired | [src/window.rs:464](src/window.rs#L464) | implemented |
-| `WindowDispatch::start_resize_dragging` | `warned` — Windows path wired | [src/window.rs:480](src/window.rs#L480) | implemented |
-| `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:533](src/window.rs#L533) | implemented |
+| `WindowDispatch::set_cursor_grab` | `warned` | [src/window.rs:440](src/window.rs#L440) | implemented |
+| `WindowDispatch::set_cursor_position` | `warned` | [src/window.rs:454](src/window.rs#L454) | implemented |
+| `WindowDispatch::start_dragging` | `warned` — Windows path wired | [src/window.rs:469](src/window.rs#L469) | implemented |
+| `WindowDispatch::start_resize_dragging` | `warned` — Windows path wired | [src/window.rs:485](src/window.rs#L485) | implemented |
+| `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:538](src/window.rs#L538) | implemented |
 | `WebviewDispatch::with_webview` | `warned` | [src/webview.rs:97](src/webview.rs#L97) | implemented |
 | `WebviewDispatch::reparent` | `warned` | [src/webview.rs:239](src/webview.rs#L239) | implemented |
 | `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:883](src/runtime.rs#L883) | implemented |
@@ -148,8 +146,8 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `set_icon` | `wired` | `wired` |  |
 | `set_skip_taskbar` | `wired` | `wired` |  |
 | `set_cursor_grab` | `warned` | `wired` | logs once when the platform refuses |
-| `set_cursor_visible` | `warned` | `wired` | logs once when the platform refuses |
-| `set_cursor_icon` | `warned` | `wired` | logs once when the platform refuses |
+| `set_cursor_visible` | `wired` | `wired` |  |
+| `set_cursor_icon` | `wired` | `wired` |  |
 | `set_cursor_position` | `warned` | `wired` | logs once when the platform refuses |
 | `set_ignore_cursor_events` | `wired` | `wired` |  |
 | `start_dragging` | `warned` | `wired` | logs once when the platform refuses — Windows path wired |

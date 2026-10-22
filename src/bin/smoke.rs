@@ -26,7 +26,7 @@ use tauri_runtime::{
   RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, WebviewDispatch, WindowDispatch,
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
   webview::{PendingWebview, WebviewAttributes},
-  window::{DetachedWindow, PendingWindow, RawWindow, WindowEvent},
+  window::{CursorIcon, DetachedWindow, PendingWindow, RawWindow, WindowEvent},
 };
 use tauri_runtime_electron::{ElectronRuntime, ElectronRuntimeHandle, ElectronWindowBuilder};
 use tauri_utils::{
@@ -96,6 +96,7 @@ fn main() -> ExitCode {
     height: 300.0,
     visible: true,
     decorations: true,
+    always_on_top: true,
     ..Default::default()
   };
 
@@ -144,6 +145,9 @@ fn main() -> ExitCode {
 
   window_checks(&window, &handle, &mut failures);
   webview_checks(webview.as_ref(), &mut failures);
+  if let Some(webview) = webview.as_ref() {
+    cursor_style_checks(&window, webview, &mut failures);
+  }
 
   // Closing has to reach the event loop, otherwise the process outlives the test.
   set(&mut failures, "close", || WindowDispatch::<()>::close(&window));
@@ -239,6 +243,11 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     WindowDispatch::<()>::is_resizable(window)
   });
 
+  // The window asks for always-on-top while it is created, which is how an app
+  // usually does it; the setter then has to turn it off and back on.
+  expect(failures, "is_always_on_top at creation", true, || {
+    WindowDispatch::<()>::is_always_on_top(window)
+  });
   expect_applied(
     failures,
     "is_always_on_top",
@@ -375,8 +384,39 @@ fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
   }
 }
 
-/// The window's own webview: script evaluation, navigation and devtools all
-/// travel through the main process, so each check proves a renderer round trip.
+/// The cursor icon and visibility show up on the page, so the page reports them.
+fn cursor_style_checks(window: &Window, webview: &Webview, failures: &mut Vec<String>) {
+  set(failures, "set_cursor_icon", || {
+    WindowDispatch::<()>::set_cursor_icon(window, CursorIcon::Hand)
+  });
+  expect_eval(
+    failures,
+    "cursor icon",
+    "pointer",
+    webview,
+    "getComputedStyle(document.documentElement).cursor",
+  );
+  set(failures, "set_cursor_visible", || {
+    WindowDispatch::<()>::set_cursor_visible(window, false)
+  });
+  expect_eval(
+    failures,
+    "cursor hidden",
+    "none",
+    webview,
+    "getComputedStyle(document.documentElement).cursor",
+  );
+  set(failures, "set_cursor_visible back", || {
+    WindowDispatch::<()>::set_cursor_visible(window, true)
+  });
+  expect_eval(
+    failures,
+    "cursor shown",
+    "default",
+    webview,
+    "getComputedStyle(document.documentElement).cursor",
+  );
+}
 fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   let Some(webview) = webview else {
     failures.push("webview: the window was created without its webview".into());
@@ -418,6 +458,42 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   expect(failures, "devtools closed", false, || {
     WebviewDispatch::<()>::is_devtools_open(webview)
   });
+
+  // A zoom factor is a style/paint decision, invisible to every getter of this
+  // trait, so the page itself reports it, relative to the display scale.
+  let scale = eval_once(webview, "window.devicePixelRatio")
+    .and_then(|value| value.trim_matches('"').parse::<f64>().ok())
+    .unwrap_or(1.0);
+  set(failures, "set_zoom", || {
+    WebviewDispatch::<()>::set_zoom(webview, 2.0)
+  });
+  expect_eval(
+    failures,
+    "zoom",
+    &format!("{}", scale * 2.0),
+    webview,
+    "String(window.devicePixelRatio)",
+  );
+  set(failures, "set_zoom back", || {
+    WebviewDispatch::<()>::set_zoom(webview, 1.0)
+  });
+  expect_eval(
+    failures,
+    "zoom back",
+    &format!("{scale}"),
+    webview,
+    "String(window.devicePixelRatio)",
+  );
+}
+
+/// Evaluates `script` once, for a value another check has to compare against.
+fn eval_once(webview: &Webview, script: &str) -> Option<String> {
+  let (tx, rx) = channel::<String>();
+  WebviewDispatch::<()>::eval_script_with_callback(webview, script, move |value| {
+    let _ = tx.send(value);
+  })
+  .ok()?;
+  rx.recv_timeout(Duration::from_secs(2)).ok()
 }
 
 /// Evaluates `script` in the page until it returns `want`, so a page that is
