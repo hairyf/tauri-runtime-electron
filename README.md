@@ -46,6 +46,22 @@ the URL Tauri resolves from `devUrl`), `TAURI_RUNTIME_ELECTRON_ICON` (window ico
 and `TAURI_RUNTIME_ELECTRON_IDENTIFIER` (AppUserModelID). Everything else (Electron
 binary, main script, IPC port) is auto-detected or defaults.
 
+For isolation or another application-defined protocol, register its scheme on the
+same thread before creating the runtime. Electron requires secure schemes before
+its `ready` event; keep and pass the original Tauri context:
+
+```rust
+let context = tauri::generate_context!();
+if let tauri::Pattern::Isolation { schema, .. } = context.pattern() {
+    tauri_runtime_electron::register_custom_protocol_scheme(schema)?;
+}
+tauri::Builder::<tauri_runtime_electron::ElectronRuntime>::new().run(context)?;
+```
+
+The example runner does this automatically. Registration is consumed by the next
+runtime on that thread; Tauri still supplies the original protocol handlers, CSP
+and ACL checks.
+
 
 ### 2. Tauri Bundle Configuration
 
@@ -83,7 +99,7 @@ The file layout mirrors `crates/tauri-runtime-cef` for side-by-side consistency:
 | --- | --- | --- |
 | `runtime.rs` | `runtime.rs` | `Runtime`/`RuntimeHandle` RPC bridge |
 | `window.rs` | `window.rs` | `BrowserWindow` methods |
-| `webview.rs` | `webview.rs` | `webContents` (`<webview>` guests) |
+| [`webview.rs`](src/webview.rs) | `webview.rs` | Main-page `webContents` and native `WebContentsView` children |
 | `window_builder.rs` | `window_builder.rs` | Unchanged shape |
 | `devtools.rs` | `devtools.rs` | Open/close/query CDP IDs |
 | `environment.rs` | `environment.rs` | Policy (`SSLKEYLOGFILE`, etc.) |
@@ -98,32 +114,72 @@ lists each one, what this crate does instead, and what `tauri-runtime-wry` does 
 same method. It is generated from source (`node scripts/coverage.mjs --write`) and CI
 fails when it goes stale.
 
-That page lists what is *wired*; it cannot prove anything *works*. `cargo test` does:
-[`src/bin/smoke.rs`](src/bin/smoke.rs) opens a real window, loads a page into it, then
-sets and reads back every capability (title, geometry and minimum size, decorations,
-maximize, theme, visibility, cursor, zoom, script evaluation, navigation, the IPC round
-trip, the page lifecycle handlers, devtools, staying connected while idle, close). CI runs it
-on Windows, macOS and
-Linux (under `xvfb-run`), so a platform that silently stops honouring a setter fails the
-build instead of a user's app.
+That page records implementation paths, not functional results. `cargo test` runs
+[the desktop smoke test](src/bin/smoke.rs) against a real window and page. Its named
+checks cover a subset: title, geometry and minimum size, selected window states,
+theme, visibility, cursor, zoom, script evaluation, navigation, IPC, page lifecycle,
+devtools, an idle connection and close. Platform-specific checks report skips; see
+[the coverage notes](docs/coverage.md) and test output for gaps. CI runs this smoke
+suite on Windows, macOS and Linux (under `xvfb-run`). Each platform also runs
+`helloworld`, `state`, `resources`, `commands`, `isolation` and `streaming` through
+the functional checker, then uploads logs, assertions and original keyframes as
+`example-checks-<platform>` artifacts. The other seven examples and native menu,
+tray, input and device checks need separate evidence. CI leaves visual review pending.
 
 ### Running Tauri's official examples
 
+Initialize the pinned sources with `git submodule update --init source/tauri source/electron`,
+then use Node.js 24+, pnpm and the Rust/system dependencies for the current desktop:
+
 ```bash
 pnpm example <name>
+pnpm example commands --prepare-only
+pnpm example file-associations -- /absolute/path/to/image.png
+pnpm check helloworld state
+pnpm check                    # attempt all 13 examples, sequentially
 ```
 
-`pnpm example` with no name lists them: `api`, `commands`, `drag`,
-`file-associations`, `helloworld`, `isolation`, `multiwebview`, `multiwindow`,
-`resources`, `run-return`, `splashscreen`, `state`, `streaming`. The five with a Cargo
-project in `src-tauri` are copied as they are; the rest are documentation snippets, so
-the script writes the `Cargo.toml` and `build.rs` they never had, drops `wry` and
-`isolation` from their configuration, and points them at this runtime. Anything extra is
-copied into `target/example/`, patched there and deleted afterwards — `source/tauri` is
-only ever read.
+`pnpm example` with no name lists `api`, `commands`, `drag`, `file-associations`,
+`helloworld`, `isolation`, `multiwebview`, `multiwindow`, `resources`, `run-return`,
+`splashscreen`, `state` and `streaming`. [The runner](scripts/example.mjs) copies
+[the Tauri sources](source/tauri) into `target/example/tauri`. Three examples already
+have Cargo projects: `api`, `file-associations` and `resources`. The other ten get
+generated manifests and build scripts. The copy selects `ElectronRuntime`, adds
+explicit runtime parameters and snippet dependencies, enables `unstable` for
+`multiwebview`, and repairs Windows drive-path parsing for file-association arguments.
+It removes only `wry` from Tauri's default features; all other defaults, original CSP,
+ACL and isolation configuration remain enabled. The original pages and command
+handlers stay in use.
 
-An example whose frontend is not checked in (`api`) is built in the copy with
-`pnpm install` and `pnpm build`, which needs network.
+All examples share one locked workspace and must run sequentially. Successful runs
+remove the copy; failed runs retain it for inspection. `--prepare-only` keeps the copy,
+prints the manifest path and starts no Cargo process or GUI. [The source submodules](.gitmodules)
+are read only. Missing API frontend assets are built from the local API package and
+original Vite sources using pnpm with the frozen lockfile; initial dependencies may
+need network. `streaming` copies the real [cat-spin.mp4 fixture](source/electron/spec/fixtures/cat-spin.mp4)
+from the pinned Electron sources into its generated app and runs there, avoiding the
+upstream video's large download.
+
+[The functional checker](scripts/example-check.mjs) operates the original UI, checks
+results and captures keyframes. Its native observation helper currently requires
+Windows, PowerShell 7 and an interactive desktop; missing native support is recorded
+as `blocked`. Remote pages, camera/microphone permission and devices, and packaged OS
+file associations have their own prerequisites. A dev run with file arguments does
+not verify installer registration or double-click associations.
+
+Each attempted example writes evidence under `target/example-checks/<name>/`:
+
+- `result.json`: functional assertions, limitations, checks and frame paths;
+- `run.log`: build and application output;
+- `native-observations.json`: native window observations, when requested;
+- original PNG captures: page or native-window keyframes, without replacement UI.
+
+Functional assertions and visual review are separate. The checker leaves
+`visualReview` as `pending`; review the original PNGs and record per-frame verdicts
+and notes in `visual-review.json` in the same directory. `assertions: passed` covers
+only the checks recorded for that run. `blocked` and `failed` are not passes, and the
+command exits nonzero for either. These commands do not establish that all 13
+examples passed, or that each example has been validated on all three desktop OSes.
 
 ---
 
@@ -132,7 +188,8 @@ An example whose frontend is not checked in (`api`) is built in the copy with
 * **Release Builds**: Ensure `devUrl` is absent from `tauri.conf.json` so Tauri embeds frontend assets.
 * **Environment**: `DebugEnvironment::Auto` honors Chromium flags in debug builds and restricts them in release builds.
 * **Custom Menu**: `electron/main.cjs` automatically builds a default context menu for every `webContents` (link/editing/clipboard, history, reload, inspect).
-* **Native Window**: `Electron` hands its Win32/macOS/X11 handle back to Tauri, so host-side code that needs one works unchanged: application and window menus, window effects (`Mica`/`Acrylic`, vibrancy), `set_decorations` at runtime, `start_dragging`, `start_resize_dragging`, `set_cursor_position`, `set_always_on_top`, always-on-bottom and `window.hwnd()`. Dragging and resizing are Win32 non-client drags; dragging is only wired on Windows, so apps that need a frameless drag elsewhere should keep a `-webkit-app-region: drag` title bar. The cursor *icon* and *visibility* are page state, so they are written as CSS on the document instead of being dropped. Public globals stay unavailable: `with_webview` gets `()` and `Window::gtk_window`/`default_vbox` are not implemented.
+* **Native Window**: Electron returns its Win32/macOS/X11 handle, but the window belongs to the Electron process. Windows decorations, drag/resize, cursor positioning and z-order have native implementations; macOS supports cursor positioning. Dragging elsewhere requires a `-webkit-app-region: drag` region. Cursor icon and visibility apply CSS to each page. Native effects and other integrations need separate validation; `with_webview` receives `()`, and GTK accessors are not implemented.
+* **Native Menus**: Tauri/muda can attach and query a Windows menu on Electron's HWND. Menu-bar command callbacks and accelerators are not bridged across the two processes; the original native popup path is not validated. The API example's menu callback check currently fails. Returning a native handle does not make these integrations fully functional.
 * **Asset Protocol**: the `ipc`, `tauri` and `asset` schemes are registered as privileged before Electron starts, so `convertFileSrc` + `fetch` work once the app enables the `protocol-asset` feature and an `assetProtocol` scope.
 * **Multiple Windows**: every `WebviewWindowBuilder` becomes its own Electron `BrowserWindow` with its own webview serial, so extra windows are created, closed and tracked exactly like the main one (closing a child keeps the app alive unless it was the last window).
 * **New Window Requests**: `on_new_window` runs on the Rust side, so a page calling `window.open` can be handled by returning `NewWindowResponse::Create` (navigate that window) or `Allow` (Electron opens a plain browser window). Electron can only answer `setWindowOpenHandler` synchronously, so the call is denied up front and the page's `window.open` returns `null` — slower but the only shape that lets Tauri own the decision.

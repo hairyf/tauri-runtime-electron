@@ -37,7 +37,7 @@ mod window_builder;
 mod window_handle;
 
 pub use environment::DebugEnvironment;
-pub use runtime::{Electron, ElectronRuntime, EventProxy, RuntimeContext};
+pub use runtime::{Electron, ElectronRuntime, EventProxy, RuntimeContext, register_custom_protocol_scheme};
 pub use webview::ElectronWebviewDispatcher;
 pub use window::ElectronWindowDispatcher;
 pub use window_builder::ElectronWindowBuilder;

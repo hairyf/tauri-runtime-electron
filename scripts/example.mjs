@@ -1,72 +1,133 @@
 #!/usr/bin/env node
 /**
- * Runs one of Tauri's official examples on this runtime.
+ * Run an official Tauri example on Electron without modifying the submodule.
  *
- *   pnpm example            # list what can run
- *   pnpm example api
- *   pnpm example multiwindow --some-arg
+ *   pnpm example                         # list examples
+ *   pnpm example commands
+ *   pnpm example commands --prepare-only # keep the generated project; no cargo/GUI
+ *   pnpm example file-associations -- path/to/image.png
  *
- * The examples live in the `source/tauri` submodule and are written against wry,
- * so this copies the tauri workspace into `target/examples/<name>/tauri`,
- * patches the copy onto this runtime, runs it, and deletes the copy again: the
- * submodule is only ever read.
- *
- * Examples that ship no Cargo project (the ones whose `main.rs` is a doc
- * snippet) get a generated one, and an example whose frontend is not checked in
- * has it built with `pnpm install && pnpm build` inside the copy.
+ * All runs share target/example/tauri to reuse Cargo artifacts. An exclusive
+ * lock protects that copy until cargo (and its application) has exited.
  */
-import { spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import {
+  closeSync, cpSync, existsSync, ftruncateSync, lstatSync, mkdirSync, openSync,
+  readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync,
+} from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const tauri = path.join(root, 'source', 'tauri')
 const [name, ...args] = process.argv.slice(2)
+const prepareOnly = args[0] === '--prepare-only'
+if (prepareOnly) args.shift()
+if (args[0] === '--') args.shift()
 
-/** Crates a snippet `main.rs` imports but that the generated project cannot infer. */
+/** Crates imported by snippets, originally supplied by the tauri crate itself. */
 const extraDependencies = {
   commands: { serde: '{ version = "1", features = ["derive"] }' },
-  streaming: { http: '"1"', 'http-range': '"0.1"' },
+  streaming: { http: '"1"', 'http-range': '"0.1"', getrandom: '"0.3"', 'percent-encoding': '"2"' },
 }
 
-/** Every example directory, with or without its own Cargo project. */
 function examples() {
   return readdirSync(path.join(tauri, 'examples'), { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && /^[a-z][a-z0-9-]*$/.test(entry.name))
     .map((entry) => entry.name)
     .filter((entry) => {
       const source = path.join(tauri, 'examples', entry)
-      return (
-        existsSync(path.join(source, 'src-tauri', 'Cargo.toml')) || existsSync(path.join(source, 'main.rs'))
-      )
+      return existsSync(path.join(source, 'src-tauri', 'Cargo.toml')) || existsSync(path.join(source, 'main.rs'))
     })
+    .sort()
 }
 
-if (!name || !examples().includes(name)) {
-  console.error(
-    `[example] usage: pnpm example <name> [args...]\n          examples: ${examples().join(', ')}`,
-  )
-  process.exit(1)
+/** Keep file operations inside their expected tree; never follow a junction. */
+function localPath(base, file) {
+  const relative = path.relative(base, file)
+  if (path.isAbsolute(relative) || relative.split(path.sep).includes('..')) {
+    throw new Error(`path escapes ${base}: ${file}`)
+  }
+  let current = base
+  for (const part of ['', ...relative.split(path.sep).filter(Boolean)]) {
+    current = path.join(current, part)
+    if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
+      throw new Error(`refusing symlink/junction: ${current}`)
+    }
+  }
+  return file
 }
 
-const source = path.join(tauri, 'examples', name)
-const full = existsSync(path.join(source, 'src-tauri', 'Cargo.toml'))
-// One copy for every example: the path stays put, so switching examples only
-// rebuilds the app, not the whole tauri workspace.
+const source = path.join(tauri, 'examples', name ?? '')
+const full = /^[a-z][a-z0-9-]*$/.test(name ?? '') && existsSync(path.join(source, 'src-tauri', 'Cargo.toml'))
 const copy = path.join(root, 'target', 'example')
 const workspace = path.join(copy, 'tauri')
-// A snippet's `main.rs` opens `../../examples/<name>/tauri.conf.json`, so its
-// crate sits in the example directory itself instead of a `src-tauri` child.
-const app = path.join(workspace, 'examples', name, ...(full ? ['src-tauri'] : []))
+// Snippets open ../../examples/<name>/tauri.conf.json relative to their crate.
+const app = path.join(workspace, 'examples', name ?? '', ...(full ? ['src-tauri'] : []))
+const manifest = path.join(app, 'Cargo.toml')
+const lock = path.join(root, 'target', 'example.lock')
+let lockFd
+let child
 
-/** Patches are loud: an anchor that misses throws instead of quietly doing nothing. */
+function record(command = null) {
+  ftruncateSync(lockFd, 0)
+  writeSync(lockFd, `${JSON.stringify({ pid: process.pid, childPid: child?.pid ?? null, name, command })}\n`, 0, 'utf8')
+}
+
+function alive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code !== 'ESRCH'
+  }
+}
+
+function acquireLock() {
+  localPath(root, lock)
+  mkdirSync(path.dirname(lock), { recursive: true })
+  try {
+    lockFd = openSync(lock, 'wx')
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+    let owner
+    try { owner = JSON.parse(readFileSync(lock, 'utf8')) } catch { /* Unknown owner: do not overwrite. */ }
+    const active = alive(owner?.pid) || alive(owner?.childPid)
+    throw new Error(`${path.relative(root, lock)} ${active ? 'is in use' : 'has an unverified/stale owner'} (runner=${owner?.pid ?? '?'}, child=${owner?.childPid ?? '?'}). Confirm its process tree has exited before removing that lock; no processes were stopped.`)
+  }
+  record()
+}
+
+/** Await the actual child, retaining its PID for a scheduler and stale-lock checks. */
+async function run(command, argv, options = {}) {
+  try {
+    return await new Promise((resolve, reject) => {
+      child = spawn(command, argv, { stdio: 'inherit', ...options })
+      child.once('error', (error) => {
+        child = undefined
+        reject(error)
+      })
+      child.once('close', (code, signal) => {
+        child = undefined
+        if (signal) console.error(`[example] ${command} exited on ${signal}`)
+        resolve(code ?? 1)
+      })
+      record(command)
+      console.log(`[example] runner PID ${process.pid}; ${command} PID ${child.pid ?? 'not started'}`)
+    })
+  } finally {
+    if (!child) record()
+  }
+}
+
+/** Patches are loud: a missing anchor fails instead of silently changing nothing. */
 function patch(file, from, to) {
-  if (!existsSync(file)) throw new Error(`${path.relative(root, file)}: no such file`)
-  // Submodule files are checked out with CRLF; anchor on LF and put it back.
+  localPath(workspace, file)
   const text = readFileSync(file, 'utf8')
   const crlf = text.includes('\r\n')
-  const normalized = crlf ? text.replaceAll('\r\n', '\n') : text
+  const normalized = text.replaceAll('\r\n', '\n')
   if (!normalized.includes(from)) {
     throw new Error(`${path.relative(root, file)}: cannot find ${JSON.stringify(from)}`)
   }
@@ -74,79 +135,54 @@ function patch(file, from, to) {
   writeFileSync(file, crlf ? patched.replaceAll('\n', '\r\n') : patched)
 }
 
-/** Tauri's default features pull in `wry`, which this runtime replaces. */
-function withoutWry(manifest) {
-  const lines = readFileSync(manifest, 'utf8').split(/\r?\n/)
-  const inline = lines.find((candidate) => /^tauri\s*=\s*\{/.test(candidate))
-  if (inline) {
-    if (inline.includes('default-features = true')) {
-      patch(manifest, inline, inline.replace('default-features = true', 'default-features = false'))
-    } else if (!inline.includes('default-features')) {
-      patch(manifest, inline, inline.replace('{ ', '{ default-features = false, '))
-    }
-    return
-  }
-  // The api example spells the same thing as a `[dependencies.tauri]` table.
-  const start = lines.indexOf('[dependencies.tauri]')
-  if (start === -1) throw new Error(`${name}: no tauri dependency in ${path.relative(root, manifest)}`)
-  const end = lines.findIndex((line, index) => index > start && line.startsWith('['))
-  const table = lines.slice(start, end === -1 ? undefined : end)
-  const feature = table.find((line) => line.startsWith('default-features'))
-  if (feature) {
-    patch(manifest, feature, feature.replace('true', 'false'))
-  } else {
-    patch(manifest, '[dependencies.tauri]', '[dependencies.tauri]\ndefault-features = false')
-  }
+function optionalPatch(file, from, to) {
+  if (readFileSync(file, 'utf8').replaceAll('\r\n', '\n').includes(from)) patch(file, from, to)
 }
 
-/** Builds the example's frontend inside the copy when it is not checked in. */
-function ensureFrontend() {
-  const config = JSON.parse(readFileSync(path.join(app, 'tauri.conf.json'), 'utf8'))
+/** Build real upstream frontend sources, including the local @tauri-apps/api. */
+async function ensureFrontend(config) {
   const dist = config.build?.frontendDist
   if (!dist) return
-  const missing = () =>
-    (Array.isArray(dist) ? dist : [dist])
-      .map((entry) => path.join(app, entry))
-      // A checked-in directory with nothing in it is not a frontend: Electron
-      // would open a window onto `asset not found: index.html`.
-      .filter((entry) => !existsSync(entry) || (statSync(entry).isDirectory() && !existsSync(path.join(entry, 'index.html'))))
+  if (typeof dist === 'string' && /^https?:\/\//.test(dist)) return
+  const paths = (Array.isArray(dist) ? dist : [dist]).map((entry) => {
+    if (typeof entry !== 'string' || !entry || path.isAbsolute(entry)) {
+      throw new Error(`${name}: invalid frontendDist path ${JSON.stringify(entry)}`)
+    }
+    return localPath(workspace, path.resolve(app, entry))
+  })
+  const missing = () => paths.filter((entry) =>
+    !existsSync(entry) || (statSync(entry).isDirectory() && !existsSync(path.join(entry, 'index.html'))),
+  )
   if (!missing().length) return
-
-  const project = path.dirname(app)
+  const project = full ? path.dirname(app) : app
   if (!existsSync(path.join(project, 'package.json'))) {
-    throw new Error(
-      `the ${name} example has no frontend to run: ${missing().map((entry) => path.relative(root, entry)).join(', ')} is missing and there is no package.json to build it from`,
-    )
+    throw new Error(`${name}: missing frontend ${missing().join(', ')}; no package.json to build it`)
   }
-  for (const script of ['install', 'build']) {
-    console.log(`[example] building the ${name} frontend: pnpm ${script}`)
-    const result = spawnSync('pnpm', [script], {
-      cwd: project,
-      shell: process.platform === 'win32',
-      stdio: 'inherit',
-    })
-    if (result.status !== 0) throw new Error(`pnpm ${script} failed in ${path.relative(root, project)}`)
+  const pnpm = async (argv, cwd = project) => {
+    console.log(`[example] pnpm ${argv.join(' ')}`)
+    const code = await run('pnpm', argv, { cwd, shell: process.platform === 'win32' })
+    if (code !== 0) throw new Error(`pnpm ${argv.join(' ')} failed (${code}) in ${path.relative(root, cwd)}`)
   }
-  if (missing().length) {
-    throw new Error(`the ${name} example's build did not produce ${missing().map((entry) => path.relative(root, entry)).join(', ')}`)
+  if (name === 'api') {
+    // Installing the whole upstream workspace also installs unrelated mobile/E2E tooling.
+    await pnpm(['--filter', '@tauri-apps/api', '--filter', 'api', 'install', '--frozen-lockfile'], workspace)
+    await pnpm(['--filter', '@tauri-apps/api', 'build'], workspace)
+  } else {
+    await pnpm(['install', ...(process.env.CI ? ['--frozen-lockfile'] : [])])
   }
+  await pnpm(['build'])
+  if (missing().length) throw new Error(`${name}: build did not produce ${missing().join(', ')}`)
 }
 
-/** Gives a doc-snippet example the Cargo project it never had. */
-function generateProject() {
+function generateProject(config) {
   const dependencies = Object.entries(extraDependencies[name] ?? {})
-    .map(([crate, version]) => `${crate} = ${version}`)
-    .join('\n')
-  // Snippets reach for `tauri_utils` directly; the path dependency keeps them on
-  // the same crate the workspace patches.
-  const utils = readdirSync(source).some(
-    (file) => file.endsWith('.rs') && readFileSync(path.join(source, file), 'utf8').includes('tauri_utils'),
-  )
-    ? 'tauri-utils = { path = "../../crates/tauri-utils" }\n'
-    : ''
-  writeFileSync(
-    path.join(app, 'Cargo.toml'),
-    `[package]
+    .map(([crate, version]) => `${crate} = ${version}`).join('\n')
+  const isolation = config.app?.security?.pattern?.use === 'isolation'
+  const features = ['custom-protocol', ...(isolation ? ['isolation'] : []), ...(name === 'multiwebview' ? ['unstable'] : [])]
+  const utils = readdirSync(source).some((file) =>
+    file.endsWith('.rs') && readFileSync(path.join(source, file), 'utf8').includes('tauri_utils'),
+  ) ? 'tauri-utils = { path = "../../crates/tauri-utils" }\n' : ''
+  writeFileSync(manifest, `[package]
 name = ${JSON.stringify(name)}
 version = "0.1.0"
 edition = "2021"
@@ -158,110 +194,149 @@ path = "main.rs"
 [workspace]
 
 [build-dependencies]
-tauri-build = { path = "../../crates/tauri-build", default-features = false }
+tauri-build = { path = "../../crates/tauri-build", features = ${JSON.stringify(isolation ? ['isolation'] : [])} }
 
 [dependencies]
-tauri = { path = "../../crates/tauri", default-features = false }
+tauri = { path = "../../crates/tauri", features = ${JSON.stringify(features)} }
 ${utils}${dependencies}
 tauri-runtime-electron = { path = ${JSON.stringify(root.replaceAll('\\', '/'))} }
 
 [patch.crates-io]
 tauri-runtime = { path = "../../crates/tauri-runtime" }
 tauri-utils = { path = "../../crates/tauri-utils" }
-`,
-  )
+`)
   writeFileSync(path.join(app, 'build.rs'), 'fn main() {\n  tauri_build::build()\n}\n')
-  for (const file of readdirSync(source)) {
-    if (file.endsWith('.rs') || file === 'index.html' || file === 'tauri.conf.json') {
-      writeFileSync(path.join(app, file), readFileSync(path.join(source, file)))
-    }
-  }
 }
 
 let status = 1
-let ran = false
 try {
-  // A pristine copy, timestamped the way the submodule is: cargo treats an
-  // identical tree as unchanged, so only the example's own crate recompiles
-  // between runs instead of the whole tauri workspace.
-  const base = path.join(root, 'target', 'example-base')
-  if (!existsSync(base) || statSync(base, { bigint: false }).mtimeMs < statSync(path.join(tauri, 'Cargo.toml')).mtimeMs) {
-    rmSync(base, { force: true, recursive: true })
-    cpSync(tauri, base, { preserveTimestamps: true, recursive: true })
+  if (!name || !examples().includes(name) || (prepareOnly && args.length)) {
+    throw new Error(`usage: pnpm example <name> [--prepare-only | [--] args...]\n          examples: ${examples().join(', ')}`)
   }
-  rmSync(copy, { force: true, recursive: true })
+  localPath(root, source)
+  acquireLock()
+  // ponytail: one shared copy serializes examples; use per-run workspaces if parallel GUI runs are needed.
+  // No mtime-only base cache: any source/config/asset change must reach the next run.
+  for (const directory of [copy, path.join(root, 'target', 'example-base')]) {
+    localPath(root, directory)
+    rmSync(directory, { force: true, recursive: true, maxRetries: 5, retryDelay: 300 })
+  }
   console.log(`[example] copying ${path.relative(root, tauri)} to ${path.relative(root, workspace)}`)
-  cpSync(base, workspace, { preserveTimestamps: true, recursive: true })
+  cpSync(tauri, workspace, {
+    preserveTimestamps: true,
+    recursive: true,
+    filter: (file) => {
+      if (path.relative(tauri, file).split(path.sep).some((part) => ['.git', 'node_modules', 'target'].includes(part))) return false
+      if (lstatSync(file).isSymbolicLink()) throw new Error(`refusing source symlink/junction: ${file}`)
+      return true
+    },
+  })
 
+  // Keep every non-Wry default (ACL, menus, compression, etc.), not default-features=false.
+  patch(path.join(workspace, 'crates', 'tauri', 'Cargo.toml'), 'default = [\n  "wry",', 'default = [')
+  const originalConfig = path.join(source, ...(full ? ['src-tauri'] : []), 'tauri.conf.json')
+  const config = JSON.parse(readFileSync(originalConfig, 'utf8'))
   if (full) {
-    // The example builds `tauri` from this workspace while this runtime asks
-    // crates.io for these two: one `Runtime` trait needs one path for both.
-    patch(
-      path.join(workspace, 'Cargo.toml'),
+    // The runtime and app must use the exact same Runtime trait and utility types.
+    patch(path.join(workspace, 'Cargo.toml'),
       'tauri-plugin = { path = "./crates/tauri-plugin" }',
       `tauri-plugin = { path = "./crates/tauri-plugin" }
 tauri-runtime = { path = "./crates/tauri-runtime" }
-tauri-utils = { path = "./crates/tauri-utils" }`,
-    )
-    writeFileSync(
-      path.join(app, 'Cargo.toml'),
-      `${readFileSync(path.join(app, 'Cargo.toml'), 'utf8')}
+tauri-utils = { path = "./crates/tauri-utils" }`)
+    writeFileSync(manifest, `${readFileSync(manifest, 'utf8')}
 [dependencies.tauri-runtime-electron]
 path = ${JSON.stringify(root.replaceAll('\\', '/'))}
-`,
-    )
-    // Isolation delegates to `with_webview`, which an Electron guest cannot
-    // honour; only some examples use it.
-    if (readFileSync(path.join(app, 'Cargo.toml'), 'utf8').includes('"isolation"')) {
-      patch(path.join(app, 'Cargo.toml'), '  "isolation",\n', '')
-    }
-    withoutWry(path.join(app, 'Cargo.toml'))
-    ensureFrontend()
+`)
   } else {
-    generateProject()
+    generateProject(config)
   }
 
-  const config = path.join(app, 'tauri.conf.json')
-  const parsed = JSON.parse(readFileSync(config, 'utf8'))
-  delete parsed.app?.security?.pattern
-  writeFileSync(config, `${JSON.stringify(parsed, null, 2)}\n`)
-
-  // `Builder::default` only exists without the `wry` feature, so every entry
-  // point names the runtime instead.
-  const entries = full
-    ? readdirSync(path.join(app, 'src')).map((file) => path.join(app, 'src', file))
-    : readdirSync(app).map((file) => path.join(app, file))
-  const entry = entries
+  const entries = readdirSync(full ? path.join(app, 'src') : app)
     .filter((file) => file.endsWith('.rs'))
-    .find((file) => readFileSync(file, 'utf8').includes('tauri::Builder::default()'))
-  if (!entry) throw new Error(`${name}: no \`tauri::Builder::default()\` to point at this runtime`)
-  patch(
-    entry,
-    'tauri::Builder::default()',
-    'tauri::Builder::<tauri_runtime_electron::ElectronRuntime>::new()',
-  )
+    .map((file) => path.join(app, ...(full ? ['src'] : []), file))
+  const entry = entries.find((file) => readFileSync(file, 'utf8').includes('tauri::Builder::default()'))
+  if (!entry) throw new Error(`${name}: no tauri::Builder::default() entry point`)
+  const runtime = 'tauri_runtime_electron::ElectronRuntime'
+  patch(entry, 'tauri::Builder::default()', `tauri::Builder::<${runtime}>::new()`)
+  optionalPatch(entry, ': AppHandle)', `: AppHandle<${runtime}>)`)
+  optionalPatch(entry, ': AppHandle,', `: AppHandle<${runtime}>,`)
+  optionalPatch(entry, ': Window)', `: Window<${runtime}>)`)
+  optionalPatch(entry, '-> tauri::Context {', `-> tauri::Context<${runtime}> {`)
+  if (config.app?.security?.pattern?.use === 'isolation') {
+    // Preserve the exact Context/macro. Its random isolation scheme must be
+    // privileged before Electron starts, including on macOS/Linux native URLs.
+    const contexts = readFileSync(entry, 'utf8').replaceAll('\r\n', '\n').match(/tauri::(?:generate_context!\([\s\S]*?\)|tauri_build_context!\(\))/g) ?? []
+    assert.equal(contexts.length, 1, `${name}: expected one original Context macro`)
+    const [context] = contexts
+    patch(entry, context, `{
+      let context = ${context};
+      if let tauri::Pattern::Isolation { schema, .. } = context.pattern() {
+        tauri_runtime_electron::register_custom_protocol_scheme(schema)
+          .expect("invalid isolation protocol scheme");
+      }
+      context
+    }`)
+  }
+  if (name === 'file-associations') {
+    // Upstream parses a Windows drive prefix as a URL scheme, losing native file argv.
+    patch(entry, 'if let Ok(url) = url::Url::parse(&maybe_file) {', `if std::path::Path::new(&maybe_file).is_absolute() {
+            files.push(PathBuf::from(maybe_file));
+          } else if let Ok(url) = url::Url::parse(&maybe_file) {`)
+  }
 
-  // `prod` embeds the frontend through the custom protocol, so it runs without
-  // the vite dev server; examples that ship their html do not need it.
-  const features = readFileSync(path.join(app, 'Cargo.toml'), 'utf8').includes('\nprod = [')
-    ? ['--features', 'prod']
-    : []
-  console.log(`[example] running the ${name} example on tauri-runtime-electron`)
-  ran = true
-  const run = spawnSync(
-    'cargo',
-    ['run', '--manifest-path', path.join(app, 'Cargo.toml'), ...features, ...(args.length ? ['--', ...args] : [])],
-    { stdio: 'inherit', env: { ...process.env, CARGO_TARGET_DIR: path.join(root, 'target') } },
-  )
-  status = run.status ?? 1
+  if (name === 'api') {
+    // Upstream reads this flag without tracking it. Invalidate an earlier build
+    // made without the workspace config, then keep future Cargo caching correct.
+    patch(path.join(app, 'build.rs'), 'fn main() {', 'fn main() {\n  println!("cargo:rerun-if-env-changed=__TAURI_WORKSPACE__");')
+  }
+  await ensureFrontend(config)
+  if (name === 'streaming') {
+    // Reuse the pinned Electron test video: real media, without a 150 MB download.
+    const video = path.join(root, 'source/electron/spec/fixtures/cat-spin.mp4')
+    if (!existsSync(video)) throw new Error('missing Electron video fixture; run git submodule update --init source/electron')
+    cpSync(video, path.join(app, 'streaming_example_test_video.mp4'))
+  }
+  // Runnable preparation checks: security configuration and real upstream assets stay intact.
+  assert.equal(readFileSync(path.join(app, 'tauri.conf.json'), 'utf8'), readFileSync(originalConfig, 'utf8'))
+  if (config.app?.security?.pattern?.use === 'isolation') {
+    assert.match(readFileSync(manifest, 'utf8'), /"isolation"/)
+    const isolationDir = localPath(workspace, path.resolve(app, config.app.security.pattern.options.dir))
+    assert.ok(existsSync(path.join(isolationDir, 'index.html')), 'missing real isolation frontend')
+  }
+
+  if (prepareOnly) {
+    console.log(`[example] prepared manifest: ${manifest}`)
+    status = 0
+  } else {
+    console.log(`[example] running ${name} on tauri-runtime-electron`)
+    // Static assets, never a hidden Vite server. Pass application arguments without a shell.
+    status = await run('cargo', ['run', '--manifest-path', manifest, '--features', 'tauri/custom-protocol',
+      ...(args.length ? ['--', ...args] : [])], {
+      // Cargo reads .cargo/config.toml from cwd, not --manifest-path. The
+      // upstream workspace enables the Windows Common Controls v6 manifest here.
+      cwd: name === 'streaming' ? app : workspace,
+      env: { ...process.env, CARGO_TARGET_DIR: path.join(root, 'target') },
+    })
+  }
 } catch (error) {
   console.error(`[example] ${error.message}`)
 } finally {
-  // Keep the copy when the run itself failed, so the build log is inspectable.
-  if (status === 0 || !ran) {
-    rmSync(copy, { force: true, recursive: true })
-  } else {
-    console.error(`[example] the run failed; the patched copy is at ${path.relative(root, workspace)}`)
+  if (lockFd !== undefined) {
+    try {
+      // A failed preparation/run is evidence, not disposable. Hard kills leave the lock too.
+      if (status === 0 && !prepareOnly && !child) {
+        localPath(root, copy)
+        rmSync(copy, { force: true, recursive: true, maxRetries: 5, retryDelay: 300 })
+      } else if (status !== 0) {
+        console.error(`[example] retained patched workspace: ${workspace}`)
+      }
+    } catch (error) {
+      status = 1
+      console.error(`[example] cleanup failed: ${error.message}`)
+    } finally {
+      closeSync(lockFd)
+      if (!child) rmSync(lock, { force: true })
+    }
   }
 }
-process.exit(status)
+process.exitCode = status

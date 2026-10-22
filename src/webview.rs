@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use crate::runtime::{ElectronRuntime, Message, RuntimeContext, IPC_TIMEOUT, create_webview_err};
+use crate::runtime::{
+  ElectronRuntime, Message, RuntimeContext, IPC_TIMEOUT, create_webview_err,
+  position_payload, size_payload,
+};
 use serde_json::{json, Value};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -32,22 +35,6 @@ impl ElectronWebviewDispatcher {
     Ok(rect_from_value(&bounds["bounds"]))
   }
 
-  /// Moves and resizes a guest by restyling its `<webview>` element.
-  fn apply_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
-    let position = bounds.position.to_physical::<i32>(1.0);
-    let size = bounds.size.to_physical::<u32>(1.0);
-    self
-      .webview_call(
-        "webview.setBounds",
-        json!({
-          "x": position.x,
-          "y": position.y,
-          "width": size.width,
-          "height": size.height,
-        }),
-      )
-      .map(|_| ())
-  }
 }
 
 impl ElectronWebviewDispatcher {
@@ -215,19 +202,18 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn set_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
-    self.apply_bounds(bounds)
+    self.webview_call("webview.setBounds", json!({
+      "position": position_payload(bounds.position),
+      "size": size_payload(bounds.size),
+    })).map(|_| ())
   }
 
   fn set_size(&self, size: Size) -> Result<()> {
-    let mut bounds = self.rectangle()?;
-    bounds.size = Size::Physical(size.to_physical::<u32>(1.0));
-    self.apply_bounds(bounds)
+    self.webview_call("webview.setBounds", json!({ "size": size_payload(size) })).map(|_| ())
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
-    let mut bounds = self.rectangle()?;
-    bounds.position = Position::Physical(position.to_physical::<i32>(1.0));
-    self.apply_bounds(bounds)
+    self.webview_call("webview.setBounds", json!({ "position": position_payload(position) })).map(|_| ())
   }
 
   fn set_focus(&self) -> Result<()> {

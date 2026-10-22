@@ -50,12 +50,40 @@ use std::{
 };
 
 
-/// Timeout for a single IPC round trip with the Electron process.
-/// Tauri 2 does not hand runtimes the configured schemes, and Electron can
-/// only register privileged schemes before `ready`, so the well-known ones are
-/// fixed. Custom schemes are still registered per webview below.
+/// Schemes built into every runtime; application schemes must be known before launch.
 pub(crate) const DEFAULT_SCHEMES: &[&str] = &["ipc", "tauri", "asset"];
 
+thread_local! {
+  static STARTUP_SCHEMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register a secure custom protocol for the next runtime created on this thread.
+///
+/// Call before `Builder::build`/`run`, for example with the schema from the original
+/// `Context::pattern()`. Registrations are deduplicated and consumed once at startup;
+/// protocol handlers are still supplied by Tauri when it creates each webview.
+pub fn register_custom_protocol_scheme(scheme: &str) -> std::result::Result<(), &'static str> {
+  let mut bytes = scheme.bytes();
+  if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+    || !bytes.all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
+  {
+    return Err("invalid custom protocol scheme");
+  }
+  let scheme = scheme.to_ascii_lowercase();
+  STARTUP_SCHEMES.with(|schemes| {
+    let mut schemes = schemes.borrow_mut();
+    if !schemes.contains(&scheme) {
+      schemes.push(scheme);
+    }
+  });
+  Ok(())
+}
+
+fn take_startup_schemes() -> Vec<String> {
+  STARTUP_SCHEMES.with(|schemes| std::mem::take(&mut *schemes.borrow_mut()))
+}
+
+/// Timeout for a single IPC round trip with the Electron process.
 pub(crate) const IPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Default time the Electron process gets to start and connect back.
@@ -178,7 +206,7 @@ pub struct RuntimeContext {
   webview_handlers: Rc<RefCell<HashMap<u32, WebviewHandlers>>>,
   /// Custom protocols registered by Tauri, served through Electron's
   /// `protocol.handle`.
-  protocol_handlers: Rc<RefCell<HashMap<String, (String, Rc<UriSchemeProtocolHandler>)>>>,
+  protocol_handlers: Rc<RefCell<HashMap<(String, Option<u32>), (String, Rc<UriSchemeProtocolHandler>)>>>,
   /// Page origin per webview label, injected as the `Origin` header on
   /// custom-protocol requests (Electron reports the request URL instead).
   webview_origins: Rc<RefCell<HashMap<String, String>>>,
@@ -486,9 +514,9 @@ impl ElectronRuntime {
       .iter()
       .map(|scheme| scheme.to_string())
       .collect();
-    for scheme in custom_schemes {
-      if !schemes.iter().any(|known| known == scheme) {
-        schemes.push((*scheme).to_string());
+    for scheme in custom_schemes.iter().map(|scheme| (*scheme).to_string()).chain(take_startup_schemes()) {
+      if !schemes.contains(&scheme) {
+        schemes.push(scheme);
       }
     }
     args.push("--tauri-schemes".to_string());
@@ -727,7 +755,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type WebviewDispatcher = ElectronWebviewDispatcher;
   type Handle = ElectronRuntimeHandle;
   type EventLoopProxy = EventProxy;
-  
+
   fn new(_args: RuntimeInitArgs) -> Result<Self> {
     Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
   }
@@ -759,9 +787,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &self,
     pending: PendingWindow<T, Self>,
-    _after_window_creation: Option<F>,
+    after_window_creation: Option<F>,
   ) -> Result<DetachedWindow<T, Self>> {
-    create_window_impl(&self.context, pending)
+    create_window_impl(&self.context, pending, after_window_creation)
   }
 
   fn create_webview(
@@ -1110,12 +1138,8 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             };
             let body = params["body"].as_str().unwrap_or_default().to_string();
             let url = params["url"].as_str().unwrap_or_default().to_string();
-            // A `data:` or `about:blank` page has no URI the http crate
-            // accepts, and dropping its messages would lose IPC silently.
-            let url = match url.parse::<http::Uri>() {
-              Ok(_) => url,
-              Err(_) => "tauri://localhost".to_string(),
-            };
+            // Keep the real sender URL for Tauri's ACL; an invalid or opaque
+            // URL must never become the trusted tauri://localhost origin.
             match Request::builder().uri(url).body(body) {
               Ok(request) => handler(request),
               Err(error) => eprintln!("[electron] invalid ipc request url: {error}"),
@@ -1125,11 +1149,19 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             let params = &event["params"];
             let Some(id) = params["id"].as_u64() else { continue };
             let scheme = params["scheme"].as_str().unwrap_or_default().to_string();
+            if scheme == "ipc" && params["webviewId"].as_u64().is_none() {
+              eprintln!("[electron] ipc protocol request has no authenticated webview");
+              continue;
+            }
             let Some((label, handler)) = self
               .context
               .protocol_handlers
               .borrow()
-              .get(&scheme)
+              .get(&(scheme.clone(), if scheme == "ipc" {
+                params["webviewId"].as_u64().map(|id| id as u32)
+              } else {
+                None
+              }))
               .cloned()
             else {
               eprintln!("[electron] no protocol handler for {scheme}");
@@ -1157,21 +1189,16 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
                 continue;
               }
             };
-            // Electron reports the request URL (e.g. `ipc://localhost`) as the
-            // Origin header. Tauri validates that header against the page URL to
-            // decide between local and remote contexts, so rewrite it to the
-            // origin of the webview that issued the request.
+            // Never replace a real (including opaque) origin with a local one:
+            // Tauri uses it to select the invocation's ACL execution context.
+            // Browser-initiated requests without one use the registered owner.
             let origin = self
               .context
               .webview_origins
               .borrow()
               .get(&label)
               .cloned();
-            if let Some(origin) = origin {
-              if let Ok(value) = http::HeaderValue::from_str(&origin) {
-                request.headers_mut().insert(http::header::ORIGIN, value);
-              }
-            }
+            set_missing_origin(request.headers_mut(), origin.as_deref());
             let ipc = self.context.ipc.clone();
             let request_uri = uri.clone();
             let responder: Box<dyn FnOnce(Response<std::borrow::Cow<'static, [u8]>>) + Send> =
@@ -1203,7 +1230,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               });
             handler(&label, request, responder);
           }
-          Some("ipc.closed") => {
+          Some("ipc.closed") => {
             break 'event_loop;
           }
           _ => {}
@@ -1215,13 +1242,13 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
         match message {
           Message::Task(task) => task(),
           Message::CloseWindow(id) => {
-            if close_window(&self.context, id, &mut callback) {
+            if close_window(&self.context, id, &mut callback) {
               break 'event_loop;
             }
           }
           Message::DestroyWindow(id) => {
             let removed = self.context.windows.borrow_mut().remove(&id).is_some();
-            if removed && exit_if_empty(&self.context, &mut callback) {
+            if removed && exit_if_empty(&self.context, &mut callback) {
               break 'event_loop;
             }
           }
@@ -1374,9 +1401,10 @@ fn exit_if_empty<T: UserEvent, F: FnMut(RunEvent<T>)>(
   !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent))
 }
 
-pub(crate) fn create_window_impl<T: UserEvent>(
+pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'static>(
   context: &RuntimeContext,
   pending: PendingWindow<T, ElectronRuntime>,
+  after_window_creation: Option<F>,
 ) -> Result<DetachedWindow<T, ElectronRuntime>> {
   let PendingWindow {
     label,
@@ -1394,15 +1422,14 @@ pub(crate) fn create_window_impl<T: UserEvent>(
 
   if let Some(webview) = webview.as_mut() {
     for (scheme, handler) in webview.uri_scheme_protocols.drain() {
-      // Scheme handlers answer for the whole session, and Electron's protocol
-      // API cannot tell us which webview sent a request, so the first webview
-      // (the window's page) keeps ownership of the scheme. Guests then reach
-      // Tauri through that page's IPC handler.
+      // Asset protocols are session-wide; IPC captures a specific webview's
+      // Tauri invoke key/ACL and must be selected by the authenticated sender.
+      let owner = if scheme == "ipc" { webview_id } else { None };
       context
         .protocol_handlers
         .borrow_mut()
-        .entry(scheme.clone())
-        .or_insert_with(|| (label.clone(), Rc::from(handler)));
+        .entry((scheme.clone(), owner))
+        .or_insert_with(|| (webview.label.clone(), Rc::from(handler)));
       if let Err(error) = context.ipc.call(
         "protocol.register",
         json!({ "scheme": scheme }),
@@ -1517,6 +1544,23 @@ pub(crate) fn create_window_impl<T: UserEvent>(
     register_webview_handlers::<T>(context, webview_serial, pending_webview);
   }
 
+  if let Some(handler) = after_window_creation {
+    #[cfg(any(windows, target_os = "macos"))]
+    handler(RawWindow {
+      #[cfg(windows)]
+      hwnd: context.native_handle(id)?,
+      _marker: &std::marker::PhantomData,
+    });
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+      let _ = handler;
+      unsupported(
+        "Runtime::create_window::after_window_creation",
+        "Electron cannot supply the GTK window required by RawWindow",
+      );
+    }
+  }
+
   let webview = webview_id.map(|webview_id| DetachedWindowWebview {
     webview: DetachedWebview {
       label: label.clone(),
@@ -1562,11 +1606,11 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   // Schemes must be installed before the page is loaded, otherwise the initial
   // `tauri://` navigation fails with ERR_FAILED.
   for (scheme, handler) in pending.uri_scheme_protocols.drain() {
-    // See `create_window_impl`: the scheme keeps the first owner's label.
+    let owner = if scheme == "ipc" { Some(webview_id) } else { None };
     context
       .protocol_handlers
       .borrow_mut()
-      .entry(scheme.clone())
+      .entry((scheme.clone(), owner))
       .or_insert_with(|| (pending.label.clone(), Rc::from(handler)));
     if let Err(error) = context.ipc.call(
       "protocol.register",
@@ -1582,6 +1626,11 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     "windowId": serial,
     "webviewId": webview_id,
     "url": url.clone(),
+    "bounds": pending.webview_attributes.bounds.as_ref().map(|bounds| json!({
+      "position": position_payload(bounds.position),
+      "size": size_payload(bounds.size),
+    })),
+    "autoResize": pending.webview_attributes.auto_resize,
     "initScripts": initialization_scripts(&pending),
     "policy": { "download": download, "permission": permission },
   });
@@ -1676,6 +1725,14 @@ fn origin_of(url: &str) -> Option<String> {
   })
 }
 
+fn set_missing_origin(headers: &mut http::HeaderMap, fallback: Option<&str>) {
+  if !headers.contains_key(http::header::ORIGIN) {
+    if let Some(value) = fallback.and_then(|origin| http::HeaderValue::from_str(origin).ok()) {
+      headers.insert(http::header::ORIGIN, value);
+    }
+  }
+}
+
 /// Tauri's webview-scoped callbacks, stored so the run loop can feed them the
 /// events Electron forwards.
 pub(crate) struct WebviewHandlers {
@@ -1768,6 +1825,35 @@ fn register_policy_handlers<T: UserEvent>(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn validates_deduplicates_and_consumes_startup_schemes() {
+    assert!(take_startup_schemes().is_empty());
+    for scheme in ["", "1bad", "isolation://localhost", "white space", "a,b", "über", "x\ny"] {
+      assert!(register_custom_protocol_scheme(scheme).is_err(), "{scheme:?}");
+    }
+    for scheme in ["Isolation-Test", "isolation-test", "custom+1.2"] {
+      register_custom_protocol_scheme(scheme).unwrap();
+    }
+    assert!(std::thread::spawn(take_startup_schemes).join().unwrap().is_empty());
+    assert_eq!(take_startup_schemes(), ["isolation-test", "custom+1.2"]);
+    assert!(take_startup_schemes().is_empty());
+  }
+
+  #[test]
+  fn keeps_real_protocol_origins() {
+    let mut headers = http::HeaderMap::new();
+    set_missing_origin(&mut headers, Some("http://tauri.localhost"));
+    assert_eq!(headers[http::header::ORIGIN], "http://tauri.localhost");
+    for origin in ["https://remote.example", "null"] {
+      headers.insert(http::header::ORIGIN, origin.parse().unwrap());
+      set_missing_origin(&mut headers, Some("http://tauri.localhost"));
+      assert_eq!(headers[http::header::ORIGIN], origin);
+    }
+    headers.clear();
+    set_missing_origin(&mut headers, Some("invalid\norigin"));
+    assert!(!headers.contains_key(http::header::ORIGIN));
+  }
 
   #[test]
   fn maps_permission_names_both_ways() {

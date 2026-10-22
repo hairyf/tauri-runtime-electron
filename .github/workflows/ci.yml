@@ -21,15 +21,45 @@ env:
   GIT_CONFIG_VALUE_0: main
 
 jobs:
+  node-regressions:
+    name: Node regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      # Production scripts run in a VM with native objects replaced by doubles.
+      # No package install, source submodules, Electron process or GUI is needed.
+      - name: Check Electron script syntax
+        run: |
+          node --check electron/main.cjs
+          node --check electron/preload.cjs
+
+      - name: Check protocols and authenticated IPC
+        run: node scripts/protocol-check.mjs
+
+      - name: Check native child layout and dispatch
+        run: node scripts/webview-layout-check.mjs
+
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -58,10 +88,9 @@ jobs:
       - name: Check
         run: cargo check --all-targets
 
-      # These open a real Electron window and assert every capability
-      # round-trips, so a platform that silently stops working fails here
-      # instead of in a user's app. Linux has no display on the runners, hence
-      # the virtual one.
+      # The smoke test opens a real Electron window and checks its named desktop
+      # subset, reporting platform skips. Official-example GUI checks are separate.
+      # Linux has no display on the runners, hence the virtual one.
       # Chromium refuses to start unless its sandbox helper is setuid root, which
       # a downloaded release archive cannot carry.
       - name: Fix the Chromium sandbox helper
@@ -84,6 +113,26 @@ jobs:
 
       - name: Build
         run: cargo build --lib
+
+      # One checker runs all six sequentially in the shared workspace.
+      # Functional assertions leave visualReview pending for human review.
+      - name: Check official examples
+        if: runner.os != 'Linux'
+        run: node scripts/example-check.mjs helloworld state resources commands isolation streaming
+
+      - name: Check official examples under a virtual display
+        if: runner.os == 'Linux'
+        run: >
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
+          sh -c 'openbox & sleep 1; node scripts/example-check.mjs helloworld state resources commands isolation streaming'
+
+      - name: Upload example evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: example-checks-${{ matrix.os }}
+          path: target/example-checks/
+          if-no-files-found: warn
 
   # The docs are generated from the pinned `source/tauri` submodule, so this job
   # fails whenever the implementation and docs/coverage.md disagree. That is what

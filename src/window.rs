@@ -99,6 +99,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn is_maximized(&self) -> Result<bool> {
+    #[cfg(windows)]
+    return imp::is_maximized(self.context.native_handle(self.id)?);
+    #[cfg(not(windows))]
     Ok(self.geometry()?["maximized"].as_bool().unwrap_or(false))
   }
 
@@ -255,9 +258,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &mut self,
     pending: PendingWindow<T, Self::Runtime>,
-    _after_window_creation: Option<F>,
+    after_window_creation: Option<F>,
   ) -> Result<DetachedWindow<T, Self::Runtime>> {
-    create_window_impl(&self.context, pending)
+    create_window_impl(&self.context, pending, after_window_creation)
   }
 
   fn create_webview(
@@ -288,10 +291,16 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn maximize(&self) -> Result<()> {
+    #[cfg(windows)]
+    return imp::set_maximized(self.context.native_handle(self.id)?, true);
+    #[cfg(not(windows))]
     self.window_call("window.maximize", json!({}))
   }
 
   fn unmaximize(&self) -> Result<()> {
+    #[cfg(windows)]
+    return imp::set_maximized(self.context.native_handle(self.id)?, false);
+    #[cfg(not(windows))]
     self.window_call("window.unmaximize", json!({}))
   }
 
@@ -364,16 +373,14 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_always_on_top(&self, always_on_top: bool) -> Result<()> {
-    // Electron's setter is asynchronous through the compositor and does not take
-    // effect on a window this runtime created, so the z-order is set directly
-    // and its getter is not trusted.
-    #[cfg(windows)]
-    imp::set_always_on_top(self.context.native_handle(self.id)?, always_on_top);
-    #[cfg(not(windows))]
+    // Keep Chromium's z-order state consistent with the native HWND; otherwise
+    // a later widget update can undo the cross-process SetWindowPos call.
     self.window_call(
       "window.alwaysOnTop",
       json!({ "alwaysOnTop": always_on_top }),
     )?;
+    #[cfg(windows)]
+    imp::set_always_on_top(self.context.native_handle(self.id)?, always_on_top)?;
     Ok(())
   }
 
@@ -389,6 +396,19 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_size(&self, size: Size) -> Result<()> {
+    #[cfg(windows)]
+    {
+      let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
+      if !scale.is_finite() || scale <= 0.0 {
+        return Err(create_window_err("invalid window scale factor".into()));
+      }
+      let size = size.to_physical::<u32>(scale);
+      if size.width == 0 || size.height == 0 || size.width > i32::MAX as u32 || size.height > i32::MAX as u32 {
+        return Err(create_window_err("invalid or overflowing window size".into()));
+      }
+      return imp::set_client_size(self.context.native_handle(self.id)?, size);
+    }
+    #[cfg(not(windows))]
     self.window_call("window.size", size_payload(size))
   }
 
@@ -401,6 +421,15 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
+    #[cfg(windows)]
+    {
+      let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
+      if !scale.is_finite() || scale <= 0.0 {
+        return Err(create_window_err("invalid window scale factor".into()));
+      }
+      return imp::set_position(self.context.native_handle(self.id)?, position.to_physical::<i32>(scale));
+    }
+    #[cfg(not(windows))]
     self.window_call("window.position", position_payload(position))
   }
 
@@ -469,8 +498,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn start_dragging(&self) -> Result<()> {
     #[cfg(windows)]
     {
-      imp::start_dragging(self.context.native_handle(self.id)?);
-      Ok(())
+      imp::start_dragging(self.context.native_handle(self.id)?)
     }
     #[cfg(not(windows))]
     {
@@ -485,8 +513,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn start_resize_dragging(&self, direction: tauri_runtime::ResizeDirection) -> Result<()> {
     #[cfg(windows)]
     {
-      imp::start_resize_dragging(self.context.native_handle(self.id)?, direction);
-      Ok(())
+      imp::start_resize_dragging(self.context.native_handle(self.id)?, direction)
     }
     #[cfg(not(windows))]
     {
@@ -626,13 +653,15 @@ fn color_css(color: tauri_utils::config::Color) -> String {
 /// Win32 tweaks that Electron has no API for but the window still supports.
 #[cfg(windows)]
 mod imp {
-  use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-  use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+  use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
   use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOZORDER,
-    SetWindowLongPtrW, SetWindowPos, SendMessageW, WM_NCLBUTTONDOWN, WS_CAPTION, WS_THICKFRAME,
+    GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed,
+    HTCAPTION, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST,
+    SC_MOVE, SC_SIZE, ShowWindowAsync, SW_MAXIMIZE, SW_RESTORE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT,
+    WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
+    SetWindowLongPtrW, SetWindowPos, PostMessageW, WM_CANCELMODE, WM_SYSCOMMAND, WS_CAPTION, WS_THICKFRAME,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE, SWP_NOMOVE, SWP_NOSIZE,
     GWL_EXSTYLE, WS_EX_TOPMOST,
   };
@@ -640,6 +669,82 @@ mod imp {
 
   fn hwnd(handle: isize) -> HWND {
     HWND(handle as *mut std::ffi::c_void)
+  }
+
+  pub(super) fn is_maximized(handle: isize) -> tauri_runtime::Result<bool> {
+    let window = hwnd(handle);
+    // SAFETY: query only; an invalid HWND must not look like a restored window.
+    unsafe {
+      if !IsWindow(Some(window)).as_bool() {
+        return Err(tauri_runtime::Error::WindowNotFound);
+      }
+      Ok(IsZoomed(window).as_bool())
+    }
+  }
+
+  pub(super) fn set_maximized(handle: isize, maximized: bool) -> tauri_runtime::Result<()> {
+    let window = hwnd(handle);
+    // SAFETY: enqueue on Electron's owning UI thread instead of its widget cache.
+    unsafe {
+      if !IsWindow(Some(window)).as_bool() {
+        return Err(tauri_runtime::Error::WindowNotFound);
+      }
+      // Do not read IsZoomed here: an earlier maximize may still be queued on
+      // the owner thread. Its restore must remain behind it in the same queue.
+      if ShowWindowAsync(window, if maximized { SW_MAXIMIZE } else { SW_RESTORE }).as_bool() {
+        Ok(())
+      } else {
+        Err(tauri_runtime::Error::FailedToSendMessage)
+      }
+    }
+  }
+
+  fn outer_size_for_client(
+    size: tauri_runtime::dpi::PhysicalSize<u32>,
+    outer: RECT,
+    client: RECT,
+  ) -> Option<(i32, i32)> {
+    let dimension = |requested: u32, outer: i64, client: i64| {
+      if requested == 0 || outer <= 0 || client < 0 || outer < client {
+        return None;
+      }
+      i32::try_from(i64::from(requested) + outer - client).ok()
+    };
+    Some((
+      dimension(size.width, i64::from(outer.right) - i64::from(outer.left), i64::from(client.right) - i64::from(client.left))?,
+      dimension(size.height, i64::from(outer.bottom) - i64::from(outer.top), i64::from(client.bottom) - i64::from(client.top))?,
+    ))
+  }
+
+  pub(super) fn set_client_size(
+    handle: isize,
+    size: tauri_runtime::dpi::PhysicalSize<u32>,
+  ) -> tauri_runtime::Result<()> {
+    let window = hwnd(handle);
+    let mut outer = RECT::default();
+    let mut client = RECT::default();
+    // SAFETY: live pixel rectangles include native menu/frame insets that
+    // Electron's content-to-window conversion cannot see for Rust-owned menus.
+    unsafe {
+      GetWindowRect(window, &mut outer).map_err(|_| tauri_runtime::Error::WindowNotFound)?;
+      GetClientRect(window, &mut client).map_err(|_| tauri_runtime::Error::WindowNotFound)?;
+      let (width, height) = outer_size_for_client(size, outer, client)
+        .ok_or_else(|| super::create_window_err("invalid or overflowing window size".into()))?;
+      SetWindowPos(window, None, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+        .map_err(|_| tauri_runtime::Error::FailedToSendMessage)
+    }
+  }
+
+  #[test]
+  fn client_size_keeps_live_native_insets() {
+    use tauri_runtime::dpi::PhysicalSize;
+    let outer = RECT { left: -1000, top: -200, right: 222, bottom: 758 };
+    let client = RECT { left: 0, top: 0, right: 1200, bottom: 872 };
+    assert_eq!(outer_size_for_client(PhysicalSize::new(1440, 1200), outer, client), Some((1462, 1286)));
+    assert_eq!(outer_size_for_client(PhysicalSize::new(1440, 1200), client, client), Some((1440, 1200)));
+    assert_eq!(outer_size_for_client(PhysicalSize::new(0, 1200), outer, client), None);
+    assert_eq!(outer_size_for_client(PhysicalSize::new(u32::MAX, 1200), outer, client), None);
+    assert_eq!(outer_size_for_client(PhysicalSize::new(1440, 1200), client, outer), None);
   }
 
   pub(super) fn send_to_bottom(handle: isize) {
@@ -657,10 +762,10 @@ mod imp {
     }
   }
 
-  pub(super) fn set_always_on_top(handle: isize, always_on_top: bool) {
+  pub(super) fn set_always_on_top(handle: isize, always_on_top: bool) -> tauri_runtime::Result<()> {
     // SAFETY: z-order only, no geometry or focus change.
     unsafe {
-      let _ = SetWindowPos(
+      SetWindowPos(
         hwnd(handle),
         Some(if always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST }),
         0,
@@ -668,7 +773,21 @@ mod imp {
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-      );
+      )
+      .map_err(|_| tauri_runtime::Error::FailedToSendMessage)
+    }
+  }
+
+  pub(super) fn set_position(
+    handle: isize,
+    position: tauri_runtime::dpi::PhysicalPosition<i32>,
+  ) -> tauri_runtime::Result<()> {
+    // SAFETY: a move must not round-trip the live size through Chromium's DIP
+    // conversion, especially when native menu/frame insets are present.
+    unsafe {
+      SetWindowPos(hwnd(handle), None, position.x, position.y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        .map_err(|_| tauri_runtime::Error::FailedToSendMessage)
     }
   }
 
@@ -701,43 +820,63 @@ mod imp {
     }
   }
 
-  pub(super) fn start_dragging(handle: isize) {
-    // SAFETY: the canonical frameless-drag trick; the message is handled by the
-    // window's non-client path and only starts a move loop.
+  fn screen_position_lparam(point: POINT) -> LPARAM {
+    // Mouse-initiated WM_SYSCOMMAND packs signed screen coordinates into 16-bit words.
+    LPARAM(((point.x as u16 as u32) | ((point.y as u16 as u32) << 16)) as isize)
+  }
+
+  fn start_non_client_drag(handle: isize, command: u32) -> tauri_runtime::Result<()> {
+    let mut point = POINT::default();
+    // SAFETY: both messages contain only integer values. Cancel capture on the
+    // owning Electron UI thread, then enter the OS move/resize loop directly;
+    // Chromium may consume a synthetic WM_NCLBUTTONDOWN as a page mouse event.
     unsafe {
-      let _ = ReleaseCapture();
-      SendMessageW(
-        hwnd(handle),
-        WM_NCLBUTTONDOWN,
-        Some(WPARAM(HTCAPTION as usize)),
-        Some(LPARAM(0)),
-      );
+      GetCursorPos(&mut point).map_err(|_| tauri_runtime::Error::FailedToGetCursorPosition)?;
+      PostMessageW(Some(hwnd(handle)), WM_CANCELMODE, WPARAM(0), LPARAM(0))
+        .map_err(|_| tauri_runtime::Error::FailedToSendMessage)?;
+      PostMessageW(
+        Some(hwnd(handle)),
+        WM_SYSCOMMAND,
+        WPARAM(command as usize),
+        screen_position_lparam(point),
+      )
+      .map_err(|_| tauri_runtime::Error::FailedToSendMessage)
     }
+  }
+
+  pub(super) fn start_dragging(handle: isize) -> tauri_runtime::Result<()> {
+    start_non_client_drag(handle, SC_MOVE | HTCAPTION)
   }
 
   /// Resizes the way dragging a frame edge does, by handing the window the
   /// matching non-client resize code.
-  pub(super) fn start_resize_dragging(handle: isize, direction: ResizeDirection) {
-    let hit = match direction {
-      ResizeDirection::East => HTRIGHT,
-      ResizeDirection::North => HTTOP,
-      ResizeDirection::NorthEast => HTTOPRIGHT,
-      ResizeDirection::NorthWest => HTTOPLEFT,
-      ResizeDirection::South => HTBOTTOM,
-      ResizeDirection::SouthEast => HTBOTTOMRIGHT,
-      ResizeDirection::SouthWest => HTBOTTOMLEFT,
-      ResizeDirection::West => HTLEFT,
+  pub(super) fn start_resize_dragging(handle: isize, direction: ResizeDirection) -> tauri_runtime::Result<()> {
+    let edge = match direction {
+      ResizeDirection::East => WMSZ_RIGHT,
+      ResizeDirection::North => WMSZ_TOP,
+      ResizeDirection::NorthEast => WMSZ_TOPRIGHT,
+      ResizeDirection::NorthWest => WMSZ_TOPLEFT,
+      ResizeDirection::South => WMSZ_BOTTOM,
+      ResizeDirection::SouthEast => WMSZ_BOTTOMRIGHT,
+      ResizeDirection::SouthWest => WMSZ_BOTTOMLEFT,
+      ResizeDirection::West => WMSZ_LEFT,
     };
-    // SAFETY: same contract as `start_dragging`, with a resize code instead of
-    // a caption code.
-    unsafe {
-      let _ = ReleaseCapture();
-      SendMessageW(
-        hwnd(handle),
-        WM_NCLBUTTONDOWN,
-        Some(WPARAM(hit as usize)),
-        Some(LPARAM(0)),
-      );
+    start_non_client_drag(handle, SC_SIZE | edge)
+  }
+
+  #[test]
+  fn packs_signed_screen_coordinates() {
+    for (x, y, expected) in [
+      (0, 0, 0),
+      (-1, 1, 0x0001_ffff),
+      (1, -1, 0xffff_0001),
+      (-32768, 32767, 0x7fff_8000),
+      (32767, -32768, 0x8000_7fff),
+    ] {
+      let packed = screen_position_lparam(POINT { x, y }).0 as u32;
+      assert_eq!(packed, expected);
+      assert_eq!(packed as i16 as i32, x);
+      assert_eq!((packed >> 16) as i16 as i32, y);
     }
   }
 }

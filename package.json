@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "example": "node scripts/example.mjs"
+    "example": "node scripts/example.mjs",
+    "check": "node scripts/example-check.mjs"
   }
 }

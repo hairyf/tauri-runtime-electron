@@ -5,10 +5,12 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   ipcMain,
   Menu,
   nativeImage,
   nativeTheme,
+  net: electronNet,
   protocol,
   screen,
   session,
@@ -116,29 +118,25 @@ protocol.registerSchemesAsPrivileged(
   }))
 )
 
-let localhostRedirectInstalled = false
+let localhostProtocolsInstalled = false
 
-/**
- * On Windows Tauri's frontend reaches custom protocols as
- * `http://<scheme>.localhost/<...>` (the WebView2 form of `convertFileSrc`),
- * but Electron only routes `<scheme>://localhost/<...>`. Rewrite the former
- * onto the registered scheme so IPC uses the custom protocol instead of
- * falling back to `postMessage`. Electron keeps a single `onBeforeRequest`
- * listener per session, so it is installed once and consults `registeredSchemes`.
- */
-function installLocalhostRedirect() {
-  if (localhostRedirectInstalled) return
-  localhostRedirectInstalled = true
-  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
-    const match = /^https?:\/\/([A-Za-z0-9-]+)\.localhost(?::\d+)?(\/.*)?$/.exec(
-      details.url
-    )
-    if (!match || !registeredSchemes.has(match[1])) {
-      callback({})
-      return
-    }
-    callback({ redirectURL: `${match[1]}://localhost${match[2] ?? '/'}` })
-  })
+/** Keep WebView2's virtual HTTP(S) origin: isolation and CSP depend on it. */
+function installLocalhostProtocols() {
+  if (localhostProtocolsInstalled) return
+  for (const transport of ['http', 'https']) {
+    protocol.handle(transport, (request) => {
+      const url = new URL(request.url)
+      const match = /^([a-z][a-z0-9+.-]*)\.localhost$/.exec(url.hostname)
+      // A dev server on a real port, or any unregistered host, stays ordinary HTTP.
+      if (url.port || !match || !registeredSchemes.has(match[1])) {
+        return electronNet.fetch(request, { bypassCustomProtocolHandlers: true })
+      }
+      // Only the resolver sees the native scheme, just like Wry's WebView2 adapter.
+      const uri = `${match[1]}://localhost${url.pathname}${url.search}`
+      return dispatchProtocol(match[1], request, uri)
+    })
+  }
+  localhostProtocolsInstalled = true
 }
 
 /** id -> resolve(Response); a `protocol.request` awaiting `protocol.respond`. */
@@ -146,32 +144,36 @@ const protocolRequests = new Map()
 let nextProtocolId = 1
 const registeredSchemes = new Set()
 
-async function dispatchProtocol(scheme, request) {
+async function dispatchProtocol(scheme, request, uri = request.url, webviewId) {
+  // Electron's session-global protocol callback has no authenticated sender.
+  // IPC uses the narrow preload fetch bridge below; never guess its owner.
+  if (scheme === 'ipc' && webviewId === undefined) return Response.error()
   const id = nextProtocolId++
   const body = Buffer.from(await request.arrayBuffer()).toString('base64')
   const headers = {}
   for (const [name, value] of request.headers) headers[name] = value
-  if (!headers.origin) {
-    // Tauri's protocols validate the request origin; a synthetic one keeps
-    // `tauri://localhost` and `ipc://localhost` requests looking native.
-    try {
-      const url = new URL(request.url)
-      headers.origin = `${url.protocol.slice(0, -1)}://${url.host}`
-    } catch {}
-  }
+  // Chromium's initiator is not page-controlled; preserve opaque origins too.
+  if (typeof request.initiatorOrigin === 'string') headers.origin = request.initiatorOrigin
   const response = new Promise((resolve) => protocolRequests.set(id, resolve))
   send({
     event: 'protocol.request',
-    params: { id, scheme, uri: request.url, method: request.method, headers, body },
+    params: { id, scheme, webviewId, uri, method: request.method, headers, body },
   })
   const reply = await response
   log('protocol', scheme, request.method, request.url, reply.status)
   if (reply.status >= 400) {
     log('protocol-error', request.url, Buffer.from(reply.body ?? '', 'base64').toString().slice(0, 300))
   }
-  return new Response(Buffer.from(reply.body ?? '', 'base64'), {
-    status: reply.status ?? 200,
-    headers: reply.headers ?? {},
+  const status = reply.status ?? 200
+  const empty = request.method === 'HEAD' || [204, 205, 304].includes(status)
+  const responseHeaders = new Headers(reply.headers ?? {})
+  if (status === 204 || status === 205) {
+    responseHeaders.delete('content-length')
+    responseHeaders.delete('transfer-encoding')
+  }
+  return new Response(empty ? null : Buffer.from(reply.body ?? '', 'base64'), {
+    status,
+    headers: responseHeaders,
   })
 }
 
@@ -184,10 +186,8 @@ const closeAllowed = new Set()
 const webviews = new Map()
 /** webContents id -> webviewId (for routing `tauri-ipc` messages) */
 const webviewByContents = new Map()
-/** windowId -> webviewId of the contents that hosts the page */
-const mainWebview = new Map()
-/** webviewId -> webContents id of a `<webview>` guest */
-const guestContentsIds = new Map()
+/** webviewId -> native child view and its resize reference (main pages stay on BrowserWindow). */
+const childWebviews = new Map()
 /** webviewId -> the out-of-band callbacks the runtime registered */
 const handlerPolicy = new Map()
 /** request id -> DownloadItem awaiting the runtime's answer */
@@ -375,8 +375,6 @@ async function createWindow(params) {
   // Electron has no decorations getter, so remember what the window was created
   // with; `window.decorations` updates it when the Win32 styles are toggled.
   window.__tauriDecorations = params.decorations ?? true
-  // The page webview of this window; later webviews on it become guests.
-  if (params.webview) mainWebview.set(windowId, params.webview.webviewId)
   // Read this now: by the time `closed` fires the window and its webContents are
   // destroyed, and `window.webContents.id` throws "Object has been destroyed".
   const contentsId = window.webContents.id
@@ -393,10 +391,17 @@ async function createWindow(params) {
   window.on('closed', () => {
     closeAllowed.delete(windowId)
     windows.delete(windowId)
-    mainWebview.delete(windowId)
     webviewByContents.delete(contentsId)
     for (const [webviewId, owner] of webviews) {
-      if (owner === window) webviews.delete(webviewId)
+      if (owner !== window) continue
+      const child = childWebviews.get(webviewId)
+      if (child) {
+        childWebviews.delete(webviewId)
+        webviewByContents.delete(child.view.webContents.id)
+        if (!child.view.webContents.isDestroyed()) child.view.webContents.close()
+      }
+      handlerPolicy.delete(webviewId)
+      webviews.delete(webviewId)
     }
     send({ event: 'window.closed', params: { windowId } })
   })
@@ -405,6 +410,7 @@ async function createWindow(params) {
     const geometry = readGeometry(window)
     send({ event: 'window.event', params: { windowId, event, ...geometry, ...extra } })
   }
+  window.on('resize', () => resizeChildWebviews(window))
   for (const event of ['resize', 'move', 'focus', 'blur', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) {
     window.on(event, () => emit(event))
   }
@@ -464,13 +470,7 @@ function writeInitPreload(webviewId, initScripts) {
   const scripts = initScripts ?? []
   if (!scripts.length) return path.join(__dirname, 'preload.cjs')
   const file = path.join(os.tmpdir(), `tauri-runtime-electron-preload-${webviewId}.cjs`)
-  const source = `'use strict'
-const { contextBridge, ipcRenderer, webFrame } = require('electron')
-contextBridge.exposeInMainWorld('ipc', {
-  postMessage(data) {
-    ipcRenderer.send('tauri-ipc', String(data))
-  },
-})
+  const source = `${fs.readFileSync(path.join(__dirname, 'preload.cjs'), 'utf8')}
 for (const source of ${JSON.stringify(scripts)}) {
   try {
     webFrame.executeJavaScript(source)
@@ -495,106 +495,110 @@ function loadWebview(window, webview) {
   return { windowId: webviewId }
 }
 
-/**
- * Additional webviews on an already loaded window are real Chromium guests:
- * a `<webview>` element appended to the page, exactly how an app would embed
- * one itself.
- */
-function attachWebviewElement(window, webview) {
+/** Native children do not depend on a host page, its CSP, or its load finishing. */
+function createChildWebview(window, webview) {
   const { webviewId, url, initScripts } = webview
+  const view = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      preload: writeInitPreload(webviewId, initScripts),
+    },
+  })
+  const child = { view, autoResize: webview.autoResize || !webview.bounds }
+  childWebviews.set(webviewId, child)
   webviews.set(webviewId, window)
-  recordPolicy(webviewId, webview.policy)
-  const elementId = `tauri-webview-${webviewId}`
-  const code = `(async () => {
-    const element = document.createElement('webview')
-    element.id = ${JSON.stringify(elementId)}
-    element.setAttribute('webpreferences', 'contextIsolation=yes,sandbox=yes')
-    element.setAttribute('preload', ${JSON.stringify(writeInitPreload(webviewId, initScripts))})
-    element.src = ${JSON.stringify(url)}
-    element.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;'
-    document.body.appendChild(element)
-    // The guest id only exists once the element is attached and loaded.
-    await new Promise((resolve, reject) => {
-      element.addEventListener('dom-ready', resolve, { once: true })
-      setTimeout(() => reject(new Error('webview dom-ready timed out')), 10000)
+  try {
+    window.contentView.addChildView(view)
+    webviewByContents.set(view.webContents.id, webviewId)
+    recordPolicy(webviewId, webview.policy)
+    wireWebviewEvents(view.webContents, webviewId)
+    const content = window.getContentBounds()
+    const position = webview.bounds?.position ?? { x: 0, y: 0 }
+    const size = webview.bounds?.size ?? content
+    setChildBounds(window, child, {
+      x: toDip(window, position, 'x'), y: toDip(window, position, 'y'),
+      width: toDip(window, size, 'width'), height: toDip(window, size, 'height'),
     })
-    return element.getWebContentsId()
-  })()`
-  return window.webContents
-    .executeJavaScript(code, true)
-    .then((contentsId) => {
-      if (typeof contentsId === 'number') {
-        webviewByContents.set(contentsId, webviewId)
-        guestContentsIds.set(webviewId, contentsId)
-        wireWebviewEvents(webContents.fromId(contentsId), webviewId)
-      }
-      return { webviewId }
-    })
+    // Never wait for navigation here: local protocols need the Rust loop that
+    // is currently waiting for this creation call to return.
+    view.webContents.loadURL(url).catch((error) => log('loadURL failed', url, serializeError(error)))
+    return { webviewId }
+  } catch (error) {
+    closeChildWebview(webviewId)
+    throw error
+  }
 }
 
-/** The webContents that belongs to `webviewId`: the window page or a guest. */
-function contentsFor(webviewId) {
-  const guestId = guestContentsIds.get(webviewId)
-  if (guestId !== undefined) {
-    const guest = webContents.fromId(guestId)
-    if (guest && !guest.isDestroyed()) return guest
+function rememberChildBounds(window, child) {
+  child.reference = { ...child.view.getBounds(), parent: window.getContentBounds() }
+}
+
+function setChildBounds(window, child, bounds) {
+  if (!Object.values(bounds).every(Number.isFinite) || bounds.width < 0 || bounds.height < 0) {
+    throw new Error('invalid child webview bounds')
   }
-  return findWebview(webviewId).webContents
+  child.view.setBounds(bounds)
+  rememberChildBounds(window, child)
+}
+
+/** Match Wry: both position and size scale relative to the parent's content. */
+function resizeChildWebviews(window) {
+  const parent = window.getContentBounds()
+  if (parent.width <= 0 || parent.height <= 0) return
+  for (const [id, child] of childWebviews) {
+    if (webviews.get(id) !== window || !child.autoResize) continue
+    const reference = child.reference
+    if (reference.parent.width <= 0 || reference.parent.height <= 0) {
+      rememberChildBounds(window, child)
+      continue
+    }
+    const x = Math.round(reference.x * parent.width / reference.parent.width)
+    const y = Math.round(reference.y * parent.height / reference.parent.height)
+    // Scale edges so adjacent views still meet when the parent has odd dimensions.
+    child.view.setBounds({
+      x, y,
+      width: Math.round((reference.x + reference.width) * parent.width / reference.parent.width) - x,
+      height: Math.round((reference.y + reference.height) * parent.height / reference.parent.height) - y,
+    })
+  }
+}
+
+function closeChildWebview(webviewId) {
+  const child = childWebviews.get(webviewId)
+  if (!child) return
+  const window = webviews.get(webviewId)
+  if (window && !window.isDestroyed()) window.contentView.removeChildView(child.view)
+  webviewByContents.delete(child.view.webContents.id)
+  handlerPolicy.delete(webviewId)
+  childWebviews.delete(webviewId)
+  webviews.delete(webviewId)
+  if (!child.view.webContents.isDestroyed()) child.view.webContents.close()
+}
+
+/** Route every dispatch to its own native child or the BrowserWindow main page. */
+function contentsFor(webviewId) {
+  const window = findWebview(webviewId)
+  const contents = childWebviews.get(webviewId)?.view.webContents ?? window.webContents
+  if (contents.isDestroyed()) throw new Error(`destroyed webview ${webviewId}`)
+  return contents
 }
 
 function readWebviewBounds(webviewId) {
   const window = findWebview(webviewId)
+  const child = childWebviews.get(webviewId)
   const scaleFactor = scaleOf(window)
-  const guestId = guestContentsIds.get(webviewId)
-  if (guestId === undefined) {
-    // the main webview fills the window content area, so its origin is (0, 0)
-    const rect = window.getContentBounds()
-    return {
-      scaleFactor,
-      bounds: {
-        x: 0,
-        y: 0,
-        width: Math.round(rect.width * scaleFactor),
-        height: Math.round(rect.height * scaleFactor),
-      },
-      contentBounds: {
-        x: Math.round(rect.x * scaleFactor),
-        y: Math.round(rect.y * scaleFactor),
-        width: Math.round(rect.width * scaleFactor),
-        height: Math.round(rect.height * scaleFactor),
-      },
-      visible: window.isVisible(),
-    }
+  const content = window.getContentBounds()
+  const rect = child ? child.view.getBounds() : { ...content, x: 0, y: 0 }
+  const toPhysical = (value) => Math.round(value * scaleFactor)
+  return {
+    scaleFactor,
+    // Webview positions are relative to their parent, never screen coordinates.
+    bounds: { x: toPhysical(rect.x), y: toPhysical(rect.y), width: toPhysical(rect.width), height: toPhysical(rect.height) },
+    contentBounds: { x: toPhysical(content.x), y: toPhysical(content.y), width: toPhysical(content.width), height: toPhysical(content.height) },
+    visible: window.isVisible() && (!child || child.view.getVisible()),
   }
-  const elementId = `tauri-webview-${webviewId}`
-  return window.webContents
-    .executeJavaScript(
-      `(() => {
-        const element = document.getElementById(${JSON.stringify(elementId)})
-        if (!element) return null
-        const rect = element.getBoundingClientRect()
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-      })()`,
-      true
-    )
-    .then((rect) => {
-      const origin = window.getContentBounds()
-      const toPhysical = (value) => Math.round(value * scaleFactor)
-      const clamp = (value, max) => Math.max(0, Math.min(value, max))
-      return {
-        scaleFactor,
-        bounds: rect
-          ? {
-              x: toPhysical(origin.x + rect.x),
-              y: toPhysical(origin.y + rect.y),
-              width: clamp(toPhysical(rect.width), toPhysical(origin.width)),
-              height: clamp(toPhysical(rect.height), toPhysical(origin.height)),
-            }
-          : { x: 0, y: 0, width: 0, height: 0 },
-        contentBounds: { x: 0, y: 0, width: toPhysical(origin.width), height: toPhysical(origin.height) },
-        visible: Boolean(rect),
-      }
-    })
 }
 
 function findWebview(webviewId) {
@@ -713,12 +717,7 @@ function handle(method, params) {
     case 'webview.create': {
       const window = windows.get(params.windowId)
       if (!window) throw new Error(`unknown window ${params.windowId}`)
-      // The first webview of a window owns the page; later ones are guests.
-      if (!mainWebview.has(params.windowId)) {
-        mainWebview.set(params.windowId, params.webviewId)
-        return loadWebview(window, params)
-      }
-      return attachWebviewElement(window, params)
+      return createChildWebview(window, params)
     }
     case 'webview.eval': {
       return contentsFor(params.webviewId).executeJavaScript(params.script, true)
@@ -783,9 +782,16 @@ function handle(method, params) {
       findWindow(params.windowId).setAlwaysOnTop(params.alwaysOnTop)
       return null
     case 'window.cursor': {
-      // The cursor over the page is the page's, so CSS is where it lives.
+      // Each native child has its own document; a host page's CSS cannot reach it.
+      const window = findWindow(params.windowId)
+      const contents = []
+      for (const [id, owner] of webviews) {
+        if (owner === window) contents.push(contentsFor(id))
+      }
       const script = `document.documentElement.style.cursor = ${JSON.stringify(params.cursor)}`
-      return findWindow(params.windowId).webContents.executeJavaScript(script).then(() => null)
+      return Promise.all(contents.filter((item) => !item.isDestroyed()).map((item) =>
+        item.executeJavaScript(script),
+      )).then(() => null)
     }
     case 'window.skipTaskbar':
       findWindow(params.windowId).setSkipTaskbar(params.skip)
@@ -848,9 +854,11 @@ function handle(method, params) {
       contentsFor(params.webviewId).reload()
       return null
     case 'webview.setAutoResize': {
-      const contents = contentsFor(params.webviewId)
-      if (typeof contents.setAutoResize === 'function') {
-        contents.setAutoResize({ width: params.autoResize, height: params.autoResize })
+      const window = findWebview(params.webviewId)
+      const child = childWebviews.get(params.webviewId)
+      if (child) {
+        child.autoResize = Boolean(params.autoResize)
+        rememberChildBounds(window, child)
       }
       return null
     }
@@ -1015,92 +1023,47 @@ function handle(method, params) {
       return readWebviewBounds(params.webviewId)
     case 'webview.setBounds': {
       const window = findWebview(params.webviewId)
-      if (!guestContentsIds.has(params.webviewId)) return null
-      const scale = scaleOf(window)
-      const dip = (value) => Math.round(value / scale)
-      const elementId = `tauri-webview-${params.webviewId}`
-      const style = `position:absolute;left:${dip(params.x)}px;top:${dip(params.y)}px;width:${dip(
-        params.width
-      )}px;height:${dip(params.height)}px`
-      return window.webContents
-        .executeJavaScript(
-          `(() => {
-            const el = document.getElementById(${JSON.stringify(elementId)})
-            if (el) el.style.cssText = ${JSON.stringify(style)}
-          })()`,
-          true
-        )
-        .then(() => null)
+      const child = childWebviews.get(params.webviewId)
+      if (!child) return null
+      const bounds = child.view.getBounds()
+      if (params.position) {
+        bounds.x = toDip(window, params.position, 'x')
+        bounds.y = toDip(window, params.position, 'y')
+      }
+      if (params.size) {
+        bounds.width = toDip(window, params.size, 'width')
+        bounds.height = toDip(window, params.size, 'height')
+      }
+      setChildBounds(window, child, bounds)
+      return null
     }
     case 'webview.visibility': {
       const window = findWebview(params.webviewId)
-      if (!guestContentsIds.has(params.webviewId)) {
-        if (params.visible) window.show()
-        else window.hide()
-        return null
-      }
-      const elementId = `tauri-webview-${params.webviewId}`
-      const visible = JSON.stringify(Boolean(params.visible))
-      return window.webContents
-        .executeJavaScript(
-          `(() => {
-            const el = document.getElementById(${JSON.stringify(elementId)})
-            if (el) el.style.visibility = ${visible} ? 'visible' : 'hidden'
-          })()`,
-          true
-        )
-        .then(() => null)
+      const child = childWebviews.get(params.webviewId)
+      if (child) child.view.setVisible(Boolean(params.visible))
+      else if (params.visible) window.show()
+      else window.hide()
+      return null
     }
     case 'webview.backgroundColor': {
-      const window = findWebview(params.webviewId)
-      if (!guestContentsIds.has(params.webviewId)) return null
-      const elementId = `tauri-webview-${params.webviewId}`
-      return window.webContents
-        .executeJavaScript(
-          `(() => {
-            const el = document.getElementById(${JSON.stringify(elementId)})
-            if (el) el.style.backgroundColor = ${JSON.stringify(params.color ?? 'transparent')}
-          })()`,
-          true
-        )
-        .then(() => null)
+      const child = childWebviews.get(params.webviewId)
+      findWebview(params.webviewId)
+      if (child) child.view.setBackgroundColor(params.color ?? '#00000000')
+      return null
     }
     case 'webview.focus': {
-      const window = findWebview(params.webviewId)
-      if (!guestContentsIds.has(params.webviewId)) {
-        window.focus()
-        return null
-      }
-      const elementId = `tauri-webview-${params.webviewId}`
-      return window.webContents
-        .executeJavaScript(
-          `(() => { document.getElementById(${JSON.stringify(elementId)})?.focus() })()`,
-          true
-        )
-        .then(() => null)
+      findWebview(params.webviewId).focus()
+      contentsFor(params.webviewId).focus()
+      return null
     }
     case 'webview.print': {
       contentsFor(params.webviewId).print({ silent: false })
       return null
     }
     case 'webview.close': {
-      const guestId = guestContentsIds.get(params.webviewId)
-      if (guestId === undefined) {
-        findWebview(params.webviewId).close()
-        return null
-      }
-      const window = findWebview(params.webviewId)
-      const elementId = `tauri-webview-${params.webviewId}`
-      return window.webContents
-        .executeJavaScript(
-          `(() => { document.getElementById(${JSON.stringify(elementId)})?.remove() })()`,
-          true
-        )
-        .then(() => {
-          webviewByContents.delete(guestId)
-          guestContentsIds.delete(params.webviewId)
-          return null
-        })
+      if (childWebviews.has(params.webviewId)) closeChildWebview(params.webviewId)
+      else findWebview(params.webviewId).close()
+      return null
     }
     case 'webview.cookies':
       return contentsFor(params.webviewId).session.cookies.get(params.url ? { url: params.url } : {})
@@ -1127,9 +1090,9 @@ function handle(method, params) {
     case 'protocol.register': {
       const { scheme } = params
       if (registeredSchemes.has(scheme)) return null
-      registeredSchemes.add(scheme)
       protocol.handle(scheme, (request) => dispatchProtocol(scheme, request))
-      installLocalhostRedirect()
+      registeredSchemes.add(scheme)
+      installLocalhostProtocols()
       return null
     }
     case 'protocol.respond': {
@@ -1167,7 +1130,35 @@ function onLine(line) {
     })
 }
 
+ipcMain.handle('tauri-ipc-fetch', async (event, data) => {
+  const frame = event.senderFrame
+  const webviewId = webviewByContents.get(event.sender.id)
+  if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || webviewId === undefined) {
+    throw new Error('unknown IPC sender')
+  }
+  const url = new URL(data.url)
+  if (url.username || url.password || url.port || !(
+    (url.protocol === 'ipc:' && url.hostname === 'localhost') ||
+    (/^https?:$/.test(url.protocol) && url.hostname === 'ipc.localhost')
+  ) || data.method !== 'POST' || !(data.body instanceof Uint8Array)) {
+    throw new Error('invalid IPC request')
+  }
+  const headers = new Headers(data.headers)
+  // The renderer can choose payload/headers, never its ACL origin or webview.
+  headers.set('Origin', frame.origin)
+  const request = new Request(url, { method: 'POST', headers, body: data.body })
+  const response = await dispatchProtocol('ipc', request, `ipc://localhost${url.pathname}${url.search}`, webviewId)
+  return {
+    status: response.status, headers: [...response.headers],
+    body: new Uint8Array(await response.arrayBuffer()),
+  }
+})
+
 ipcMain.on('tauri-ipc', (event, data) => {
+  // Only the frame that received Tauri's main-frame preload may invoke it.
+  // Do not relabel an iframe's URL (including an opaque origin) as its parent.
+  const frame = event.senderFrame
+  if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || typeof data !== 'string') return
   const webviewId = webviewByContents.get(event.sender.id)
   if (webviewId === undefined) {
     log('ipc message from unknown contents', event.sender.id)
@@ -1175,7 +1166,7 @@ ipcMain.on('tauri-ipc', (event, data) => {
   }
   send({
     event: 'ipc.message',
-    params: { webviewId, url: event.sender.getURL(), body: data },
+    params: { webviewId, url: frame.url, body: data },
   })
 })
 

@@ -78,9 +78,9 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &self,
     pending: PendingWindow<T, Self::Runtime>,
-    _after_window_creation: Option<F>,
+    after_window_creation: Option<F>,
   ) -> Result<DetachedWindow<T, Self::Runtime>> {
-    create_window_impl(&self.context, pending)
+    create_window_impl(&self.context, pending, after_window_creation)
   }
 
   fn create_webview(

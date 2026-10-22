@@ -1,8 +1,8 @@
-//! Launches the real Electron runtime and asserts every window capability
-//! round-trips: set something, read it back, compare.
+//! Launches the real Electron runtime and checks a named desktop subset:
+//! set a value, read it back, compare, and observe events and page state.
 //!
-//! A silent no-op cannot survive this, because the getters ask Electron rather
-//! than echoing the last value the Rust side sent.
+//! These checks catch no-ops on their exercised paths. Platform skips are
+//! reported; native effects and the complete official examples need more evidence.
 //!
 //! `cargo run --bin smoke` needs a display; CI wraps it in `xvfb-run` on Linux.
 //!
@@ -45,10 +45,10 @@ const SETTLE: Duration = Duration::from_secs(5);
  type Handle = <ElectronRuntime as Runtime<()>>::Handle;
 
 /// The first page the window loads.
-const PAGE: &str = "data:text/html,<title>smoke-page</title><p>smoke</p>";
+const PAGE: &str = "tauri://localhost/index.html";
 
 /// The page `navigate` sends the window to; its title proves the load happened.
-const SECOND_PAGE: &str = "data:text/html,<title>smoke-second</title><p>second</p>";
+const SECOND_PAGE: &str = "tauri://localhost/second.html";
 
 fn main() -> ExitCode {
   let runtime = match <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs::default()) {
@@ -124,6 +124,19 @@ fn main() -> ExitCode {
       // The window loads this page itself, so the checks below can eval against
       // a document that really exists.
       webview.url = PAGE.to_string();
+      webview.register_uri_scheme_protocol("tauri", |_, request, respond| {
+        let title = if request.uri().path() == "/second.html" {
+          "smoke-second"
+        } else {
+          "smoke-page"
+        };
+        respond(
+          http::Response::builder()
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .body(std::borrow::Cow::Owned(format!("<title>{title}</title><p>smoke</p>").into_bytes()))
+            .unwrap(),
+        );
+      });
       // The page posts through `window.ipc.postMessage`, which is the bridge
       // Tauri's own IPC script uses; the handler is the other end of it.
       webview.ipc_handler = Some(Box::new(|_webview, request| {
@@ -142,6 +155,9 @@ fn main() -> ExitCode {
     }
   }
   // A fn pointer is higher-ranked over the handle lifetime, so it satisfies `Fn(RawWindow)`.
+  #[cfg(any(windows, target_os = "macos"))]
+  let after: Option<fn(RawWindow<'_>)> = Some(record_window_creation);
+  #[cfg(not(any(windows, target_os = "macos")))]
   let after: Option<fn(RawWindow<'_>)> = None;
   let detached = match <ElectronRuntimeHandle as RuntimeHandle<()>>::create_window(
     &handle, pending, after,
@@ -158,6 +174,26 @@ fn main() -> ExitCode {
     ..
   } = detached;
   let webview = webview.map(|detached| detached.webview.dispatcher);
+
+  #[cfg(any(windows, target_os = "macos"))]
+  expect(&mut failures, "creation callback once", 1, || {
+    Ok(CREATIONS.load(Ordering::SeqCst))
+  });
+  #[cfg(windows)]
+  {
+    CHECKS.fetch_add(1, Ordering::Relaxed);
+    match WindowDispatch::<()>::window_handle(&window).map(|handle| handle.as_raw()) {
+      Ok(raw_window_handle::RawWindowHandle::Win32(raw))
+        if *CREATED_HWND.lock().unwrap() == Some(raw.hwnd.get()) =>
+      {
+        println!("ok   creation callback HWND matches window handle");
+      }
+      other => failures.push(format!(
+        "creation callback HWND {:?} does not match {other:?}",
+        *CREATED_HWND.lock().unwrap(),
+      )),
+    }
+  }
 
   window_checks(&window, &handle, &mut failures);
   webview_checks(webview.as_ref(), &mut failures);
@@ -821,6 +857,20 @@ fn expect_named(
     thread::sleep(Duration::from_millis(25));
   }
 }
+
+#[cfg(any(windows, target_os = "macos"))]
+fn record_window_creation(_raw: RawWindow<'_>) {
+  CREATIONS.fetch_add(1, Ordering::SeqCst);
+  #[cfg(windows)]
+  {
+    *CREATED_HWND.lock().unwrap() = Some(_raw.hwnd);
+  }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+static CREATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(windows)]
+static CREATED_HWND: Mutex<Option<isize>> = Mutex::new(None);
 
 static CHECKS: AtomicUsize = AtomicUsize::new(0);
 static REPORT: Mutex<Vec<String>> = Mutex::new(Vec::new());

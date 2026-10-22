@@ -14,6 +14,8 @@ include!("src/acquisition_shared.rs");
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=src/acquisition_shared.rs");
+  println!("cargo:rerun-if-changed=electron/main.cjs");
+  println!("cargo:rerun-if-changed=electron/preload.cjs");
   println!("cargo:rerun-if-env-changed=TAURI_RUNTIME_ELECTRON_ELECTRON_DIR");
   println!("cargo:rerun-if-env-changed=TAURI_RUNTIME_ELECTRON_DOWNLOAD");
   println!("cargo:rerun-if-env-changed=ELECTRON_MIRROR");
