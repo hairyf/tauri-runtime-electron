@@ -436,6 +436,11 @@ impl ElectronRuntime {
 
   fn start(attrs: Electron, custom_schemes: &[&str]) -> Result<Self> {
     let binary = attrs.resolve_binary();
+    // Task Manager and Explorer name and icon a process after its executable,
+    // so the Electron binary borrows the application's resources.
+    if let Ok(app_exe) = std::env::current_exe() {
+      crate::branding::apply(&binary, &app_exe);
+    }
     let main_script = attrs.resolve_main_script(&binary);
     if !main_script.exists() {
       return Err(create_window_err(format!(

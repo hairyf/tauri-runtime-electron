@@ -22,6 +22,7 @@
 
 mod acquisition;
 mod app_icon;
+mod branding;
 mod devtools;
 mod electron_impl;
 mod environment;

@@ -13,7 +13,7 @@ use std::{
   path::PathBuf,
   process::{Child, Command},
   sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{channel, Receiver, Sender},
     Arc, Mutex,
   },
@@ -29,6 +29,9 @@ pub(crate) struct Ipc {
   writer: Mutex<TcpStream>,
   pending: Mutex<HashMap<u64, Sender<IpcResult>>>,
   next_id: AtomicU64,
+  /// Set once the Electron process is gone; later calls fail fast instead of
+  /// waiting out the full timeout during Tauri's exit cleanup.
+  closed: AtomicBool,
   child: Mutex<Option<Child>>,
   /// Version reported by the Electron process during the handshake.
   pub(crate) version: String,
@@ -130,6 +133,7 @@ impl Ipc {
       writer: Mutex::new(writer),
       pending: Mutex::new(HashMap::new()),
       next_id: AtomicU64::new(0),
+      closed: AtomicBool::new(false),
       child: Mutex::new(Some(child)),
       version,
     });
@@ -152,6 +156,7 @@ impl Ipc {
           reader_ipc.dispatch(message, &event_tx);
         }
         // The Electron process is gone; let the event loop wind down.
+        reader_ipc.closed.store(true, Ordering::SeqCst);
         let _ = event_tx.send(json!({ "event": "ipc.closed" }));
       })
       .map_err(|e| format!("failed to start IPC reader thread: {e}"))?;
@@ -166,6 +171,9 @@ impl Ipc {
     params: Value,
     timeout: Duration,
   ) -> IpcResult {
+    if self.closed.load(Ordering::SeqCst) {
+      return Err(format!("electron is gone ({method})"));
+    }
     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = channel();
     self.pending.lock().unwrap().insert(id, tx);
@@ -211,6 +219,7 @@ impl Ipc {
 
   /// Closes the socket and terminates the Electron process.
   pub(crate) fn shutdown(&self) {
+    self.closed.store(true, Ordering::SeqCst);
     if let Ok(writer) = self.writer.lock() {
       let _ = writer.shutdown(std::net::Shutdown::Both);
     }
