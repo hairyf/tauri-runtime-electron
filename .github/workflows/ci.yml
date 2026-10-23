@@ -5,6 +5,11 @@ on:
     branches: [main, next]
   pull_request:
   workflow_dispatch:
+    inputs:
+      examples:
+        description: Space-separated official examples (empty runs all)
+        type: string
+        default: ''
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -147,7 +152,12 @@ jobs:
       # Native drag/resize and real decoded video frames supplement page CDP.
       # Screenshot inspection remains separate from automated assertion results.
       - name: Official example actions and keyframes
-        run: node scripts/verify-examples.mjs
+        env:
+          EXAMPLES: ${{ inputs.examples }}
+        run: |
+          $examples = @($env:EXAMPLES -split '\s+' | Where-Object { $_ })
+          node scripts/verify-examples.mjs @examples
+          exit $LASTEXITCODE
 
       - name: Upload example evidence
         if: always()

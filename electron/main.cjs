@@ -684,8 +684,10 @@ async function createWindow(params) {
   // destroyed, and `window.webContents.id` throws "Object has been destroyed".
   const contentsId = window.webContents.id
   if (process.platform === 'win32' && process.env.TAURI_RUNTIME_ELECTRON_LOG) {
-    for (const [message, phase] of [[0x0231, 'enter'], [0x0232, 'exit']]) {
-      window.hookWindowMessage(message, () => log('native-move-loop', phase, JSON.stringify({ windowId, ...readGeometry(window) })))
+    for (const [message, phase] of [[0x0231, 'enter'], [0x0232, 'exit'], [0x0112, 'syscommand'], [0x00a3, 'caption-doubleclick'], [0x0005, 'size']]) {
+      window.hookWindowMessage(message, (wparam, lparam) => log('native-window-message', phase, JSON.stringify({
+        windowId, wparam: wparam.readUInt32LE(0), lparam: lparam.readUInt32LE(0), ...readGeometry(window),
+      })))
     }
   }
 
@@ -1193,8 +1195,11 @@ function handle(method, params) {
       if (window) window.setTitle(params.title)
       return null
     }
-    case 'window.geometry':
-      return readGeometry(findWindow(params.windowId))
+    case 'window.geometry': {
+      const geometry = readGeometry(findWindow(params.windowId))
+      if (process.env.TAURI_RUNTIME_ELECTRON_LOG) log('window.geometry', JSON.stringify({ windowId: params.windowId, ...geometry }))
+      return geometry
+    }
     case 'window.size':
       setWindowSize(findWindow(params.windowId), params)
       return null
@@ -1240,11 +1245,14 @@ function handle(method, params) {
       return null
     }
     case 'window.maximize':
-      findWindow(params.windowId).maximize()
+    case 'window.unmaximize': {
+      const window = findWindow(params.windowId)
+      if (process.env.TAURI_RUNTIME_ELECTRON_LOG) log(method, 'before', JSON.stringify({ windowId: params.windowId, ...readGeometry(window) }))
+      if (method === 'window.maximize') window.maximize()
+      else window.unmaximize()
+      if (process.env.TAURI_RUNTIME_ELECTRON_LOG) log(method, 'after', JSON.stringify({ windowId: params.windowId, ...readGeometry(window) }))
       return null
-    case 'window.unmaximize':
-      findWindow(params.windowId).unmaximize()
-      return null
+    }
     case 'window.minimize':
       findWindow(params.windowId).minimize()
       return null
