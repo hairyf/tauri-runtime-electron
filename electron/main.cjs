@@ -32,6 +32,39 @@ function log(...args) {
   fs.appendFileSync(logFile, `${new Date().toISOString()} ${args.join(' ')}\n`)
 }
 
+const openingDevtools = new WeakMap()
+
+function openDevtools(contents) {
+  const pending = openingDevtools.get(contents)
+  if (pending) return pending
+  // Visibility can become true before the frontend finishes loading. Electron
+  // exposes devToolsWebContents only after its devtools-opened lifecycle step.
+  if (contents.devToolsWebContents) return null
+  let finish
+  const opening = new Promise((resolve, reject) => {
+    finish = (error) => {
+      clearTimeout(timer)
+      contents.removeListener('devtools-opened', opened)
+      contents.removeListener('devtools-closed', closed)
+      contents.removeListener('destroyed', destroyed)
+      openingDevtools.delete(contents)
+      if (error) reject(error)
+      else resolve(null)
+    }
+    const opened = () => finish()
+    const closed = () => finish(new Error('DevTools closed before opening completed'))
+    const destroyed = () => finish(new Error('webview destroyed while opening DevTools'))
+    const timer = setTimeout(() => finish(new Error('DevTools opening timed out')), 10_000)
+    contents.once('devtools-opened', opened)
+    contents.once('devtools-closed', closed)
+    contents.once('destroyed', destroyed)
+  })
+  openingDevtools.set(contents, opening)
+  try { contents.openDevTools({ mode: 'detach' }) }
+  catch (error) { finish(error) }
+  return opening
+}
+
 /** F12 / Ctrl+Shift+I toggle the DevTools of the focused renderer. */
 function installDevtoolsShortcut(contents) {
   contents.on('before-input-event', (event, input) => {
@@ -40,9 +73,9 @@ function installDevtoolsShortcut(contents) {
     const inspect = input.control && input.shift && input.key.toLowerCase() === 'i'
     if (!f12 && !inspect) return
     event.preventDefault()
-    if (contents.isDevToolsOpened()) contents.closeDevTools()
-    else contents.openDevTools({ mode: 'detach' })
-    setTimeout(() => log('devtools', contents.id, contents.isDevToolsOpened()), 300)
+    if (contents.isDevToolsOpened() && !openingDevtools.has(contents)) contents.closeDevTools()
+    else Promise.resolve(openDevtools(contents)).catch((error) => log('devtools open failed', serializeError(error)))
+    setTimeout(() => { if (!contents.isDestroyed()) log('devtools', contents.id, contents.isDevToolsOpened()) }, 300)
   })
 }
 
@@ -997,8 +1030,7 @@ function handle(method, params) {
     case 'webview.canGoForward':
       return contentsFor(params.webviewId).navigationHistory.canGoForward()
     case 'webview.openDevtools':
-      contentsFor(params.webviewId).openDevTools({ mode: 'detach' })
-      return null
+      return openDevtools(contentsFor(params.webviewId))
     case 'webview.closeDevtools':
       contentsFor(params.webviewId).closeDevTools()
       return null

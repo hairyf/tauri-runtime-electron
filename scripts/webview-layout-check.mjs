@@ -25,8 +25,8 @@ class Contents extends EventEmitter {
   reload() { this.reloaded = true }
   focus() { this.focused = true }
   setZoomFactor(value) { this.zoom = value }
-  openDevTools() { this.devtools = true }
-  closeDevTools() { this.devtools = false }
+  openDevTools() { this.devtools = true; this.devToolsWebContents = {}; this.emit('devtools-opened') }
+  closeDevTools() { this.devtools = false; this.devToolsWebContents = null; this.emit('devtools-closed') }
   isDevToolsOpened() { return this.devtools ?? false }
   close() { this.destroyed = true }
   constructor() { super(); allContents.push(this) }
@@ -200,8 +200,34 @@ for (const cursor of ['pointer', 'none', 'default']) {
 }
 await call('webview.reload', { webviewId: 10 })
 await call('webview.setZoom', { webviewId: 10, scaleFactor: 1.25 })
-await call('webview.openDevtools', { webviewId: 10 })
+// A repeated native open can report visible before the frontend has loaded.
+// The RPC must await the real lifecycle event and reuse the pending operation.
+const nativeOpen = first.webContents.openDevTools
+let openCalls = 0
+first.webContents.openDevTools = () => { openCalls++; first.webContents.devtools = true }
+let opened = false
+const opening = call('webview.openDevtools', { webviewId: 10 })
+opening.then(() => { opened = true })
+assert.equal(call('webview.openDevtools', { webviewId: 10 }), opening)
 assert.equal(await call('webview.isDevtoolsOpen', { webviewId: 10 }), true)
+assert.equal(opened, false, 'visibility is not frontend readiness')
+assert.equal(openCalls, 1)
+first.webContents.devToolsWebContents = {}
+first.webContents.emit('devtools-opened')
+await opening
+assert.equal(opened, true)
+await call('webview.openDevtools', { webviewId: 10 })
+assert.equal(openCalls, 1, 'an already loaded frontend must not be opened again')
+for (const event of ['devtools-opened', 'devtools-closed', 'destroyed']) {
+  assert.equal(first.webContents.listenerCount(event), 0)
+}
+first.webContents.openDevTools = nativeOpen
+const destroyedOpening = new Contents()
+destroyedOpening.openDevTools = () => {}
+const interrupted = context.openDevtools(destroyedOpening)
+destroyedOpening.emit('destroyed')
+await assert.rejects(interrupted, /webview destroyed while opening DevTools/)
+assert.equal(inspect('openingDevtools').has(destroyedOpening), false)
 // Native lifecycle methods can reenter Node; invoke them in the socket callback,
 // before its microtask checkpoint. Async results and both error paths still reply.
 const replies = []
