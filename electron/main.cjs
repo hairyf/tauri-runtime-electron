@@ -1310,8 +1310,8 @@ async function onLine(line) {
   }
 
   try {
-    // Native lifecycle calls may reenter Node; start them in the socket callback,
-    // rather than in a Promise microtask. Await only their result.
+    // Start native lifecycle calls in the scheduled task, not a Promise microtask.
+    // Await only their result.
     trace('rpc.enter', message.id, message.method)
     const result = await handle(message.method, message.params ?? {})
     trace('rpc.return', message.id, message.method)
@@ -1396,10 +1396,10 @@ app.whenReady().then(async () => {
     let index = buffer.indexOf('\n')
     while (index !== -1) {
       const line = buffer.slice(0, index)
-      // Native handlers can pump the event loop: consume before dispatch so a
-      // nested socket callback never sees and executes this same request again.
+      // Drain input before entering native lifecycle code. Unlike a Promise
+      // microtask, Electron's setImmediate also wakes its embedded Node loop.
       buffer = buffer.slice(index + 1)
-      onLine(line)
+      setImmediate(() => onLine(line))
       index = buffer.indexOf('\n')
     }
   })

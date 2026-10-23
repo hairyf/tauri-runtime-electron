@@ -106,7 +106,7 @@ const context = vm.createContext({
     : name === 'node:fs' ? { appendFileSync() {} }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
-  Buffer, URL, console, setTimeout, clearTimeout, __dirname: new URL('../electron', import.meta.url).pathname,
+  Buffer, URL, console, setTimeout, clearTimeout, setImmediate, __dirname: new URL('../electron', import.meta.url).pathname,
 })
 vm.runInContext(readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8'), context)
 const inspect = (expression) => vm.runInContext(expression, context)
@@ -235,14 +235,14 @@ const interrupted = context.openDevtools(destroyedOpening)
 destroyedOpening.emit('destroyed')
 await assert.rejects(interrupted, /webview destroyed while opening DevTools/)
 assert.equal(inspect('openingDevtools').has(destroyedOpening), false)
-// Native lifecycle methods can reenter Node; invoke them in the socket callback,
-// before its microtask checkpoint. Async results and both error paths still reply.
+// Native lifecycle methods must start synchronously within their scheduled task,
+// not in a Promise microtask. Async results and both error paths still reply.
 const replies = []
 const originalSend = context.send
 context.send = (message) => replies.push(plain(message))
 try {
   const close = context.onLine(JSON.stringify({ id: 1, method: 'webview.closeDevtools', params: { webviewId: 10 } }))
-  assert.equal(first.webContents.devtools, false, 'close must run before the socket callback returns')
+  assert.equal(first.webContents.devtools, false, 'close must start before the task reaches its microtask checkpoint')
   await close
   assert.deepEqual(replies.pop(), { id: 1, result: null })
   await context.onLine(JSON.stringify({ id: 2, method: 'webview.isDevtoolsOpen', params: { webviewId: 10 } }))
@@ -260,21 +260,30 @@ try {
   await context.onLine('invalid JSON')
   await context.onLine(JSON.stringify({ method: 'webview.closeDevtools' }))
   assert.equal(replies.length, 0, 'invalid requests produce no uncorrelated replies')
-  // A native close can pump the event loop and deliver more socket data before
-  // returning. Each line must be consumed before dispatch, exactly once.
+  // Drain batched/partial input outside native lifecycle code. A native close
+  // can deliver more input reentrantly; each request still runs exactly once.
   ready()
   await Promise.resolve()
   const nativeClose = first.webContents.closeDevTools
   let closeCalls = 0
+  let reading = false
   first.webContents.closeDevTools = () => {
+    assert.equal(reading, false, 'native lifecycle must run outside the socket read callback')
     closeCalls++
-    if (closeCalls === 1) transport.emit('data', `${JSON.stringify({ id: 7, method: 'webview.isDevtoolsOpen', params: { webviewId: 10 } })}\n`)
+    transport.emit('data', `${JSON.stringify({ id: 8, method: 'webview.isDevtoolsOpen', params: { webviewId: 10 } })}\n`)
   }
   try {
-    transport.emit('data', `${JSON.stringify({ id: 6, method: 'webview.closeDevtools', params: { webviewId: 10 } })}\n`)
-    await Promise.resolve()
+    const request = (id, method) => JSON.stringify({ id, method, params: { webviewId: 10 } })
+    reading = true
+    transport.emit('data', `${request(6, 'webview.closeDevtools')}\n${request(7, 'webview.isDevtoolsOpen')}`)
+    transport.emit('data', '\n')
+    reading = false
+    assert.equal(closeCalls, 0, 'socket reads only frame requests, never invoke native code')
+    assert.equal(replies.length, 0)
+    await new Promise(setImmediate)
+    await new Promise(setImmediate)
     assert.equal(closeCalls, 1, 'reentrant native calls must not redispatch the current line')
-    assert.deepEqual(replies.map((reply) => reply.id).sort(), [6, 7], 'each request receives exactly one reply')
+    assert.deepEqual(replies.map((reply) => reply.id).sort(), [6, 7, 8], 'batched, partial and reentrant requests each receive one reply')
   } finally { first.webContents.closeDevTools = nativeClose }
 } finally { context.send = originalSend }
 assert.equal(first.webContents.reloaded, true)
