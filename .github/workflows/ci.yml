@@ -22,8 +22,12 @@ env:
 
 jobs:
   node-regressions:
-    name: Node regressions
-    runs-on: ubuntu-latest
+    name: Node regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -43,6 +47,15 @@ jobs:
 
       - name: Check native child layout and dispatch
         run: node scripts/webview-layout-check.mjs
+
+      - name: Check download lifecycle
+        run: node scripts/download-check.mjs
+
+      - name: Check generic webview policy and initialization
+        run: node scripts/webview-policy-check.mjs
+
+      - name: Check library window API and effects queue
+        run: node scripts/window-api-check.mjs
 
   build:
     name: ${{ matrix.os }}
@@ -86,7 +99,7 @@ jobs:
       # The build script downloads this platform's Electron release, so the
       # steps below also prove that acquisition works on every target.
       - name: Check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets --all-features
 
       # The smoke test opens a real Electron window and checks its named desktop
       # subset, reporting platform skips. Official-example GUI checks are separate.
@@ -126,6 +139,10 @@ jobs:
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
           sh -c 'openbox & sleep 1; node scripts/example-check.mjs helloworld state resources commands isolation streaming'
 
+      - name: Check transparent window example
+        if: runner.os == 'Windows'
+        run: node scripts/example-check.mjs transparent
+
       - name: Upload example evidence
         if: always()
         uses: actions/upload-artifact@v6
@@ -134,7 +151,7 @@ jobs:
           path: target/example-checks/
           if-no-files-found: warn
 
-  # The docs are generated from the pinned `source/tauri` submodule, so this job
+  # The docs are generated from the checked-out `source/tauri` tree, so this job
   # fails whenever the implementation and docs/coverage.md disagree. That is what
   # keeps stubs and panics visible in the PR diff instead of only in the source.
   coverage:

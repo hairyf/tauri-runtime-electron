@@ -353,10 +353,34 @@ mod tests {
     let config = WindowConfig {
       width: 640.0,
       height: 480.0,
+      title_bar_style: tauri_utils::TitleBarStyle::Overlay,
+      traffic_light_position: Some(tauri_utils::config::LogicalPosition { x: 12.0, y: 18.0 }),
+      hidden_title: true,
+      tabbing_identifier: Some("documents".into()),
       ..Default::default()
     };
     let builder = <ElectronWindowBuilder as WindowBuilder>::with_config(&config);
     assert_eq!(builder.config.width, 640.0);
     assert_eq!(builder.config.height, 480.0);
+    assert!(matches!(builder.config.title_bar_style, tauri_utils::TitleBarStyle::Overlay));
+    let position = builder.config.traffic_light_position.unwrap();
+    assert_eq!((position.x, position.y), (12.0, 18.0));
+    assert!(builder.config.hidden_title);
+    assert_eq!(builder.config.tabbing_identifier.as_deref(), Some("documents"));
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn macos_title_setters_land_in_the_config() {
+    let builder = <ElectronWindowBuilder as WindowBuilder>::new()
+      .title_bar_style(TitleBarStyle::Overlay)
+      .traffic_light_position(tauri_runtime::dpi::LogicalPosition::new(12.0, 18.0))
+      .hidden_title(true)
+      .tabbing_identifier("documents");
+    assert!(matches!(builder.config.title_bar_style, TitleBarStyle::Overlay));
+    let position = builder.config.traffic_light_position.unwrap();
+    assert_eq!((position.x, position.y), (12.0, 18.0));
+    assert!(builder.config.hidden_title);
+    assert_eq!(builder.config.tabbing_identifier.as_deref(), Some("documents"));
   }
 }

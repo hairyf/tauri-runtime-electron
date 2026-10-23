@@ -79,15 +79,12 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     id
   }
 
-  /// Electron guests have no native handle to hand out: they are `<webview>`
-  /// elements composited by the renderer, so callers get `()` boxed.
-  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
-    crate::runtime::unsupported(
-      "WebviewDispatch::with_webview",
-      "Electron guests have no native handle to hand out",
-    );
-    f(Box::new(()));
-    Ok(())
+  /// Electron owns its WebContents in another process. There is no local native
+  /// webview object compatible with Tauri's platform-specific downcasts.
+  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, _f: F) -> Result<()> {
+    Err(create_webview_err(
+      "WebviewDispatch::with_webview is unavailable: Electron owns the webview in another process".into(),
+    ))
   }
 
   #[cfg(target_os = "ios")]

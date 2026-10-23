@@ -31,6 +31,8 @@ const extraDependencies = {
   commands: { serde: '{ version = "1", features = ["derive"] }' },
   streaming: { http: '"1"', 'http-range': '"0.1"', getrandom: '"0.3"', 'percent-encoding': '"2"' },
 }
+// Preserve the pinned Tauri defaults while selecting Electron instead of Wry.
+const tauriFeatures = ['compression', 'common-controls-v6', 'dynamic-acl', 'x11', 'dbus']
 
 function examples() {
   return [...new Set([path.join(root, 'example'), path.join(tauri, 'examples')].flatMap((directory) =>
@@ -125,7 +127,7 @@ async function run(command, argv, options = {}) {
 
 /** Patches are loud: a missing anchor fails instead of silently changing nothing. */
 function patch(file, from, to) {
-  localPath(workspace, file)
+  localPath(app, file)
   const text = readFileSync(file, 'utf8')
   const crlf = text.includes('\r\n')
   const normalized = text.replaceAll('\r\n', '\n')
@@ -179,7 +181,7 @@ function generateProject(config) {
   const dependencies = Object.entries(extraDependencies[name] ?? {})
     .map(([crate, version]) => `${crate} = ${version}`).join('\n')
   const isolation = config.app?.security?.pattern?.use === 'isolation'
-  const features = ['custom-protocol', ...(isolation ? ['isolation'] : []), ...(name === 'multiwebview' ? ['unstable'] : [])]
+  const features = [...tauriFeatures, 'custom-protocol', ...(isolation ? ['isolation'] : []), ...(name === 'multiwebview' ? ['unstable'] : [])]
   const utils = readdirSync(source).some((file) =>
     file.endsWith('.rs') && readFileSync(path.join(source, file), 'utf8').includes('tauri_utils'),
   ) ? 'tauri-utils = { path = "../../crates/tauri-utils" }\n' : ''
@@ -198,15 +200,22 @@ path = "main.rs"
 tauri-build = { path = "../../crates/tauri-build", features = ${JSON.stringify(isolation ? ['isolation'] : [])} }
 
 [dependencies]
-tauri = { path = "../../crates/tauri", features = ${JSON.stringify(features)} }
+tauri = { path = "../../crates/tauri", default-features = false, features = ${JSON.stringify(features)} }
 ${utils}${dependencies}
-tauri-runtime-electron = { path = ${JSON.stringify(root.replaceAll('\\', '/'))} }
+tauri-runtime-electron = { path = ${JSON.stringify(root.replaceAll('\\', '/'))}${name === 'transparent' ? ', features = ["tauri"]' : ''} }
 
 [patch.crates-io]
+tauri = { path = "../../crates/tauri" }
 tauri-runtime = { path = "../../crates/tauri-runtime" }
 tauri-utils = { path = "../../crates/tauri-utils" }
 `)
-  writeFileSync(path.join(app, 'build.rs'), 'fn main() {\n  tauri_build::build()\n}\n')
+  writeFileSync(path.join(app, 'build.rs'), name === 'transparent' ? `fn main() {
+  tauri_build::try_build(tauri_build::Attributes::new().plugin(
+    "electron-window",
+    tauri_build::InlinedPlugin::new().commands(&["set_effects"]),
+  )).expect("failed to build transparent example");
+}
+` : 'fn main() {\n  tauri_build::build()\n}\n')
 }
 
 let status = 1
@@ -242,41 +251,36 @@ try {
     })
   }
 
-  // Keep every non-Wry default (ACL, menus, compression, etc.), not default-features=false.
-  patch(path.join(workspace, 'crates', 'tauri', 'Cargo.toml'), 'default = [\n  "wry",', 'default = [')
-  // Tauri applies effects directly to native handles, bypassing the runtime trait.
-  // Electron must synchronize its compositor too; adapt only the disposable copy.
-  patch(path.join(workspace, 'crates', 'tauri', 'Cargo.toml'), '[dependencies]',
-    `[dependencies]\ntauri-runtime-electron = { path = ${JSON.stringify(root.replaceAll('\\', '/'))} }`)
-  patch(path.join(workspace, 'crates', 'tauri', 'src', 'vibrancy', 'mod.rs'),
-    '  if let Some(_effects) = effects {', `  #[cfg(windows)]
-  if let Some(dispatcher) = (&window.window.dispatcher as &dyn std::any::Any)
-    .downcast_ref::<tauri_runtime_electron::ElectronWindowDispatcher>()
-  {
-    return dispatcher.set_window_effects(effects).map_err(Into::into);
+  if (name === 'transparent') {
+    cpSync(path.join(root, 'api', 'window.js'), path.join(app, 'window-api.js'))
   }
-  if let Some(_effects) = effects {`)
-  patch(path.join(workspace, 'crates', 'tauri', 'src', 'window', 'mod.rs'),
-    `    self.run_on_main_thread(move || {
-      let _ = crate::vibrancy::set_window_effects(&window, effects);
-    })`, `    let (tx, rx) = std::sync::mpsc::channel();
-    self.run_on_main_thread(move || {
-      let _ = tx.send(crate::vibrancy::set_window_effects(&window, effects));
-    })?;
-    rx.recv().map_err(|_| crate::Error::FailedToReceiveMessage)?`)
 
   const originalConfig = path.join(source, ...(full ? ['src-tauri'] : []), 'tauri.conf.json')
   const config = JSON.parse(readFileSync(originalConfig, 'utf8'))
   if (full) {
-    // The runtime and app must use the exact same Runtime trait and utility types.
-    patch(path.join(workspace, 'Cargo.toml'),
-      'tauri-plugin = { path = "./crates/tauri-plugin" }',
-      `tauri-plugin = { path = "./crates/tauri-plugin" }
-tauri-runtime = { path = "./crates/tauri-runtime" }
-tauri-utils = { path = "./crates/tauri-utils" }`)
+    // Isolate the app workspace so type unification never edits the framework.
+    const text = readFileSync(manifest, 'utf8').replaceAll('\r\n', '\n')
+    const dependency = text.includes('[dependencies.tauri]\n')
+      ? '[dependencies.tauri]\nworkspace = true\ndefault-features = true\nfeatures = ['
+      : text.match(/^tauri = \{ workspace = true, default-features = true(?:, features = \[)?/m)?.[0]
+    assert.ok(dependency, `${name}: missing Tauri workspace dependency`)
+    patch(manifest, dependency, dependency.replace('default-features = true', 'default-features = false')
+      + (dependency.endsWith('[') ? `\n  ${tauriFeatures.map((feature) => JSON.stringify(feature)).join(', ')},` : `, features = ${JSON.stringify(tauriFeatures)}`))
+    const workspaceManifest = readFileSync(path.join(workspace, 'Cargo.toml'), 'utf8')
+    const inherited = workspaceManifest.replaceAll('\r\n', '\n').match(/^\[workspace\.dependencies\]\n([\s\S]*?)(?=^\[)/m)?.[1]
+    assert.ok(inherited, 'missing upstream workspace dependencies')
     writeFileSync(manifest, `${readFileSync(manifest, 'utf8')}
 [dependencies.tauri-runtime-electron]
 path = ${JSON.stringify(root.replaceAll('\\', '/'))}
+
+[workspace]
+
+[workspace.dependencies]
+${inherited.replaceAll('path = "./crates/', 'path = "../../../crates/')}
+[patch.crates-io]
+tauri = { path = "../../../crates/tauri" }
+tauri-runtime = { path = "../../../crates/tauri-runtime" }
+tauri-utils = { path = "../../../crates/tauri-utils" }
 `)
   } else {
     generateProject(config)
@@ -326,6 +330,20 @@ path = ${JSON.stringify(root.replaceAll('\\', '/'))}
     const video = path.join(root, 'source/electron/spec/fixtures/cat-spin.mp4')
     if (!existsSync(video)) throw new Error('missing Electron video fixture; run git submodule update --init source/electron')
     cpSync(video, path.join(app, 'streaming_example_test_video.mp4'))
+  }
+  // Framework manifests and runtime/effect implementations stay byte-identical.
+  for (const file of [
+    'Cargo.toml',
+    'crates/tauri/Cargo.toml',
+    'crates/tauri/src/app.rs',
+    'crates/tauri/src/vibrancy/mod.rs',
+    'crates/tauri/src/window/mod.rs',
+    'crates/tauri-runtime/Cargo.toml',
+    'crates/tauri-runtime/src/lib.rs',
+    'crates/tauri-utils/Cargo.toml',
+  ]) {
+    assert.deepEqual(readFileSync(path.join(workspace, file)), readFileSync(path.join(tauri, file)),
+      `framework file must be copied unchanged: ${file}`)
   }
   // Runnable preparation checks: security configuration and real upstream assets stay intact.
   assert.equal(readFileSync(path.join(app, 'tauri.conf.json'), 'utf8'), readFileSync(originalConfig, 'utf8'))

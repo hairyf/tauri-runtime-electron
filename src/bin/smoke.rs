@@ -12,6 +12,7 @@
 
 use std::{
   fmt::Debug,
+  path::Path,
   process::ExitCode,
   sync::{
     Mutex,
@@ -64,7 +65,7 @@ fn main() -> ExitCode {
   let handle: Handle = <ElectronRuntime as Runtime<()>>::handle(&runtime);
   let (exit_tx, exit_rx) = channel::<()>();
   let loop_thread = thread::spawn(move || {
-    <ElectronRuntime as Runtime<()>>::run(runtime, move |event| {
+    <ElectronRuntime as Runtime<()>>::run_return(runtime, move |event| {
       if let RunEvent::WindowEvent { event, .. } = &event {
         let name = match event {
           WindowEvent::Destroyed => "destroyed",
@@ -90,6 +91,13 @@ fn main() -> ExitCode {
   });
 
   let mut failures = Vec::new();
+  let session_root = std::env::temp_dir().join(format!(
+    "tauri-runtime-electron-smoke-{}-{}",
+    std::process::id(),
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+  ));
+  let session_a = session_root.join("a");
+  let session_b = session_root.join("b");
   let config = WindowConfig {
     title: "smoke".into(),
     width: 400.0,
@@ -117,7 +125,10 @@ fn main() -> ExitCode {
     }
   };
   match PendingWebview::<(), ElectronRuntime>::new(
-    WebviewAttributes::new(WebviewUrl::App("index.html".into())),
+    WebviewAttributes::new(WebviewUrl::App("index.html".into()))
+      .data_directory(session_a.clone())
+      .initialization_script("window.__smokeMain = 'main'")
+      .initialization_script_on_all_frames("window.__smokeAll = 'all'"),
     "smoke-page",
   ) {
     Ok(mut webview) => {
@@ -125,22 +136,40 @@ fn main() -> ExitCode {
       // a document that really exists.
       webview.url = PAGE.to_string();
       webview.register_uri_scheme_protocol("tauri", |_, request, respond| {
-        let title = if request.uri().path() == "/second.html" {
-          "smoke-second"
-        } else {
-          "smoke-page"
+        let title = match request.uri().path() {
+          "/second.html" => "smoke-second",
+          "/blocked.html" => "smoke-blocked",
+          "/sibling.html" => "smoke-sibling",
+          _ => "smoke-page",
         };
-        respond(
-          http::Response::builder()
-            .header(http::header::CONTENT_TYPE, "text/html")
-            .body(std::borrow::Cow::Owned(format!("<title>{title}</title><p>smoke</p>").into_bytes()))
-            .unwrap(),
-        );
+        let frame = if request.uri().path() == "/index.html" {
+          "<iframe id='smoke-frame' src='/frame.html'></iframe>"
+        } else {
+          ""
+        };
+        let response = http::Response::builder()
+          .header(http::header::CONTENT_TYPE, "text/html")
+          .body(std::borrow::Cow::Owned(format!("<title>{title}</title><p>smoke</p>{frame}").into_bytes()))
+          .unwrap();
+        if request.uri().path() == "/sibling.html" {
+          // Keep an unrelated frame loading while the other frame is vetoed:
+          // stopping the whole WebContents must fail this allowed navigation.
+          thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            respond(response);
+          });
+        } else {
+          respond(response);
+        }
       });
       // The page posts through `window.ipc.postMessage`, which is the bridge
       // Tauri's own IPC script uses; the handler is the other end of it.
       webview.ipc_handler = Some(Box::new(|_webview, request| {
         IPC.lock().unwrap().push(request.body().clone());
+      }));
+      webview.navigation_handler = Some(Box::new(|url| {
+        NAVIGATIONS.lock().unwrap().push(url.to_string());
+        url.path() != "/blocked.html"
       }));
       webview.on_page_load_handler = Some(Box::new(|_url, event| {
         LOADS.lock().unwrap().push(format!("{event:?}"));
@@ -155,9 +184,9 @@ fn main() -> ExitCode {
     }
   }
   // A fn pointer is higher-ranked over the handle lifetime, so it satisfies `Fn(RawWindow)`.
-  #[cfg(any(windows, target_os = "macos"))]
+  #[cfg(windows)]
   let after: Option<fn(RawWindow<'_>)> = Some(record_window_creation);
-  #[cfg(not(any(windows, target_os = "macos")))]
+  #[cfg(not(windows))]
   let after: Option<fn(RawWindow<'_>)> = None;
   let detached = match <ElectronRuntimeHandle as RuntimeHandle<()>>::create_window(
     &handle, pending, after,
@@ -175,7 +204,7 @@ fn main() -> ExitCode {
   } = detached;
   let webview = webview.map(|detached| detached.webview.dispatcher);
 
-  #[cfg(any(windows, target_os = "macos"))]
+  #[cfg(windows)]
   expect(&mut failures, "creation callback once", 1, || {
     Ok(CREATIONS.load(Ordering::SeqCst))
   });
@@ -195,7 +224,11 @@ fn main() -> ExitCode {
     }
   }
 
+  native_access_checks(&window, &mut failures);
   window_checks(&window, &handle, &mut failures);
+  if let Some(webview) = webview.as_ref() {
+    session_checks(&window, webview, &session_a, &session_b, &mut failures);
+  }
   webview_checks(webview.as_ref(), &mut failures);
   if let Some(webview) = webview.as_ref() {
     cursor_style_checks(&window, webview, &mut failures);
@@ -229,6 +262,72 @@ fn main() -> ExitCode {
       eprintln!("  - {failure}");
     }
     ExitCode::FAILURE
+  }
+}
+
+fn native_access_checks(_window: &Window, _failures: &mut Vec<String>) {
+  #[cfg(target_os = "macos")]
+  expect(_failures, "AppKit handle unavailable", true, || {
+    Ok(matches!(
+      WindowDispatch::<()>::window_handle(_window),
+      Err(raw_window_handle::HandleError::Unavailable)
+    ))
+  });
+  #[cfg(any(
+    target_os = "linux", target_os = "dragonfly", target_os = "freebsd",
+    target_os = "netbsd", target_os = "openbsd"
+  ))]
+  {
+    expect(_failures, "GTK window unavailable", true, || {
+      Ok(WindowDispatch::<()>::gtk_window(_window).is_err())
+    });
+    expect(_failures, "GTK widget tree unavailable", true, || {
+      Ok(WindowDispatch::<()>::default_vbox(_window).is_err())
+    });
+  }
+}
+
+fn session_checks(
+  window: &Window,
+  webview: &Webview,
+  session_a: &Path,
+  session_b: &Path,
+  failures: &mut Vec<String>,
+) {
+  expect_eval(failures, "session seed", "a", webview,
+    "localStorage.setItem('smoke-session', 'a'); localStorage.getItem('smoke-session')");
+  for (label, directory, want) in [
+    ("same-session", session_a, "a"),
+    ("other-session", session_b, "empty"),
+  ] {
+    let mut pending = PendingWebview::<(), ElectronRuntime>::new(
+      WebviewAttributes::new(WebviewUrl::App("index.html".into()))
+        .data_directory(directory.to_path_buf()),
+      label,
+    ).unwrap();
+    pending.url = PAGE.to_string();
+    pending.navigation_handler = Some(Box::new(move |url| {
+      NAVIGATIONS.lock().unwrap().push(format!("{label}:{}", url));
+      true
+    }));
+    match WindowDispatch::<()>::create_webview(&mut window.clone(), pending) {
+      Ok(extra) => {
+        expect_eval(failures, label, want, &extra.dispatcher,
+          "localStorage.getItem('smoke-session') ?? 'empty'");
+        set(failures, "navigate session webview", || {
+          WebviewDispatch::<()>::navigate(&extra.dispatcher, SECOND_PAGE.parse().unwrap())
+        });
+        expect_eval(failures, "session webview navigated", "smoke-second", &extra.dispatcher,
+          "document.title");
+        expect_named(failures, "session navigation callback", &format!("{label}:{SECOND_PAGE}"), || {
+          NAVIGATIONS.lock().unwrap().clone()
+        });
+        set(failures, "close session webview", || {
+          WebviewDispatch::<()>::close(&extra.dispatcher)
+        });
+      }
+      Err(error) => failures.push(format!("{label}: {error}")),
+    }
   }
 }
 
@@ -281,8 +380,11 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::inner_size(window),
   );
 
+  // Stay above the 250x180 DIP minimum on high-DPI screens while exercising
+  // the physical-size conversion rather than asking the OS to clamp our target.
+  let resized = PhysicalSize::new((420.0 * scale).round() as u32, (320.0 * scale).round() as u32);
   set(failures, "set_size", || {
-    WindowDispatch::<()>::set_size(window, Size::Physical(PhysicalSize::new(420, 320)))
+    WindowDispatch::<()>::set_size(window, Size::Physical(resized))
   });
 
   set(failures, "set_position", || {
@@ -303,7 +405,7 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
 
   // `set_size` sets the content size, so the content is what has to arrive;
   // the frame around it makes `outer_size` larger by an OS-specific amount.
-  expect_size(failures, "inner_size", PhysicalSize::new(420, 320), 8, || {
+  expect_size(failures, "inner_size", resized, 8, || {
     WindowDispatch::<()>::inner_size(window)
   });
   match (
@@ -504,9 +606,23 @@ fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
     failures.push("cursor_position: cannot read the starting position".into());
     return;
   };
-  // Move relative to where the pointer is: this proves the setter and the
-  // getter agree without depending on how each side labels screen coordinates.
-  let target = PhysicalPosition::new(start.x + 60.0, start.y + 40.0);
+  let monitor = match WindowDispatch::<()>::current_monitor(window) {
+    Ok(Some(monitor)) => monitor,
+    other => {
+      failures.push(format!("cursor_position: cannot locate the window's monitor: {other:?}"));
+      return;
+    }
+  };
+  // A relative move can leave the monitor or land in a multi-display gap, where
+  // the OS clamps it. Pick an interior point on the window's actual monitor.
+  let area = monitor.work_area;
+  let mut target = PhysicalPosition::new(
+    f64::from(area.position.x) + f64::from(area.size.width) / 2.0,
+    f64::from(area.position.y) + f64::from(area.size.height) / 2.0,
+  );
+  if (target.x - start.x).abs() <= 2.0 && (target.y - start.y).abs() <= 2.0 {
+    target.x = f64::from(area.position.x) + f64::from(area.size.width) / 4.0;
+  }
   let request = Position::Physical(PhysicalPosition::new(
     target.x.round() as i32,
     target.y.round() as i32,
@@ -579,6 +695,29 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     return;
   };
 
+  let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let invoked = called.clone();
+  let result = WebviewDispatch::<()>::with_webview(webview, move |_| {
+    invoked.store(true, Ordering::SeqCst);
+  });
+  expect(failures, "native webview unavailable without callback", true, || {
+    Ok(result.is_err() && !called.load(Ordering::SeqCst))
+  });
+  expect_eval(failures, "main-frame initialization", "main/all", webview,
+    "window.__smokeMain + '/' + window.__smokeAll");
+  expect_eval(failures, "subframe initialization scope", "undefined/all/undefined", webview,
+    "(() => { const frame = document.querySelector('#smoke-frame')?.contentWindow; return typeof frame?.__smokeMain + '/' + frame?.__smokeAll + '/' + typeof frame?.ipc })()");
+  expect_eval(failures, "page has no Node globals", "undefined/undefined/undefined", webview,
+    "typeof window.require + '/' + typeof window.process + '/' + typeof window.Buffer");
+  expect_eval(failures, "subframe has no Node globals", "undefined/undefined/undefined", webview,
+    "(() => { const frame = document.querySelector('#smoke-frame')?.contentWindow; return typeof frame?.require + '/' + typeof frame?.process + '/' + typeof frame?.Buffer })()");
+  expect_named(failures, "initial navigation callback", PAGE, || {
+    NAVIGATIONS.lock().unwrap().clone()
+  });
+  expect_named(failures, "subframe navigation callback", "tauri://localhost/frame.html", || {
+    NAVIGATIONS.lock().unwrap().clone()
+  });
+
   expect_eval(failures, "eval_script", "2", webview, "1 + 1");
   expect_eval(
     failures,
@@ -591,6 +730,31 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   expect(failures, "url", PAGE.to_string(), || {
     WebviewDispatch::<()>::url(webview)
   });
+  let _ = eval_once(webview,
+    "(() => { const sibling = document.createElement('iframe'); sibling.id = 'smoke-sibling'; sibling.src = 'tauri://localhost/sibling.html'; document.body.append(sibling); return 'requested' })()");
+  expect_named(failures, "sibling navigation callback", "tauri://localhost/sibling.html", || {
+    NAVIGATIONS.lock().unwrap().clone()
+  });
+  let _ = eval_once(webview,
+    "(() => { document.querySelector('#smoke-frame').contentWindow.location.href = 'tauri://localhost/blocked.html?frame=smoke'; return 'requested' })()");
+  expect_named(failures, "vetoed subframe navigation callback", "tauri://localhost/blocked.html?frame=smoke", || {
+    NAVIGATIONS.lock().unwrap().clone()
+  });
+  expect_eval(failures, "subframe veto preserves main document", "tauri://localhost/index.html/smoke-page", webview,
+    "location.href + '/' + document.title");
+  // Electron can replace a cancelled subframe with an inaccessible error page;
+  // request veto guarantees the target cannot load, not preservation of old DOM.
+  expect_eval(failures, "sibling loads despite subframe veto", "smoke-sibling", webview,
+    "document.querySelector('#smoke-sibling').contentDocument?.title");
+  expect_eval(failures, "subframe veto blocks target document", "true", webview,
+    "(() => { try { return document.querySelector('#smoke-frame').contentDocument?.title !== 'smoke-blocked' } catch { return true } })()");
+  let _ = eval_once(webview,
+    "(() => { const link = document.createElement('a'); link.href = 'tauri://localhost/blocked.html'; document.body.append(link); link.click(); return 'clicked' })()");
+  expect_named(failures, "vetoed navigation callback", "tauri://localhost/blocked.html", || {
+    NAVIGATIONS.lock().unwrap().clone()
+  });
+  expect_eval(failures, "veto keeps current document", "tauri://localhost/index.html/smoke-page", webview,
+    "location.href + '/' + document.title");
   set(failures, "navigate", || {
     WebviewDispatch::<()>::navigate(webview, SECOND_PAGE.parse().unwrap())
   });
@@ -599,6 +763,9 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   });
   // The mirrored url above could be a lie; this reads the document instead.
   expect_eval(failures, "navigated", "smoke-second", webview, "document.title");
+  expect_named(failures, "main navigation callback", SECOND_PAGE, || {
+    NAVIGATIONS.lock().unwrap().clone()
+  });
 
   expect_applied(
     failures,
@@ -858,7 +1025,7 @@ fn expect_named(
   }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 fn record_window_creation(_raw: RawWindow<'_>) {
   CREATIONS.fetch_add(1, Ordering::SeqCst);
   #[cfg(windows)]
@@ -867,7 +1034,7 @@ fn record_window_creation(_raw: RawWindow<'_>) {
   }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 static CREATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
 static CREATED_HWND: Mutex<Option<isize>> = Mutex::new(None);
@@ -877,6 +1044,9 @@ static REPORT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// What the page posted through the IPC bridge, as the runtime received it.
 static IPC: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Navigation policy calls observed through Rust, including child views/frames.
+static NAVIGATIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The page load events the runtime reported to the handler.
 static LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());

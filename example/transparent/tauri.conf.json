@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "identifier": "com.tauri.runtime-electron.transparent",
   "build": {
-    "frontendDist": ["index.html", "style.css", "main.js"]
+    "frontendDist": ["index.html", "style.css", "main.js", "window-api.js"]
   },
   "app": {
     "withGlobalTauri": true,
@@ -28,7 +28,7 @@
         {
           "identifier": "transparent-window",
           "windows": ["main"],
-          "permissions": ["core:window:allow-start-dragging", "core:window:allow-minimize", "core:window:allow-close", "core:window:allow-set-effects"]
+          "permissions": ["core:window:allow-start-dragging", "core:window:allow-minimize", "core:window:allow-close", "electron-window:allow-set-effects"]
         }
       ]
     }

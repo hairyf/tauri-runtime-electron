@@ -32,7 +32,7 @@ mod platform;
 mod runtime;
 mod switches;
 mod webview;
-mod window;
+pub mod window;
 mod window_builder;
 mod window_handle;
 

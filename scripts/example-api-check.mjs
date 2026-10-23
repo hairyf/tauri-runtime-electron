@@ -1,7 +1,6 @@
 // Exercises the official Svelte views. Missing OS/device evidence stays blocked;
 // a screenshot or a resolved setter alone never certifies a native capability.
 import nodeAssert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -87,65 +86,6 @@ export default async function apiChecks(test, { assert = nodeAssert, click, fill
   }
   const originalTitle = await windowRead('title')
   const icon = path.join(root, 'source/tauri/examples/.icons/tray_icon.png')
-  const flattenMenu = (items) => items.flatMap((item) => [item, ...flattenMenu(item.children)])
-  const nativeMenu = async (window, commandId) => {
-    if (process.platform !== 'win32' || !native) blocked('Windows native menu observation is unavailable')
-    const current = (await native(test, 'Rect', { WindowHandle: window.hwnd })).window
-    const hwnd = String(current.hwnd), owner = current.pid ?? current.processId
-    assert.match(hwnd, /^\d+$/)
-    assert.ok(Number.isInteger(owner) && owner > 0)
-    if (commandId !== undefined) assert.ok(Number.isInteger(commandId) && commandId > 0 && commandId < 0xFFFFFFFF)
-    // Only a scoped, validated HWND and an ID just read from its real menu enter
-    // this Win32 command path. WM_COMMAND certifies routing, not user selection.
-    const source = `$ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class ApiMenuProbe {
-  public class Item { public string text; public uint id; public bool enabled, check; public Item[] children; }
-  [DllImport("user32.dll")] static extern IntPtr GetMenu(IntPtr window);
-  [DllImport("user32.dll")] static extern IntPtr GetSubMenu(IntPtr menu, int position);
-  [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
-  [DllImport("user32.dll")] static extern uint GetMenuItemID(IntPtr menu, int position);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int size, uint flags);
-  [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
-  [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
-  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
-  [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
-  static Item[] Read(IntPtr menu) {
-    var result = new List<Item>();
-    for (int i = 0; i < GetMenuItemCount(menu); i++) {
-      var text = new StringBuilder(2048); GetMenuString(menu, (uint)i, text, text.Capacity, 0x400);
-      uint state = GetMenuState(menu, (uint)i, 0x400);
-      result.Add(new Item { text = text.ToString(), id = GetMenuItemID(menu, i), enabled = (state & 3) == 0, check = (state & 8) != 0, children = Read(GetSubMenu(menu, i)) });
-    }
-    return result.ToArray();
-  }
-  public static Item[] Probe(long handle, uint owner, uint command) {
-    IntPtr window = new IntPtr(handle); uint actual; GetWindowThreadProcessId(window, out actual);
-    if (!IsWindow(window) || actual != owner) throw new Exception("Native menu window owner changed");
-    if (command != 0) { UIntPtr result; if (SendMessageTimeoutW(window, 0x111, new UIntPtr(command), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero) throw new Exception("Native WM_COMMAND timed out or was refused"); }
-    return Read(GetMenu(window));
-  }
-}
-'@
-@{ items = @([ApiMenuProbe]::Probe([long]${hwnd}, [uint32]${owner}, [uint32]${commandId ?? 0})) } | ConvertTo-Json -Depth 20 -Compress`
-    return new Promise((resolve, reject) => {
-      const process = spawn('pwsh', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-      let stdout = '', stderr = ''
-      const timer = setTimeout(() => { process.kill(); reject(new Error('Native menu probe timed out')) }, 15_000)
-      process.stdout.on('data', (data) => { stdout += data })
-      process.stderr.on('data', (data) => { stderr += data })
-      process.on('error', (error) => { clearTimeout(timer); reject(error) })
-      process.on('close', (code) => {
-        clearTimeout(timer)
-        try { if (code !== 0) throw new Error(stderr.trim() || `native probe exited ${code}`); resolve(JSON.parse(stdout.trim().replace(/^\uFEFF/, ''))) }
-        catch (error) { reject(error) }
-      })
-    })
-  }
 
   await section('Welcome metadata and original isolation frame', async () => {
     await view('Welcome')
@@ -432,7 +372,7 @@ public static class ApiMenuProbe {
       throw Object.assign(error, { message: `Menu ${kind} native drag, ${stage}: ${error.message}`, evidence: { kind, stage } })
     }
   }
-  await section('Menu original native-pointer builder drag, real Win32 items and native command callback', async () => {
+  await section('Menu original native-pointer builder drag and original form mutations (native attachment/callback blocked)', async () => {
     await view('Menu')
     let stage = 'Normal original Sortable insertion by native pointer'
     try {
@@ -448,41 +388,27 @@ public static class ApiMenuProbe {
       assert.equal(await page.evaluate('document.querySelector("main .menu-item[data-id][data-kind=Check] input[title=checked]").checked'), true)
       assert.equal(await page.evaluate('document.querySelector("main .menu-item[data-id][data-kind=Normal]").dataset.text'), text)
       await test.shot(page, 'api-15-menu-builder')
-      stage = 'create menu and enumerate native items'
+      stage = 'original Create menu control'
       await button('Create menu')
-      if (process.platform !== 'win32' || !native || !nativeWindow) blocked('Menu builder ran; Win32 native item/query/callback verification is unavailable on this host')
-      const target = nativeWindow(await native(test, 'List'), await windowRead('title'))
-      const tree = await until(() => nativeMenu(target), (tree) => flattenMenu(tree.items).some((item) => item.text === text))
-      const actual = flattenMenu(tree.items)
-      const normal = actual.find((item) => item.text === text)
-      const check = actual.find((item) => item.text === 'A check menu')
-      assert.ok(normal && normal.enabled && Number.isInteger(normal.id) && normal.id > 0 && normal.id < 0xFFFFFFFF)
-      assert.ok(check && check.check, 'original checked control must update the real Win32 menu state')
-      if (test.nativeShot) await test.nativeShot(target, 'api-native-created-menu')
-      stage = 'native Normal command callback'
-      await clear()
-      await nativeMenu(target, normal.id)
-      assert.deepEqual(await until(messages, (values) => values.length > 0), [`Item ${text} clicked`])
-      await test.shot(page, 'api-menu-native-command-callback')
-      // Edit/remove the live original items, then verify the native menu changed.
       const renamed = `${text} edited`
       stage = 'live Normal text change'
       await fill(page, 'main .menu-item[data-id][data-kind="Normal"] input[title="text"]', renamed)
       await key('Tab', 'Tab', 9)
-      await until(() => nativeMenu(target), (tree) => flattenMenu(tree.items).some((item) => item.text === renamed))
+      await until(() => page.evaluate('document.querySelector("main .menu-item[data-id][data-kind=Normal]").dataset.text'), (value) => value === renamed)
       stage = 'live Check checked change'
       await click(page, 'main .menu-item[data-id][data-kind="Check"] input[title="checked"]')
-      await until(() => nativeMenu(target), (tree) => flattenMenu(tree.items).find((item) => item.text === 'A check menu')?.check === false)
+      assert.equal(await page.evaluate('document.querySelector("main .menu-item[data-id][data-kind=Check] input[title=checked]").checked'), false)
+      await until(() => page.evaluate('document.querySelector("main .menu-item[data-id][data-kind=Check]").dataset.checked'), (value) => value === 'false')
       stage = 'live Check remove'
       await click(page, 'main .menu-item[data-id][data-kind="Check"] button[title="remove"]')
-      const removed = await until(() => nativeMenu(target), (tree) => !flattenMenu(tree.items).some((item) => item.text === 'A check menu'))
+      const remainingCheckRows = await until(() => page.evaluate('document.querySelectorAll("main .menu-item[data-id][data-kind=Check]").length'), (count) => count === 0)
       await test.shot(page, 'api-menu-live-edit-and-remove')
-      return { originalUiRows: 2, text, tree, nativeRoute: 'Win32 WM_COMMAND using ID enumerated from this HWND; actual popup selection not certified', removed }
+      return { partial: true, originalUiRows: 2, text, renamed, remainingCheckRows, nativeAttachmentCertified: false, nativeCallbackCertified: false }
     } catch (error) {
       throw Object.assign(error, { message: `Menu ${stage}: ${error.message}`, evidence: error.evidence ?? { stage } })
     } finally { await view('Welcome') } // original onDestroy closes menu/items
   })
-  limit('Welcome/Menu', 'Actual popup selection and OS visuals', 'The original builder, real Win32 item/state changes and original Console callback through WM_COMMAND are checked. That command route does not certify a user opening/selecting Context menu/Popup. Actual native keyboard/mouse selection, NativeIcon/Image variants, live reorder and Ctrl+B visibility still need OS input and keyframes; no JS callback is fabricated.')
+  limit('Welcome/Menu', 'Native menu attachment, callbacks, popup selection and OS visuals', 'Original builder drag, Create menu, text/checked changes and row removal use original controls. Their bound UI state does not certify backend menu mutations, native attachment or callbacks. The official muda cross-process window callback path is unsupported by this runtime; attachment and callbacks remain blocked. Popup selection, NativeIcon/Image variants, live reorder, accelerators and Ctrl+B visibility also remain unverified.')
 
   await section('Tray original Create/Remove path (OS appearance still blocked)', async () => {
     await view('Tray')

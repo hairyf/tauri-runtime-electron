@@ -61,6 +61,7 @@ class Window extends EventEmitter {
   setBackgroundMaterial(material) { this.material = material; this.color = material === 'none' ? '#ffffff' : '#00000000' }
   getContentBounds() { return { ...this.content } }
   getBounds() { return { ...this.content, scale: this.scale } }
+  setPosition(x, y) { this.content.x = x; this.content.y = y }
   isDestroyed() { return this.destroyed }
   isVisible() { return this.visible }
   isMaximized() { return false }
@@ -83,7 +84,18 @@ const context = vm.createContext({
     app: { on() {}, whenReady: () => new Promise(() => {}) },
     BrowserWindow: Window, WebContentsView: View,
     ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} },
-    screen: { getDisplayMatching: (bounds) => ({ scaleFactor: bounds.scale }) },
+    screen: {
+      getDisplayMatching: (bounds) => ({ scaleFactor: bounds.scale }),
+      // A secondary display has a physical origin distinct from DIP-origin * scale.
+      getCursorScreenPoint: () => ({ x: 2100, y: 40 }),
+      getDisplayNearestPoint: () => ({ scaleFactor: 2 }),
+      dipToScreenPoint: ({ x, y }) => ({ x: 1920 + (x - 1920) * 2, y: y * 2 }),
+      screenToDipPoint: ({ x, y }) => ({ x: 1920 + (x - 1920) / 2, y: y / 2 }),
+      dipToScreenRect: (_window, rect) => ({
+        x: 1920 + (rect.x - 1920) * 2, y: rect.y * 2,
+        width: rect.width * 2, height: rect.height * 2,
+      }),
+    },
   } : name === 'node:fs' ? { appendFileSync() {} }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
@@ -96,6 +108,19 @@ const call = (method, params) => context.handle(method, params)
 await call('window.create', { windowId: 1, width: 800, height: 600 })
 const host = inspect('windows.get(1)')
 assert.equal(host.options.useContentSize, true)
+assert.deepEqual(plain(await call('window.cursorPosition', {})), { x: 2280, y: 80 })
+await call('window.position', { windowId: 1, physical: true, x: 2280, y: 80 })
+assert.equal(host.content.x, 2100)
+assert.equal(host.content.y, 40)
+const geometry = plain(inspect('readGeometry(windows.get(1))'))
+assert.equal(geometry.bounds.x, 2280)
+assert.equal(geometry.bounds.y, 80)
+const monitor = plain(inspect(`readDisplay({ scaleFactor: 2,
+  bounds: { x: 1920, y: 0, width: 1280, height: 720 },
+  workArea: { x: 1920, y: 0, width: 1280, height: 680 } })`))
+assert.equal(monitor.position.x, 1920, 'monitor origin is converted natively, not multiplied by scale')
+assert.equal(monitor.size.width, 2560)
+assert.equal(monitor.workArea.size.height, 1360)
 const urls = ['tauri://localhost/', 'https://github.com/tauri-apps/tauri', 'https://tauri.app', 'https://twitter.com/TauriApps']
 for (let index = 0; index < 4; index++) {
   const x = index % 2 * 400
@@ -114,6 +139,7 @@ for (let index = 0; index < 4; index++) {
   assert.equal(view.webContents.url, urls[index])
   assert.deepEqual(plain(view.options.webPreferences), {
     contextIsolation: true, sandbox: true, nodeIntegration: false,
+    nodeIntegrationInSubFrames: true,
     preload: view.options.webPreferences.preload,
   })
   assert.equal(inspect(`webviewByContents.get(${view.webContents.id})`), index + 10)

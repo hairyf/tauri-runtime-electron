@@ -14,7 +14,6 @@ const {
   protocol,
   screen,
   session,
-  shell,
   webContents,
 } = require('electron')
 const net = require('node:net')
@@ -51,12 +50,8 @@ function installDevtoolsShortcut(contents) {
 function installContextMenu(contents) {
   contents.on('context-menu', (_event, params) => {
     const items = []
-    if (params.linkURL) {
-      items.push({
-        label: 'Open Link in Browser',
-        click: () => shell.openExternal(params.linkURL),
-      })
-    }
+    // Opening links belongs to the host's new-window policy, not a runtime
+    // context-menu shortcut that bypasses it. Keep only ordinary editing here.
     if (params.isEditable) {
       items.push(
         { role: 'cut', label: 'Cut', enabled: params.editFlags.canCut },
@@ -118,25 +113,28 @@ protocol.registerSchemesAsPrivileged(
   }))
 )
 
-let localhostProtocolsInstalled = false
+const localhostProtocolSessions = new WeakSet()
+const policySessions = new WeakSet()
+const navigationRequests = new Map()
+let nextNavigationRequest = 0
 
 /** Keep WebView2's virtual HTTP(S) origin: isolation and CSP depend on it. */
-function installLocalhostProtocols() {
-  if (localhostProtocolsInstalled) return
+function installLocalhostProtocols(target = protocol, network = electronNet) {
+  if (localhostProtocolSessions.has(target)) return
   for (const transport of ['http', 'https']) {
-    protocol.handle(transport, (request) => {
+    target.handle(transport, (request) => {
       const url = new URL(request.url)
       const match = /^([a-z][a-z0-9+.-]*)\.localhost$/.exec(url.hostname)
       // A dev server on a real port, or any unregistered host, stays ordinary HTTP.
       if (url.port || !match || !registeredSchemes.has(match[1])) {
-        return electronNet.fetch(request, { bypassCustomProtocolHandlers: true })
+        return network.fetch(request, { bypassCustomProtocolHandlers: true })
       }
       // Only the resolver sees the native scheme, just like Wry's WebView2 adapter.
       const uri = `${match[1]}://localhost${url.pathname}${url.search}`
       return dispatchProtocol(match[1], request, uri)
     })
   }
-  localhostProtocolsInstalled = true
+  localhostProtocolSessions.add(target)
 }
 
 /** id -> resolve(Response); a `protocol.request` awaiting `protocol.respond`. */
@@ -190,10 +188,40 @@ const webviewByContents = new Map()
 const childWebviews = new Map()
 /** webviewId -> the out-of-band callbacks the runtime registered */
 const handlerPolicy = new Map()
-/** request id -> DownloadItem awaiting the runtime's answer */
+/** request id -> staged download, joined with its first host decision and done state */
 const downloadRequests = new Map()
-/** request id -> where Electron writes now vs where the runtime wants it */
-const downloadPaths = new Map()
+
+function cleanDownloadStage(entry) {
+  try {
+    fs.rmSync(entry.directory, { recursive: true, force: true })
+  } catch (error) {
+    log('download.cleanup failed', entry.directory, serializeError(error))
+  }
+}
+
+function finishDownload(id) {
+  const entry = downloadRequests.get(id)
+  if (!entry || entry.allow === undefined || entry.state === undefined) return
+  downloadRequests.delete(id)
+  clearTimeout(entry.timer)
+  entry.contents.removeListener('destroyed', entry.onDestroyed)
+  let success = false
+  if (entry.allow && entry.state === 'completed') {
+    try {
+      // Exclusive copying works across devices and never replaces existing data.
+      fs.copyFileSync(entry.provisional, entry.finalPath, fs.constants.COPYFILE_EXCL)
+      success = true
+    } catch (error) {
+      // Keep the completed bytes recoverable if publishing fails.
+      log('download.publish failed; staged data retained', entry.provisional, serializeError(error))
+    }
+  }
+  if (success || !entry.allow || entry.state !== 'completed') cleanDownloadStage(entry)
+  send({
+    event: 'download.finished',
+    params: { webviewId: entry.webviewId, url: entry.url, path: success ? entry.finalPath : null, success },
+  })
+}
 /** request id -> Electron permission callback awaiting the runtime */
 const permissionRequests = new Map()
 let nextDownloadRequest = 0
@@ -223,58 +251,105 @@ function policyFor(contents) {
 
 function recordPolicy(webviewId, policy) {
   if (!policy) return
-  if (policy.download || policy.permission) handlerPolicy.set(webviewId, policy)
+  if (policy.download || policy.permission || policy.navigation) handlerPolicy.set(webviewId, policy)
 }
 
 /**
  * Downloads and permission prompts are decided by the Rust run loop, so they are
  * forwarded to it and answered later instead of blocking the main thread.
  */
-function installPolicyHandlers() {
-  session.defaultSession.on('will-download', (_event, item, contents) => {
-    log('download.begin', contents && contents.id, item.getURL(), 'policy', JSON.stringify(policyFor(contents)))
+function installPolicyHandlers(target = session.defaultSession) {
+  if (policySessions.has(target)) return
+  policySessions.add(target)
+  const pendingNavigations = new Map()
+  const retireNavigation = (details) => {
+    const finish = pendingNavigations.get(details.id)
+    if (finish) finish(false, true)
+  }
+  target.webRequest.onCompleted(retireNavigation)
+  target.webRequest.onErrorOccurred(retireNavigation)
+  // Pause the real request: preserve POST data, redirects and initiating frame.
+  target.webRequest.onBeforeRequest((details, callback) => {
+    const contents = details.webContents ?? webContents.fromId(details.webContentsId)
+    if (!['mainFrame', 'subFrame'].includes(details.resourceType) || !policyFor(contents)?.navigation) {
+      callback({})
+      return
+    }
+    const id = ++nextNavigationRequest
+    const finish = (allow, retired = false) => {
+      const entry = navigationRequests.get(id)
+      if (!entry) return
+      navigationRequests.delete(id)
+      pendingNavigations.delete(details.id)
+      clearTimeout(entry.timer)
+      contents.removeListener('destroyed', entry.onDestroyed)
+      // An ended request must not let a late decision stop a newer navigation.
+      if (retired) return
+      // Native cancel alone can commit ERR_BLOCKED_BY_CLIENT. Stop main-frame
+      // navigation first to retain its document, never the whole page for an iframe.
+      // ponytail: denied iframe may show an error page; retention needs a native async navigation throttle.
+      try {
+        if (!allow && details.resourceType === 'mainFrame' && !contents.isDestroyed()) contents.stop()
+      } finally {
+        callback({ cancel: !allow })
+      }
+    }
+    const onDestroyed = () => finish(false)
+    const timer = setTimeout(onDestroyed, 15_000)
+    timer.unref()
+    navigationRequests.set(id, { finish, timer, onDestroyed })
+    pendingNavigations.set(details.id, finish)
+    contents.once('destroyed', onDestroyed)
+    send({ event: 'webview.navigationRequested', params: {
+      id, webviewId: webviewIdFor(contents), url: details.url,
+    } })
+  })
+  target.on('will-download', (event, item, contents) => {
     const webviewId = contents && webviewByContents.get(contents.id)
     const policy = webviewId === undefined ? undefined : handlerPolicy.get(webviewId)
     if (!policy || !policy.download) return
     const id = ++nextDownloadRequest
-    downloadRequests.set(id, item)
-    // Electron only starts writing once a save path exists; the runtime's answer
-    // may replace this provisional one before the first byte is written.
-    if (!item.getSavePath()) item.setSavePath(path.join(os.tmpdir(), `electron-download-${id}.bin`))
-    downloadPaths.set(id, { provisional: item.getSavePath(), finalPath: item.getSavePath() })
+    const entry = {
+      item, contents, webviewId, url: item.getURL(),
+      finalPath: item.getSavePath() || path.join(app.getPath('downloads'), path.basename(item.getFilename())),
+    }
+    try {
+      entry.directory = fs.mkdtempSync(path.join(os.tmpdir(), 'electron-download-'))
+      entry.provisional = path.join(entry.directory, 'download')
+      // Electron only permits setSavePath during this synchronous callback.
+      item.setSavePath(entry.provisional)
+    } catch (error) {
+      event.preventDefault()
+      if (entry.directory) cleanDownloadStage(entry)
+      log('download.stage failed', serializeError(error))
+      send({ event: 'download.finished', params: { webviewId, url: entry.url, path: null, success: false } })
+      return
+    }
+    downloadRequests.set(id, entry)
+    entry.onDestroyed = () => {
+      entry.allow = false
+      try { if (entry.state === undefined) item.cancel() }
+      catch (error) { log('download.cancel failed', serializeError(error)) }
+      entry.state ??= 'cancelled'
+      finishDownload(id)
+    }
+    contents.once('destroyed', entry.onDestroyed)
+    // A lost host reply must not leave private data or a live item indefinitely.
+    entry.timer = setTimeout(entry.onDestroyed, 30_000)
+    entry.timer.unref()
     item.once('done', (_done, state) => {
-      const entry = downloadPaths.get(id)
-      downloadPaths.delete(id)
-      if (entry && entry.finalPath !== entry.provisional) {
-        // `setSavePath` only takes effect before the first byte, so the data sits
-        // in the provisional file; move it once the download has finished.
-        if (state === 'completed' && fs.existsSync(entry.provisional)) {
-          try {
-            fs.renameSync(entry.provisional, entry.finalPath)
-            log('download.moved', entry.provisional, entry.finalPath)
-          } catch (error) {
-            log('download.move failed', serializeError(error))
-          }
-        } else if (fs.existsSync(entry.provisional)) {
-          fs.rmSync(entry.provisional, { force: true })
-        }
-      }
-      log('download.done', state, entry ? entry.finalPath : item.getSavePath())
-      const path = state === 'completed' ? (entry ? entry.finalPath : item.getSavePath()) : null
-      send({
-        event: 'download.finished',
-        params: { webviewId, url: item.getURL(), path, success: state === 'completed' },
-      })
+      entry.state = state
+      // Cancellation may release its Windows file handle after destruction.
+      if (!downloadRequests.has(id)) cleanDownloadStage(entry)
+      else finishDownload(id)
     })
-    // The runtime answers through `webview.downloadResponse`. Electron keeps the
-    // original path when the answer arrives after the first byte.
     send({
       event: 'download.requested',
-      params: { id, webviewId, url: item.getURL(), destination: item.getSavePath() },
+      params: { id, webviewId, url: entry.url, destination: entry.finalPath },
     })
   })
 
-  session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+  target.setPermissionRequestHandler((contents, permission, callback, details) => {
     const policy = policyFor(contents)
     const kind = permissionKind(permission, details)
     if (!policy || !policy.permission || !kind) {
@@ -307,6 +382,25 @@ function serializeError(error) {
   return error && error.message ? error.message : String(error)
 }
 
+const customSessions = new Set()
+let nextIncognitoSession = 0
+
+function sessionFor(webview = {}) {
+  if (!webview.incognito && !webview.dataDirectory) return undefined
+  const target = webview.incognito
+    ? session.fromPartition(`tauri-private-${++nextIncognitoSession}`)
+    : session.fromPath(path.resolve(webview.dataDirectory))
+  if (!customSessions.has(target)) {
+    customSessions.add(target)
+    installPolicyHandlers(target)
+    for (const scheme of registeredSchemes) {
+      target.protocol.handle(scheme, (request) => dispatchProtocol(scheme, request))
+    }
+    installLocalhostProtocols(target.protocol, target)
+  }
+  return target
+}
+
 async function createWindow(params) {
   const { windowId } = params
   // Windows canonicalized paths arrive with a verbatim `\\?\` prefix that
@@ -335,6 +429,8 @@ async function createWindow(params) {
     ...(params.backgroundColor ? { backgroundColor: params.backgroundColor } : {}),
     ...(params.titleBarHidden ? { titleBarStyle: 'hidden' } : {}),
     ...(params.titleBarOverlay ? { titleBarOverlay: true } : {}),
+    ...(params.trafficLightPosition ? { trafficLightPosition: params.trafficLightPosition } : {}),
+    ...(params.tabbingIdentifier ? { tabbingIdentifier: params.tabbingIdentifier } : {}),
   }
   for (const key of Object.keys(creation)) {
     if (creation[key] === null) delete creation[key]
@@ -361,6 +457,9 @@ async function createWindow(params) {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      // Subframes receive the sandboxed script runner, never Node or Tauri IPC.
+      nodeIntegrationInSubFrames: true,
+      session: sessionFor(params.webview),
       preload: params.webview
         ? writeInitPreload(params.webview.webviewId, params.webview.initScripts)
         : path.join(__dirname, 'preload.cjs'),
@@ -441,20 +540,9 @@ function wireWebviewEvents(contents, webviewId) {
       params: { webviewId, reason: details.reason, exitCode: details.exitCode },
     })
   })
-  // `setWindowOpenHandler` can only answer synchronously, but the Rust run loop
-  // is what decides — so deny here and let Tauri open its own window.
-  contents.setWindowOpenHandler(({ url, features }) => {
-    // Web pages open in the system browser, like they do under wry. Doing it
-    // here rather than from the Tauri process keeps the launch in the process
-    // that owns the window: Windows only lets a foreground app hand the
-    // foreground to the browser it opens.
-    if (/^(https?|mailto|tel):/i.test(url)) {
-      shell.openExternal(url)
-      return { action: 'deny' }
-    }
-    send({ event: 'webview.newWindow', params: { webviewId, url, features: features ?? '' } })
-    return { action: 'deny' }
-  })
+  // Never bypass the host policy with an implicit system-browser launch.
+  // Native opener callbacks are rejected at creation by the Rust boundary.
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }))
 }
 
 /**
@@ -469,11 +557,15 @@ function wireWebviewEvents(contents, webviewId) {
 function writeInitPreload(webviewId, initScripts) {
   const scripts = initScripts ?? []
   if (!scripts.length) return path.join(__dirname, 'preload.cjs')
-  const file = path.join(os.tmpdir(), `tauri-runtime-electron-preload-${webviewId}.cjs`)
+  // Different apps reuse webview IDs; never share executable preload files.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tauri-runtime-electron-preload-'))
+  const file = path.join(directory, `${webviewId}.cjs`)
+  app.once('will-quit', () => fs.rmSync(directory, { recursive: true, force: true }))
   const source = `${fs.readFileSync(path.join(__dirname, 'preload.cjs'), 'utf8')}
-for (const source of ${JSON.stringify(scripts)}) {
+for (const entry of ${JSON.stringify(scripts)}) {
+  if (entry.mainFrameOnly && !process.isMainFrame) continue
   try {
-    webFrame.executeJavaScript(source)
+    webFrame.executeJavaScript(entry.script)
   } catch (error) {
     console.error('init script failed', error)
   }
@@ -503,6 +595,8 @@ function createChildWebview(window, webview) {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      nodeIntegrationInSubFrames: true,
+      session: sessionFor(webview),
       preload: writeInitPreload(webviewId, initScripts),
     },
   })
@@ -617,14 +711,18 @@ function scaleOf(window) {
   return screen.getDisplayMatching(window.getBounds()).scaleFactor || 1
 }
 
+/** Global screen origins cannot be scaled like window-relative coordinates on mixed-DPI Windows. */
+function physicalScreenRect(window, rect, scale) {
+  if (process.platform === 'win32') return screen.dipToScreenRect(window, rect)
+  return {
+    x: Math.round(rect.x * scale), y: Math.round(rect.y * scale),
+    width: Math.round(rect.width * scale), height: Math.round(rect.height * scale),
+  }
+}
+
 /** Tauri monitors are physical pixels, Electron displays are DIPs. */
 function readDisplay(display) {
-  const toPhysical = (rect) => ({
-    x: Math.round(rect.x * display.scaleFactor),
-    y: Math.round(rect.y * display.scaleFactor),
-    width: Math.round(rect.width * display.scaleFactor),
-    height: Math.round(rect.height * display.scaleFactor),
-  })
+  const toPhysical = (rect) => physicalScreenRect(null, rect, display.scaleFactor)
   return {
     name: display.label,
     position: toPhysical(display.bounds),
@@ -663,12 +761,7 @@ function imageFromPayload(payload) {
 
 function readGeometry(window) {
   const scaleFactor = scaleOf(window)
-  const toPhysical = (rect) => ({
-    x: Math.round(rect.x * scaleFactor),
-    y: Math.round(rect.y * scaleFactor),
-    width: Math.round(rect.width * scaleFactor),
-    height: Math.round(rect.height * scaleFactor),
-  })
+  const toPhysical = (rect) => physicalScreenRect(window, rect, scaleFactor)
   return {
     scaleFactor,
     bounds: toPhysical(window.getBounds()),
@@ -704,6 +797,12 @@ function setWindowSize(window, params) {
 }
 
 function setWindowPosition(window, params) {
+  if (typeof params.x !== 'number' || typeof params.y !== 'number') return
+  if (params.physical && process.platform === 'win32') {
+    const point = screen.screenToDipPoint({ x: params.x, y: params.y })
+    window.setPosition(point.x, point.y)
+    return
+  }
   const x = toDip(window, params, 'x')
   const y = toDip(window, params, 'y')
   if (x === undefined || y === undefined) return
@@ -808,27 +907,25 @@ function handle(method, params) {
     case 'window.requestAttention':
       findWindow(params.windowId).flashFrame(Boolean(params.flash))
       return null
+    case 'webview.navigationResponse': {
+      navigationRequests.get(params.id)?.finish(params.allow === true)
+      return null
+    }
     case 'webview.downloadResponse': {
-      const item = downloadRequests.get(params.id)
-      downloadRequests.delete(params.id)
-      const entry = downloadPaths.get(params.id)
-      if (!item) return null
-      if (!params.allow) {
-        item.cancel()
-        if (entry) {
-          if (fs.existsSync(entry.provisional)) fs.rmSync(entry.provisional, { force: true })
-          downloadPaths.delete(params.id)
+      const entry = downloadRequests.get(params.id)
+      if (!entry || entry.allow !== undefined) return null
+      clearTimeout(entry.timer)
+      if (params.destination !== undefined) entry.finalPath = params.destination
+      entry.allow = params.allow === true && typeof entry.finalPath === 'string' &&
+        entry.finalPath.length > 0 && !entry.finalPath.includes('\0')
+      if (!entry.allow && entry.state === undefined) {
+        try { entry.item.cancel() }
+        catch (error) {
+          log('download.cancel failed', serializeError(error))
+          entry.state = 'cancelled'
         }
-        return null
       }
-      if (entry && params.destination) entry.finalPath = params.destination
-      try {
-        if (params.destination) item.setSavePath(params.destination)
-        log('download.answer', item.getState(), item.getSavePath())
-      } catch (error) {
-        log('download.answer failed', serializeError(error))
-        item.cancel()
-      }
+      finishDownload(params.id)
       return null
     }
     case 'webview.permissionResponse': {
@@ -1027,6 +1124,7 @@ function handle(method, params) {
       }
     case 'window.cursorPosition': {
       const point = screen.getCursorScreenPoint()
+      if (process.platform === 'win32') return screen.dipToScreenPoint(point)
       const scale = screen.getDisplayNearestPoint(point).scaleFactor
       return { x: Math.round(point.x * scale), y: Math.round(point.y * scale) }
     }
@@ -1113,6 +1211,9 @@ function handle(method, params) {
       const { scheme } = params
       if (registeredSchemes.has(scheme)) return null
       protocol.handle(scheme, (request) => dispatchProtocol(scheme, request))
+      for (const target of customSessions) {
+        target.protocol.handle(scheme, (request) => dispatchProtocol(scheme, request))
+      }
       registeredSchemes.add(scheme)
       installLocalhostProtocols()
       return null
@@ -1229,6 +1330,17 @@ app.whenReady().then(async () => {
   })
 })
 
+// Native Quit (including the menu role) asks Rust first, just like close.
+// A disconnected host must still be able to tear Electron down.
+app.on('before-quit', (event) => {
+  if (!socket || socket.destroyed) return
+  event.preventDefault()
+  send({ event: 'app.exitRequested', params: {} })
+})
+
 // The Rust side owns the lifetime: no window means keep running until the
 // socket closes.
 app.on('window-all-closed', () => {})
+app.on('activate', (_event, hasVisibleWindows) => {
+  send({ event: 'app.reopen', params: { hasVisibleWindows } })
+})

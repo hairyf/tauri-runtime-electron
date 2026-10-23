@@ -12,7 +12,17 @@ use crate::{
   window_builder::ElectronWindowBuilder,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc, sync::Weak};
+use crate::electron_impl::ipc::Ipc;
+
+pub use tauri_utils::{config::{Color, WindowEffectsConfig}, WindowEffect as Effect, WindowEffectState as EffectState};
+
+#[cfg(feature = "tauri")]
+mod extension;
+#[cfg(feature = "tauri")]
+pub use extension::{clear_effects, init, set_effects, Window};
+#[cfg(feature = "tauri")]
+pub use tauri::window::EffectsBuilder;
 use tauri_runtime::{
   Icon, ProgressBarState, ProgressBarStatus, Result, UserAttentionType, UserEvent, WindowDispatch,
   WindowEventId,
@@ -23,27 +33,83 @@ use tauri_runtime::{
 };
 use tauri_utils::Theme;
 
+/// A thread-safe route bound to one window and one Electron connection.
+#[derive(Debug, Clone)]
+pub(crate) struct EffectsTarget {
+  serial: u32,
+  ipc: Weak<Ipc>,
+}
+
+impl EffectsTarget {
+  pub(crate) fn new(serial: u32, ipc: &std::sync::Arc<Ipc>) -> Self {
+    Self { serial, ipc: std::sync::Arc::downgrade(ipc) }
+  }
+
+  fn apply(&self, material: &str) -> std::io::Result<()> {
+    self.ipc.upgrade()
+      .ok_or_else(|| std::io::Error::other("Electron runtime has exited"))?
+      .call("window.backgroundMaterial", json!({ "windowId": self.serial, "material": material }), IPC_TIMEOUT)
+      .map(|_| ())
+      .map_err(std::io::Error::other)
+  }
+}
+
+// The official Window exposes scheduling, but deliberately hides its dispatcher.
+// Bind only the scheduled task's lifetime, never a global 'current' runtime.
+thread_local! {
+  static EFFECTS_TARGET: RefCell<Option<EffectsTarget>> = const { RefCell::new(None) };
+}
+
+fn with_effects_target<R>(target: EffectsTarget, task: impl FnOnce() -> R) -> R {
+  struct Restore(Option<EffectsTarget>);
+  impl Drop for Restore {
+    fn drop(&mut self) {
+      EFFECTS_TARGET.with(|slot| slot.replace(self.0.take()));
+    }
+  }
+  let _restore = Restore(EFFECTS_TARGET.with(|slot| slot.replace(Some(target))));
+  task()
+}
+
+fn background_material(effects: Option<&WindowEffectsConfig>) -> std::io::Result<&'static str> {
+  match effects.and_then(|config| config.effects.iter().find(|effect| matches!(
+    effect, Effect::Acrylic | Effect::Mica | Effect::Tabbed
+  ))) {
+    Some(Effect::Acrylic) => Ok("acrylic"),
+    Some(Effect::Mica) => Ok("mica"),
+    Some(Effect::Tabbed) => Ok("tabbed"),
+    _ if effects.is_none_or(|config| config.effects.is_empty()) => Ok("none"),
+    _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Unsupported window effect: Electron supports Acrylic, Mica and Tabbed only")),
+  }
+}
+
+#[test]
+fn selects_supported_background_material_or_rejects() {
+  assert_eq!(background_material(None).unwrap(), "none");
+  let mut config = WindowEffectsConfig::default();
+  assert_eq!(background_material(Some(&config)).unwrap(), "none");
+  for (effect, material) in [(Effect::Acrylic, "acrylic"), (Effect::Mica, "mica"), (Effect::Tabbed, "tabbed")] {
+    config.effects = vec![Effect::Blur, effect];
+    assert_eq!(background_material(Some(&config)).unwrap(), material);
+  }
+  config.effects = vec![Effect::Blur];
+  assert!(background_material(Some(&config)).unwrap_err().to_string().contains("Unsupported window effect"));
+}
+
 #[derive(Debug, Clone)]
 pub struct ElectronWindowDispatcher {
   pub(crate) id: WindowId,
   pub(crate) context: RuntimeContext,
+  pub(crate) effects_target: EffectsTarget,
 }
 
 impl ElectronWindowDispatcher {
   /// Apply Windows backdrop materials through Electron, which also synchronizes
   /// Chromium's compositor. Applying window-vibrancy to its HWND alone does not.
-  pub fn set_window_effects(&self, effects: Option<tauri_utils::config::WindowEffectsConfig>) -> Result<()> {
-    use tauri_utils::WindowEffect;
-    let material = match effects.as_ref().and_then(|config| config.effects.iter().find(|effect| matches!(
-      effect, WindowEffect::Acrylic | WindowEffect::Mica | WindowEffect::Tabbed
-    ))) {
-      Some(WindowEffect::Acrylic) => "acrylic",
-      Some(WindowEffect::Mica) => "mica",
-      Some(WindowEffect::Tabbed) => "tabbed",
-      _ if effects.as_ref().is_none_or(|config| config.effects.is_empty()) => "none",
-      _ => return Err(create_window_err("Electron background materials support Acrylic, Mica and Tabbed only".into())),
-    };
-    self.window_call("window.backgroundMaterial", json!({ "material": material }))
+  pub fn set_window_effects(&self, effects: Option<WindowEffectsConfig>) -> Result<()> {
+    background_material(effects.as_ref())
+      .and_then(|material| self.effects_target.apply(material))
+      .map_err(|error| create_window_err(error.to_string()))
   }
 
   fn window_call(&self, method: &str, params: Value) -> Result<()> {
@@ -77,7 +143,8 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   type WindowBuilder = ElectronWindowBuilder;
 
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
-    self.context.send_message(Message::Task(Box::new(f)))
+    let target = self.effects_target.clone();
+    self.context.send_message(Message::Task(Box::new(move || with_effects_target(target, f))))
   }
 
   fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, f: F) -> WindowEventId {
@@ -203,7 +270,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
-    unimplemented!("tauri-runtime-electron: Electron owns the window, so there is no GTK window")
+    Err(create_window_err("Electron owns the window in another process; no local GTK window is available".into()))
   }
 
   #[cfg(any(
@@ -214,7 +281,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     target_os = "openbsd"
   ))]
   fn default_vbox(&self) -> Result<gtk::Box> {
-    unimplemented!("tauri-runtime-electron: Electron has no GTK widget tree")
+    Err(create_window_err("Electron has no local GTK widget tree".into()))
   }
 
   #[cfg(target_os = "android")]
@@ -230,36 +297,33 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn window_handle(
     &self,
   ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-    // Electron owns the window, but it will tell us its native handle; Tauri's
-    // host-side code (muda menus, window effects, Win32 tweaks) needs it.
-    let handle = self
-      .context
-      .native_handle(self.id)
-      .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
-    let handle = std::num::NonZeroIsize::new(handle)
-      .ok_or(raw_window_handle::HandleError::Unavailable)?;
-    // SAFETY: the handle stays valid while the window exists, and Tauri uses it
-    // synchronously from the main thread.
-    #[cfg(windows)]
-    let raw = raw_window_handle::RawWindowHandle::Win32(
-      raw_window_handle::Win32WindowHandle::new(handle),
-    );
-    #[cfg(target_os = "macos")]
-    let raw = raw_window_handle::RawWindowHandle::AppKit(
-      raw_window_handle::AppKitWindowHandle::new(
-        std::ptr::NonNull::new(handle.get() as *mut std::ffi::c_void)
-          .ok_or(raw_window_handle::HandleError::Unavailable)?,
-      ),
-    );
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let raw = raw_window_handle::RawWindowHandle::Xlib(
-      raw_window_handle::XlibWindowHandle::new(handle.get() as std::os::raw::c_ulong),
-    );
-    #[cfg(not(any(windows, unix)))]
-    return Err(raw_window_handle::HandleError::Unavailable);
+    // An AppKit handle contains an NSView pointer, not a cross-process ID.
+    // Electron's pointer is never a valid object in this Rust process.
+    #[cfg(any(target_os = "macos", not(any(windows, unix))))]
+    {
+      Err(raw_window_handle::HandleError::Unavailable)
+    }
 
-    #[allow(unreachable_code)]
-    Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
+    #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+    {
+      let handle = self
+        .context
+        .native_handle(self.id)
+        .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
+      let handle = std::num::NonZeroIsize::new(handle)
+        .ok_or(raw_window_handle::HandleError::Unavailable)?;
+      #[cfg(windows)]
+      let raw = raw_window_handle::RawWindowHandle::Win32(
+        raw_window_handle::Win32WindowHandle::new(handle),
+      );
+      #[cfg(all(unix, not(target_os = "macos")))]
+      let raw = raw_window_handle::RawWindowHandle::Xlib(
+        raw_window_handle::XlibWindowHandle::new(handle.get() as std::os::raw::c_ulong),
+      );
+      // SAFETY: HWND and X11 window IDs can be used across processes; unlike an
+      // AppKit pointer they do not refer to Electron's process-local memory.
+      Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
+    }
   }
 
   fn center(&self) -> Result<()> {

@@ -4,6 +4,7 @@
 
 const { contextBridge, ipcRenderer, webFrame } = require('electron')
 
+if (process.isMainFrame) {
 contextBridge.exposeInMainWorld('ipc', {
   postMessage(data) {
     ipcRenderer.send('tauri-ipc', String(data))
@@ -39,3 +40,4 @@ webFrame.executeJavaScript(`(${function installIpcFetch() {
     })
   }
 }.toString()})()`)
+}

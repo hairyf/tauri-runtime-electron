@@ -2,6 +2,15 @@
   "name": "tauri-runtime-electron",
   "private": true,
   "type": "module",
+  "exports": {
+    "./api/window": {
+      "types": "./api/window.d.ts",
+      "import": "./api/window.js"
+    }
+  },
+  "peerDependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
   "scripts": {
     "example": "node scripts/example.mjs",
     "check": "node scripts/example-check.mjs"

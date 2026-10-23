@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Transparent Window</title>
     <link rel="stylesheet" href="style.css" />
-    <script src="main.js" defer></script>
+    <script type="module" src="main.js"></script>
   </head>
   <body>
     <main id="panel">
@@ -22,10 +22,13 @@
           <label class="toggle"><input id="transparency" type="checkbox" checked /> 启用透明面板</label>
           <label for="opacity">面板不透明度 <output id="opacity-value" for="opacity">72%</output></label>
           <input id="opacity" type="range" min="15" max="100" value="72" />
-          <label class="toggle"><input id="blur" type="checkbox" /> 背景模糊（Windows 11 Acrylic）</label>
+          <div class="effect-controls">
+            <label class="toggle"><input id="blur" type="checkbox" disabled aria-busy="true" aria-describedby="blur-note" /> 系统背景模糊（Acrylic）</label>
+            <button id="reset" type="button" disabled>重置</button>
+          </div>
         </div>
-        <p class="note">关闭模糊时四周留白透明；开启后 Acrylic 作用于整个窗口。需要 Windows 11 22H2 及以上；系统辅助功能及透明效果设置可能限制原生效果。</p>
-        <p id="status" role="status">透明层已就绪</p>
+        <p id="blur-note" class="note">正在清理并检测系统背景效果；不透明度滑块只调整面板背景。</p>
+        <p id="status" role="status">正在检测系统背景效果…</p>
       </section>
     </main>
   </body>

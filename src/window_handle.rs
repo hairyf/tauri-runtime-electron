@@ -69,9 +69,8 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     Ok(())
   }
 
-  fn request_exit(&self, _code: i32) -> Result<()> {
-    // Tauri's `Message::Exit` carries no code, so this runtime always exits 0.
-    self.context.send_message(Message::Exit)
+  fn request_exit(&self, code: i32) -> Result<()> {
+    self.context.send_message(Message::RequestExit(code))
   }
 
   /// Create a new webview window.
@@ -228,7 +227,9 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     &self,
     _cb: F,
   ) -> Result<()> {
-    todo!("tauri-runtime-electron: Electron sessions have no WKWebView data store to enumerate")
+    Err(crate::runtime::create_webview_err(
+      "Electron sessions have no WKWebView data store to enumerate".into(),
+    ))
   }
 
   #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -237,7 +238,9 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     _uuid: [u8; 16],
     _cb: F,
   ) -> Result<()> {
-    todo!("tauri-runtime-electron: Electron sessions have no WKWebView data store to remove")
+    Err(crate::runtime::create_webview_err(
+      "Electron sessions have no WKWebView data store to remove".into(),
+    ))
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {

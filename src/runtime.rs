@@ -157,7 +157,7 @@ pub(crate) enum Message {
   CloseWindow(WindowId),
   DestroyWindow(WindowId),
   UserEvent(Box<dyn Any + Send>),
-  Exit,
+  RequestExit(i32),
 }
 
 struct Webview {
@@ -213,9 +213,9 @@ pub struct RuntimeContext {
   /// Download and permission callbacks, by webview serial. Electron asks for
   /// these asynchronously, so the run loop answers over IPC.
   policy_handlers: Rc<RefCell<HashMap<u32, PolicyHandlers>>>,
-  /// Native window handle (HWND / NSView / X11 window) per window serial, asked
-  /// from Electron once. `window_handle()` hands it to Tauri so host-side code
-  /// (muda menus, window effects, Win32 tweaks) works as it does on wry.
+  /// Native window handle per window serial, asked from Electron once.
+  /// HWND/X11 IDs permit selected cross-process operations; AppKit pointers
+  /// cannot be borrowed from Electron's process.
   native_handles: Rc<RefCell<HashMap<u32, isize>>>,
 }
 
@@ -237,7 +237,9 @@ impl RuntimeContext {
       }
       (_, message) => message,
     };
-    if self.is_running.load(Ordering::Relaxed) {
+    // Like Wry's proxy, explicit exit requests must reach the callback even
+    // when requested during setup, before the event loop starts.
+    if matches!(&message, Message::RequestExit(_)) || self.is_running.load(Ordering::Relaxed) {
       self
         .run_tx
         .send(message)
@@ -246,13 +248,17 @@ impl RuntimeContext {
       match message {
         Message::Task(task) => task(),
         Message::CloseWindow(id) | Message::DestroyWindow(id) => {
-          self.windows.borrow_mut().remove(&id);
+          self.forget_window(id);
         }
         // No run loop to deliver it to yet.
-        Message::UserEvent(_) | Message::Exit => {}
+        Message::UserEvent(_) | Message::RequestExit(_) => {}
       }
       Ok(())
     }
+  }
+
+  fn forget_window(&self, id: WindowId) -> bool {
+    self.windows.borrow_mut().remove(&id).is_some()
   }
 
   fn next_window_id(&self) -> WindowId {
@@ -928,20 +934,23 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   // iterate here, and callers invoke this in a loop so it must stay silent.
   fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, _callback: F) {}
 
-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
-    self.run(callback);
-
-    0
+  fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
+    std::process::exit(self.run_return(callback));
   }
 
-  fn run<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) {
+  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) -> i32 {
     self.is_running.store(true, Ordering::Relaxed);
     callback(RunEvent::Ready);
 
-    'event_loop: loop {
+    let exit_code = 'event_loop: loop {
       // Events pushed by the Electron process.
       while let Ok(event) = self.event_rx.try_recv() {
         match event["event"].as_str() {
+          Some("app.exitRequested") => {
+            if request_exit(None, &mut callback) {
+              break 'event_loop 0;
+            }
+          }
           Some("window.closeRequested") => {
             let serial = event["params"]["windowId"].as_u64().unwrap_or_default() as u32;
             let Some(id) = self.context.window_for_serial(serial) else {
@@ -956,7 +965,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             };
             if window_closed(&self.context, id, &mut callback) {
               eprintln!("[electron] last window closed, exiting the loop (serial {serial})");
-              break 'event_loop;
+              break 'event_loop 0;
             }
           }
           Some("window.event") => {
@@ -1029,13 +1038,50 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             );
           }
           Some("webview.processGone") => {
-            // Tauri 2 only exposes process termination on macOS/iOS, so this is
-            // reported on the console instead of through a handler.
-            let serial = event["params"]["webviewId"].as_u64().unwrap_or_default();
+            let Some(serial) = event["params"]["webviewId"]
+              .as_u64()
+              .and_then(|serial| u32::try_from(serial).ok())
+            else {
+              continue;
+            };
+            // The generic Tauri callback is only exposed on Apple targets.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+              let handler = self.context.webview_handlers.borrow().get(&serial)
+                .and_then(|handlers| handlers.process_terminated.clone());
+              if let Some(handler) = handler {
+                handler();
+              }
+            }
             eprintln!(
               "[electron] webview {serial} process gone: {}",
               event["params"]["reason"].as_str().unwrap_or("unknown")
             );
+          }
+          #[cfg(target_os = "macos")]
+          Some("app.reopen") => {
+            if let Some(has_visible_windows) = event["params"]["hasVisibleWindows"].as_bool() {
+              callback(RunEvent::Reopen { has_visible_windows });
+            }
+          }
+          Some("webview.navigationRequested") => {
+            let params = &event["params"];
+            let (Some(id), Some(serial)) = (params["id"].as_u64(), params["webviewId"].as_u64()) else {
+              continue;
+            };
+            let handler = u32::try_from(serial).ok().and_then(|serial| {
+              self.context.policy_handlers.borrow().get(&serial)
+                .and_then(|handlers| handlers.navigation.clone())
+            });
+            let allow = handler.is_some_and(|handler| {
+              url::Url::parse(params["url"].as_str().unwrap_or_default())
+                .is_ok_and(|url| handler(&url))
+            });
+            if let Err(error) = self.context.ipc.call(
+              "webview.navigationResponse", json!({ "id": id, "allow": allow }), IPC_TIMEOUT,
+            ) {
+              eprintln!("[electron] failed to answer navigation: {error}");
+            }
           }
           Some("download.requested") => {
             let params = &event["params"];
@@ -1231,7 +1277,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             handler(&label, request, responder);
           }
           Some("ipc.closed") => {
-            break 'event_loop;
+            break 'event_loop 0;
           }
           _ => {}
         }
@@ -1243,13 +1289,13 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
           Message::Task(task) => task(),
           Message::CloseWindow(id) => {
             if close_window(&self.context, id, &mut callback) {
-              break 'event_loop;
+              break 'event_loop 0;
             }
           }
           Message::DestroyWindow(id) => {
-            let removed = self.context.windows.borrow_mut().remove(&id).is_some();
+            let removed = self.context.forget_window(id);
             if removed && exit_if_empty(&self.context, &mut callback) {
-              break 'event_loop;
+              break 'event_loop 0;
             }
           }
           Message::UserEvent(event) => {
@@ -1257,7 +1303,11 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               callback(RunEvent::UserEvent(*event));
             }
           }
-          Message::Exit => break 'event_loop,
+          Message::RequestExit(code) => {
+            if request_exit(Some(code), &mut callback) {
+              break 'event_loop code;
+            }
+          }
         }
       }
 
@@ -1268,7 +1318,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       pump_thread_messages();
 
       std::thread::sleep(Duration::from_millis(10));
-    }
+    };
 
     self.is_running.store(false, Ordering::Relaxed);
     eprintln!("[electron] run loop finished, shutting the runtime down");
@@ -1276,6 +1326,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     // to run while Electron is alive; only then can the channel be torn down.
     callback(RunEvent::Exit);
     self.context.ipc.shutdown();
+    exit_code
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
@@ -1357,7 +1408,7 @@ fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
   };
 
   context.emit_window_event(id, &WindowEvent::Destroyed);
-  context.windows.borrow_mut().remove(&id);
+  context.forget_window(id);
   callback(RunEvent::WindowEvent {
     label,
     event: WindowEvent::Destroyed,
@@ -1396,8 +1447,13 @@ fn exit_if_empty<T: UserEvent, F: FnMut(RunEvent<T>)>(
   if !context.windows.borrow().is_empty() {
     return false;
   }
+  request_exit(None, callback)
+}
+
+/// Shares Wry's synchronous veto handshake for implicit and explicit exits.
+fn request_exit<T: UserEvent, F: FnMut(RunEvent<T>)>(code: Option<i32>, callback: &mut F) -> bool {
   let (tx, rx) = channel();
-  callback(RunEvent::ExitRequested { code: None, tx });
+  callback(RunEvent::ExitRequested { code, tx });
   !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent))
 }
 
@@ -1412,6 +1468,16 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     mut webview,
   } = pending;
 
+  if let Some(webview) = &webview {
+    validate_webview(webview)?;
+  }
+  let config = &window_builder.config;
+  #[cfg(target_os = "macos")]
+  if config.hidden_title || matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Transparent) {
+    return Err(create_window_err(
+      "Electron does not support Tauri hidden_title or the Transparent title bar style; use Overlay without hidden_title".into(),
+    ));
+  }
   let id = context.next_window_id();
   let serial = context.next_serial();
   let webview_id = webview.as_ref().map(|_| context.next_webview_id());
@@ -1444,14 +1510,11 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   // the main process knows whether to intercept downloads and permissions.
   let policy = match (webview.as_mut(), webview_id) {
     (Some(pending_webview), Some(webview_serial)) => {
-      let (download, permission) =
-        register_policy_handlers(context, webview_serial, pending_webview);
-      json!({ "download": download, "permission": permission })
+      register_policy_handlers(context, webview_serial, pending_webview)
     }
     _ => json!(null),
   };
 
-  let config = &window_builder.config;
   let mut payload = json!({
     "windowId": serial,
     "label": label,
@@ -1489,6 +1552,8 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     }),
     "titleBarHidden": !matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Visible),
     "titleBarOverlay": matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Overlay),
+    "trafficLightPosition": config.traffic_light_position,
+    "tabbingIdentifier": config.tabbing_identifier,
   });
   if let Some(icon) = &context.icon {
     payload["icon"] = json!(icon.display().to_string());
@@ -1498,6 +1563,8 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       "webviewId": webview_id,
       "url": webview_url.clone(),
       "initScripts": initialization_scripts(webview),
+      "dataDirectory": webview.webview_attributes.data_directory,
+      "incognito": webview.webview_attributes.incognito,
       "policy": policy,
     });
   }
@@ -1580,6 +1647,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     dispatcher: ElectronWindowDispatcher {
       id,
       context: context.clone(),
+      effects_target: crate::window::EffectsTarget::new(serial, &context.ipc),
     },
     webview,
   })
@@ -1590,6 +1658,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   window_id: WindowId,
   mut pending: PendingWebview<T, ElectronRuntime>,
 ) -> Result<DetachedWebview<T, ElectronRuntime>> {
+  validate_webview(&pending)?;
   let serial = context
     .serial_for_window(window_id)
     .ok_or_else(|| create_webview_err("window does not exist".into()))?;
@@ -1621,7 +1690,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     }
   }
 
-  let (download, permission) = register_policy_handlers(context, webview_id, &mut pending);
+  let policy = register_policy_handlers(context, webview_id, &mut pending);
   let payload = json!({
     "windowId": serial,
     "webviewId": webview_id,
@@ -1632,7 +1701,9 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     })),
     "autoResize": pending.webview_attributes.auto_resize,
     "initScripts": initialization_scripts(&pending),
-    "policy": { "download": download, "permission": permission },
+    "dataDirectory": pending.webview_attributes.data_directory,
+    "incognito": pending.webview_attributes.incognito,
+    "policy": policy,
   });
   context
     .ipc
@@ -1702,16 +1773,28 @@ fn register_ipc_handler<T: UserEvent>(
   context.ipc_handlers.borrow_mut().insert(webview_id, handler);
 }
 
-/// Electron only reads the title bar style while creating the window.
+/// Preserve frame scope through Electron's sandboxed preload.
 fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
   pending: &PendingWebview<T, R>,
-) -> Vec<String> {
+) -> Vec<Value> {
   pending
     .webview_attributes
     .initialization_scripts
     .iter()
-    .map(|script| script.script.clone())
+    .map(|script| json!({
+      "script": script.script,
+      "mainFrameOnly": script.for_main_frame_only,
+    }))
     .collect()
+}
+
+fn validate_webview<T: UserEvent, R: Runtime<T>>(pending: &PendingWebview<T, R>) -> Result<()> {
+  if pending.new_window_handler.is_some() {
+    return Err(create_webview_err(
+      "new-window callbacks require a native opener in tauri-runtime 2.x; Electron cannot supply a WebView2/WKWebView/GTK object".into(),
+    ));
+  }
+  Ok(())
 }
 
 /// Scheme+host of `url`, e.g. `tauri://localhost` — the origin Tauri sees for
@@ -1738,6 +1821,8 @@ fn set_missing_origin(headers: &mut http::HeaderMap, fallback: Option<&str>) {
 pub(crate) struct WebviewHandlers {
   pub(crate) page_load: Option<Rc<dyn Fn(url::Url, PageLoadEvent) + Send>>,
   pub(crate) title: Option<Rc<dyn Fn(String) + Send>>,
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  process_terminated: Option<Rc<dyn Fn() + Send>>,
 }
 
 /// The callbacks Electron asks about out of band: a download question and
@@ -1746,11 +1831,12 @@ pub(crate) struct WebviewHandlers {
 pub(crate) struct PolicyHandlers {
   download: Option<Arc<DownloadHandler>>,
   permission: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
+  navigation: Option<Rc<dyn Fn(&url::Url) -> bool + Send>>,
 }
 
 impl PolicyHandlers {
   fn is_empty(&self) -> bool {
-    self.download.is_none() && self.permission.is_none()
+    self.download.is_none() && self.permission.is_none() && self.navigation.is_none()
   }
 }
 
@@ -1797,22 +1883,28 @@ fn register_webview_handlers<T: UserEvent>(
     WebviewHandlers {
       page_load,
       title,
+      #[cfg(any(target_os = "macos", target_os = "ios"))]
+      process_terminated: pending.on_web_content_process_terminate_handler.take().map(Rc::from),
     },
   );
 }
 
-/// Moves the download and permission callbacks off the attributes and records
-/// which of them Electron should ask about. Returns `(download, permission)`.
+/// Move generic policy callbacks off the attributes before loading the page.
 fn register_policy_handlers<T: UserEvent>(
   context: &RuntimeContext,
   webview_id: u32,
   pending: &mut PendingWebview<T, ElectronRuntime>,
-) -> (bool, bool) {
+) -> Value {
   let handlers = PolicyHandlers {
     download: pending.download_handler.take(),
     permission: pending.permission_request_handler.take(),
+    navigation: pending.navigation_handler.take().map(Rc::from),
   };
-  let wired = (handlers.download.is_some(), handlers.permission.is_some());
+  let wired = json!({
+    "download": handlers.download.is_some(),
+    "permission": handlers.permission.is_some(),
+    "navigation": handlers.navigation.is_some(),
+  });
   if !handlers.is_empty() {
     context
       .policy_handlers
