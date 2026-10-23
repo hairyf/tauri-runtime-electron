@@ -1229,7 +1229,7 @@ function handle(method, params) {
   }
 }
 
-function onLine(line) {
+async function onLine(line) {
   let message
   try {
     message = JSON.parse(line)
@@ -1242,15 +1242,15 @@ function onLine(line) {
     return
   }
 
-  Promise.resolve()
-    .then(() => handle(message.method, message.params ?? {}))
-    .then((result) => {
-      send({ id: message.id, result: result ?? null })
-    })
-    .catch((error) => {
-      log('error', message.method, serializeError(error))
-      send({ id: message.id, error: serializeError(error) })
-    })
+  try {
+    // Native lifecycle calls may reenter Node; start them in the socket callback,
+    // rather than in a Promise microtask. Await only their result.
+    const result = await handle(message.method, message.params ?? {})
+    send({ id: message.id, result: result ?? null })
+  } catch (error) {
+    log('error', message.method, serializeError(error))
+    send({ id: message.id, error: serializeError(error) })
+  }
 }
 
 ipcMain.handle('tauri-ipc-fetch', async (event, data) => {

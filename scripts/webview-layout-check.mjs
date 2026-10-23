@@ -202,7 +202,32 @@ await call('webview.reload', { webviewId: 10 })
 await call('webview.setZoom', { webviewId: 10, scaleFactor: 1.25 })
 await call('webview.openDevtools', { webviewId: 10 })
 assert.equal(await call('webview.isDevtoolsOpen', { webviewId: 10 }), true)
-await call('webview.closeDevtools', { webviewId: 10 })
+// Native lifecycle methods can reenter Node; invoke them in the socket callback,
+// before its microtask checkpoint. Async results and both error paths still reply.
+const replies = []
+const originalSend = context.send
+context.send = (message) => replies.push(plain(message))
+try {
+  const close = context.onLine(JSON.stringify({ id: 1, method: 'webview.closeDevtools', params: { webviewId: 10 } }))
+  assert.equal(first.webContents.devtools, false, 'close must run before the socket callback returns')
+  await close
+  assert.deepEqual(replies.pop(), { id: 1, result: null })
+  await context.onLine(JSON.stringify({ id: 2, method: 'webview.isDevtoolsOpen', params: { webviewId: 10 } }))
+  assert.deepEqual(replies.pop(), { id: 2, result: false })
+  await context.onLine(JSON.stringify({ id: 3, method: 'missing' }))
+  assert.match(replies.pop().error, /unknown method missing/)
+  const execute = first.webContents.executeJavaScript
+  try {
+    first.webContents.executeJavaScript = () => Promise.reject(new Error('eval rejected'))
+    await context.onLine(JSON.stringify({ id: 4, method: 'webview.eval', params: { webviewId: 10, script: '' } }))
+    assert.deepEqual(replies.pop(), { id: 4, error: 'eval rejected' })
+  } finally { first.webContents.executeJavaScript = execute }
+  await context.onLine(JSON.stringify({ id: 5, method: 'webview.eval', params: { webviewId: 10, script: first.webContents.script } }))
+  assert.deepEqual(replies.pop(), { id: 5, result: first.webContents.id })
+  await context.onLine('invalid JSON')
+  await context.onLine(JSON.stringify({ method: 'webview.closeDevtools' }))
+  assert.equal(replies.length, 0, 'invalid requests produce no uncorrelated replies')
+} finally { context.send = originalSend }
 assert.equal(first.webContents.reloaded, true)
 assert.equal(first.webContents.zoom, 1.25)
 await call('webview.visibility', { webviewId: 10, visible: false })
