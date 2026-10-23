@@ -871,9 +871,31 @@ function handle(method, params) {
     case 'window.minimize':
       findWindow(params.windowId).minimize()
       return null
-    case 'window.unminimize':
-      findWindow(params.windowId).restore()
-      return null
+    case 'window.unminimize': {
+      const window = findWindow(params.windowId)
+      if (process.platform !== 'darwin' || !window.isMinimized()) {
+        window.restore()
+        return null
+      }
+      // AppKit clears isMiniaturized before deminiaturization finishes. Wait
+      // for the native completion so a subsequent hide is not undone by it.
+      return new Promise((resolve, reject) => {
+        const finish = (error) => {
+          clearTimeout(timer)
+          window.removeListener('restore', restored)
+          window.removeListener('closed', closed)
+          if (error) reject(error)
+          else resolve(null)
+        }
+        const restored = () => finish()
+        const closed = () => finish(new Error('window closed during restore'))
+        const timer = setTimeout(() => finish(new Error('window restore timed out')), 10_000)
+        window.once('restore', restored)
+        window.once('closed', closed)
+        try { window.restore() }
+        catch (error) { finish(error) }
+      })
+    }
     case 'window.fullscreen':
       findWindow(params.windowId).setFullScreen(params.fullscreen)
       return null

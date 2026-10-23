@@ -99,7 +99,7 @@ const context = vm.createContext({
   } : name === 'node:fs' ? { appendFileSync() {} }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
-  Buffer, URL, console, __dirname: new URL('../electron', import.meta.url).pathname,
+  Buffer, URL, console, setTimeout, clearTimeout, __dirname: new URL('../electron', import.meta.url).pathname,
 })
 vm.runInContext(readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8'), context)
 const inspect = (expression) => vm.runInContext(expression, context)
@@ -283,6 +283,26 @@ await call('window.backgroundColor', { windowId: 2, color: '#123456' })
 await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
 assert.equal(main.getBackgroundColor(), '#123456')
 assert.throws(() => call('window.backgroundMaterial', { windowId: 2, material: 'blur' }), /invalid background material/)
+// AppKit can clear isMiniaturized before its restore animation completes. A
+// following hide must not be undone by that animation ordering the window in.
+context.process.platform = 'darwin'
+let finishRestore
+main.isMinimized = () => true
+main.restore = () => {
+  main.isMinimized = () => false
+  finishRestore = () => { main.visible = true; main.emit('restore') }
+}
+let restored = false
+const restoring = Promise.resolve(call('window.unminimize', { windowId: 2 })).then(() => { restored = true })
+await Promise.resolve()
+assert.equal(restored, false, 'unminimize must wait for the native restore event, not just isMinimized')
+finishRestore()
+await restoring
+assert.equal(main.listenerCount('restore'), 0)
+await call('window.hide', { windowId: 2 })
+assert.equal((await call('window.geometry', { windowId: 2 })).visible, false)
+await call('window.show', { windowId: 2 })
+assert.equal((await call('window.geometry', { windowId: 2 })).visible, true)
 context.process.platform = 'linux'
 assert.throws(() => call('window.backgroundMaterial', { windowId: 2, material: 'acrylic' }), /Windows 11 22H2/)
 context.process.platform = 'win32'
