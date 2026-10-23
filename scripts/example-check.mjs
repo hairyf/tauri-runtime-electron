@@ -2,7 +2,7 @@
 // Runs the original pages, asserts their own UI/IPC, and records unmodified
 // keyframes for visual review. A successful assertion is not a visual verdict.
 //   pnpm check helloworld state
-//   pnpm check                         # all official examples, sequentially
+//   pnpm check                         # all local and official examples, sequentially
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -10,6 +10,7 @@ import { createServer } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import apiChecks from './example-api-check.mjs'
+import transparentChecks from './example-transparent-check.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const artifacts = path.join(root, 'target', 'example-checks')
@@ -193,6 +194,7 @@ async function nativeWindows(test, titles, timeout = 15_000) {
 
 const checks = {
   api: (test) => apiChecks(test, { assert, click, fill, until, native, nativeWindow }),
+  transparent: (test) => transparentChecks(test, { assert, click, until, native, nativeWindow, nativeWindows }),
   'file-associations': async (test) => {
     if (process.platform === 'darwin') nativeBlocked('macOS open-file delivery requires an installed bundle and real open-file event')
     const page = await test.page()
@@ -686,9 +688,12 @@ async function check(name) {
   return report
 }
 
-const available = readdirSync(path.join(root, 'source/tauri/examples'), { withFileTypes: true })
-  .filter((entry) => entry.isDirectory() && (existsSync(path.join(root, 'source/tauri/examples', entry.name, 'main.rs')) || existsSync(path.join(root, 'source/tauri/examples', entry.name, 'src-tauri/Cargo.toml'))))
-  .map((entry) => entry.name)
+const available = [...new Set(['source/tauri/examples', 'example'].flatMap((directory) =>
+  existsSync(path.join(root, directory)) ? readdirSync(path.join(root, directory), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^[a-z][a-z0-9-]*$/.test(entry.name))
+    .filter((entry) => existsSync(path.join(root, directory, entry.name, 'main.rs')) || existsSync(path.join(root, directory, entry.name, 'src-tauri/Cargo.toml')))
+    .map((entry) => entry.name) : [],
+))]
 const requested = process.argv.slice(2)
 assert.ok(requested.every((name) => available.includes(name)), `unknown example; choose ${available.join(', ')}`)
 const results = []

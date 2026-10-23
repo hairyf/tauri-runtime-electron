@@ -962,9 +962,31 @@ function handle(method, params) {
       findWindow(params.windowId).setOverlayIcon(image, params.description || '')
       return null
     }
-    case 'window.backgroundColor':
-      findWindow(params.windowId).setBackgroundColor(params.color)
+    case 'window.backgroundColor': {
+      const window = findWindow(params.windowId)
+      window.setBackgroundColor(params.color)
+      if (window.__tauriMaterialBackground !== undefined) window.__tauriMaterialBackground = params.color
       return null
+    }
+    case 'window.backgroundMaterial': {
+      if (!['none', 'acrylic', 'mica', 'tabbed'].includes(params.material)) throw new Error('invalid background material')
+      if (process.platform !== 'win32' || Number(os.release().split('.')[2]) < 22621) {
+        throw new Error('Electron background materials require Windows 11 22H2 or later')
+      }
+      const window = findWindow(params.windowId)
+      // Electron resets the backing to white on 'none'. Preserve the configured
+      // color (including full transparency) across repeated enable/clear calls.
+      if (params.material !== 'none' && window.__tauriMaterialBackground === undefined) {
+        window.__tauriMaterialBackground = window.getBackgroundColor()
+      }
+      const background = window.__tauriMaterialBackground ?? window.getBackgroundColor()
+      window.setBackgroundMaterial(params.material)
+      if (params.material === 'none') {
+        window.setBackgroundColor(background)
+        delete window.__tauriMaterialBackground
+      }
+      return null
+    }
     case 'window.theme': {
       nativeTheme.themeSource = params.theme === 'dark' ? 'dark' : params.theme === 'light' ? 'light' : 'system'
       return null

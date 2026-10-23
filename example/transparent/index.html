@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Transparent Window</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="main.js" defer></script>
+  </head>
+  <body>
+    <main id="panel">
+      <header>
+        <span id="drag-region" data-tauri-drag-region>透明窗口 · 拖动这里移动</span>
+        <button id="minimize" type="button" aria-label="最小化窗口">−</button>
+        <button id="close" type="button" aria-label="关闭窗口">×</button>
+      </header>
+      <section>
+        <p class="eyebrow">TAURI × ELECTRON</p>
+        <h1>让桌面透进来</h1>
+        <p>窗口和页面底色保持透明，只调整内容面板的背景 alpha；文字与按钮不会一起变淡。</p>
+        <div class="controls">
+          <label class="toggle"><input id="transparency" type="checkbox" checked /> 启用透明面板</label>
+          <label for="opacity">面板不透明度 <output id="opacity-value" for="opacity">72%</output></label>
+          <input id="opacity" type="range" min="15" max="100" value="72" />
+          <label class="toggle"><input id="blur" type="checkbox" /> 背景模糊（Windows 11 Acrylic）</label>
+        </div>
+        <p class="note">关闭模糊时四周留白透明；开启后 Acrylic 作用于整个窗口。需要 Windows 11 22H2 及以上；系统辅助功能及透明效果设置可能限制原生效果。</p>
+        <p id="status" role="status">透明层已就绪</p>
+      </section>
+    </main>
+  </body>
+</html>

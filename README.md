@@ -126,24 +126,45 @@ the functional checker, then uploads logs, assertions and original keyframes as
 `example-checks-<platform>` artifacts. The other seven examples and native menu,
 tray, input and device checks need separate evidence. CI leaves visual review pending.
 
-### Running Tauri's official examples
+### Running examples
 
 Initialize the pinned sources with `git submodule update --init source/tauri source/electron`,
 then use Node.js 24+, pnpm and the Rust/system dependencies for the current desktop:
 
 ```bash
 pnpm example <name>
+pnpm example transparent
 pnpm example commands --prepare-only
 pnpm example file-associations -- /absolute/path/to/image.png
 pnpm check helloworld state
-pnpm check                    # attempt all 13 examples, sequentially
+pnpm check transparent
+pnpm check                    # attempt all 14 examples, sequentially
 ```
 
 `pnpm example` with no name lists `api`, `commands`, `drag`, `file-associations`,
 `helloworld`, `isolation`, `multiwebview`, `multiwindow`, `resources`, `run-return`,
-`splashscreen`, `state` and `streaming`. [The runner](scripts/example.mjs) copies
-[the Tauri sources](source/tauri) into `target/example/tauri`. Three examples already
-have Cargo projects: `api`, `file-associations` and `resources`. The other ten get
+`splashscreen`, `state`, `streaming` and the local `transparent` demo.
+
+[The transparent demo](example/transparent/index.html) uses a frameless transparent
+window, an explicit zero-alpha native background, transparent HTML/body and a separate
+panel background alpha, following the desktop shell's layer separation. Its controls
+adjust panel opacity (15–100%), toggle transparency/background blur, and minimize or
+close the window; the header is draggable. On Windows the blur toggle calls Tauri's
+native `setEffects`/`clearEffects` API with `Effect.Acrylic`. The generated Tauri copy
+forwards effects to Electron's `setBackgroundMaterial`, which also synchronizes Chromium's
+compositor; applying an accent policy to its HWND alone is insufficient. This requires
+Windows 11 22H2 or later. Clearing restores the original background instead of Electron's
+white default. Acrylic affects the entire window, including its margins, and
+OS version/accessibility/transparency settings can limit its appearance. Other platforms
+report native blur as unavailable in this demo. The window is
+fixed-size because transparent-window resizing is platform-dependent. The check records
+appearance and window-control assertions separately from desktop-compositing visual review;
+other compositors/platforms need their own validation.
+
+[The runner](scripts/example.mjs) discovers local demos under `example/` as well as
+official examples, copying the selected local source into the same generated workspace.
+It copies [the Tauri sources](source/tauri) into `target/example/tauri`. Three examples already
+have Cargo projects: `api`, `file-associations` and `resources`. The other eleven get
 generated manifests and build scripts. The copy selects `ElectronRuntime`, adds
 explicit runtime parameters and snippet dependencies, enables `unstable` for
 `multiwebview`, and repairs Windows drive-path parsing for file-association arguments.
@@ -178,7 +199,7 @@ Functional assertions and visual review are separate. The checker leaves
 `visualReview` as `pending`; review the original PNGs and record per-frame verdicts
 and notes in `visual-review.json` in the same directory. `assertions: passed` covers
 only the checks recorded for that run. `blocked` and `failed` are not passes, and the
-command exits nonzero for either. These commands do not establish that all 13
+command exits nonzero for either. These commands do not establish that all 14
 examples passed, or that each example has been validated on all three desktop OSes.
 
 ---

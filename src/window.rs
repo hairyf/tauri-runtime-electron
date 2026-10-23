@@ -30,6 +30,22 @@ pub struct ElectronWindowDispatcher {
 }
 
 impl ElectronWindowDispatcher {
+  /// Apply Windows backdrop materials through Electron, which also synchronizes
+  /// Chromium's compositor. Applying window-vibrancy to its HWND alone does not.
+  pub fn set_window_effects(&self, effects: Option<tauri_utils::config::WindowEffectsConfig>) -> Result<()> {
+    use tauri_utils::WindowEffect;
+    let material = match effects.as_ref().and_then(|config| config.effects.iter().find(|effect| matches!(
+      effect, WindowEffect::Acrylic | WindowEffect::Mica | WindowEffect::Tabbed
+    ))) {
+      Some(WindowEffect::Acrylic) => "acrylic",
+      Some(WindowEffect::Mica) => "mica",
+      Some(WindowEffect::Tabbed) => "tabbed",
+      _ if effects.as_ref().is_none_or(|config| config.effects.is_empty()) => "none",
+      _ => return Err(create_window_err("Electron background materials support Acrylic, Mica and Tabbed only".into())),
+    };
+    self.window_call("window.backgroundMaterial", json!({ "material": material }))
+  }
+
   fn window_call(&self, method: &str, params: Value) -> Result<()> {
     self.window_call_value(method, params).map(|_| ())
   }

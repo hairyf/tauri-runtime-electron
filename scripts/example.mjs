@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Run an official Tauri example on Electron without modifying the submodule.
+ * Run a local or official Tauri example on Electron without modifying the submodule.
  *
  *   pnpm example                         # list examples
  *   pnpm example commands
@@ -33,14 +33,12 @@ const extraDependencies = {
 }
 
 function examples() {
-  return readdirSync(path.join(tauri, 'examples'), { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && /^[a-z][a-z0-9-]*$/.test(entry.name))
-    .map((entry) => entry.name)
-    .filter((entry) => {
-      const source = path.join(tauri, 'examples', entry)
-      return existsSync(path.join(source, 'src-tauri', 'Cargo.toml')) || existsSync(path.join(source, 'main.rs'))
-    })
-    .sort()
+  return [...new Set([path.join(root, 'example'), path.join(tauri, 'examples')].flatMap((directory) =>
+    existsSync(directory) ? readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^[a-z][a-z0-9-]*$/.test(entry.name))
+      .filter((entry) => existsSync(path.join(directory, entry.name, 'src-tauri', 'Cargo.toml')) || existsSync(path.join(directory, entry.name, 'main.rs')))
+      .map((entry) => entry.name) : [],
+  ))].sort()
 }
 
 /** Keep file operations inside their expected tree; never follow a junction. */
@@ -59,7 +57,10 @@ function localPath(base, file) {
   return file
 }
 
-const source = path.join(tauri, 'examples', name ?? '')
+const validName = /^[a-z][a-z0-9-]*$/.test(name ?? '')
+const localSource = path.join(root, 'example', name ?? '')
+const local = validName && (existsSync(path.join(localSource, 'main.rs')) || existsSync(path.join(localSource, 'src-tauri/Cargo.toml')))
+const source = local ? localSource : path.join(tauri, 'examples', name ?? '')
 const full = /^[a-z][a-z0-9-]*$/.test(name ?? '') && existsSync(path.join(source, 'src-tauri', 'Cargo.toml'))
 const copy = path.join(root, 'target', 'example')
 const workspace = path.join(copy, 'tauri')
@@ -231,9 +232,39 @@ try {
       return true
     },
   })
+  if (local) {
+    cpSync(source, path.join(workspace, 'examples', name), {
+      recursive: true,
+      filter: (file) => {
+        if (lstatSync(file).isSymbolicLink()) throw new Error(`refusing source symlink/junction: ${file}`)
+        return !path.relative(source, file).split(path.sep).some((part) => ['node_modules', 'target'].includes(part))
+      },
+    })
+  }
 
   // Keep every non-Wry default (ACL, menus, compression, etc.), not default-features=false.
   patch(path.join(workspace, 'crates', 'tauri', 'Cargo.toml'), 'default = [\n  "wry",', 'default = [')
+  // Tauri applies effects directly to native handles, bypassing the runtime trait.
+  // Electron must synchronize its compositor too; adapt only the disposable copy.
+  patch(path.join(workspace, 'crates', 'tauri', 'Cargo.toml'), '[dependencies]',
+    `[dependencies]\ntauri-runtime-electron = { path = ${JSON.stringify(root.replaceAll('\\', '/'))} }`)
+  patch(path.join(workspace, 'crates', 'tauri', 'src', 'vibrancy', 'mod.rs'),
+    '  if let Some(_effects) = effects {', `  #[cfg(windows)]
+  if let Some(dispatcher) = (&window.window.dispatcher as &dyn std::any::Any)
+    .downcast_ref::<tauri_runtime_electron::ElectronWindowDispatcher>()
+  {
+    return dispatcher.set_window_effects(effects).map_err(Into::into);
+  }
+  if let Some(_effects) = effects {`)
+  patch(path.join(workspace, 'crates', 'tauri', 'src', 'window', 'mod.rs'),
+    `    self.run_on_main_thread(move || {
+      let _ = crate::vibrancy::set_window_effects(&window, effects);
+    })`, `    let (tx, rx) = std::sync::mpsc::channel();
+    self.run_on_main_thread(move || {
+      let _ = tx.send(crate::vibrancy::set_window_effects(&window, effects));
+    })?;
+    rx.recv().map_err(|_| crate::Error::FailedToReceiveMessage)?`)
+
   const originalConfig = path.join(source, ...(full ? ['src-tauri'] : []), 'tauri.conf.json')
   const config = JSON.parse(readFileSync(originalConfig, 'utf8'))
   if (full) {

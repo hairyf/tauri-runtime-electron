@@ -56,6 +56,9 @@ class Window extends EventEmitter {
     this.options = options
     this.content = { x: -200, y: 100, width: options.width, height: options.height }
   }
+  getBackgroundColor() { return this.color ?? this.options.backgroundColor ?? '#ffffff' }
+  setBackgroundColor(color) { this.color = color }
+  setBackgroundMaterial(material) { this.material = material; this.color = material === 'none' ? '#ffffff' : '#00000000' }
   getContentBounds() { return { ...this.content } }
   getBounds() { return { ...this.content, scale: this.scale } }
   isDestroyed() { return this.destroyed }
@@ -81,8 +84,9 @@ const context = vm.createContext({
     BrowserWindow: Window, WebContentsView: View,
     ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} },
     screen: { getDisplayMatching: (bounds) => ({ scaleFactor: bounds.scale }) },
-  } : name === 'node:fs' ? { appendFileSync() {} } : require(name),
-  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {} },
+  } : name === 'node:fs' ? { appendFileSync() {} }
+    : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
+  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
   Buffer, URL, console, __dirname: new URL('../electron', import.meta.url).pathname,
 })
 vm.runInContext(readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8'), context)
@@ -211,6 +215,26 @@ assert.equal(await call('webview.eval', { webviewId: 20, script: 'main-script' }
 await call('window.cursor', { windowId: 2, cursor: 'crosshair' })
 assert.equal(main.webContents.script, 'document.documentElement.style.cursor = "crosshair"')
 assert.equal(first.webContents.script, 'document.documentElement.style.cursor = "default"', 'cursor changes stay within their owning window')
+// Exercise the production effects RPC: clearing must not leave Electron's white
+// backing, and a new color during an effect becomes the next restored backing.
+await call('window.backgroundColor', { windowId: 2, color: '#00000000' })
+await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
+assert.equal(main.getBackgroundColor(), '#00000000')
+for (const material of ['acrylic', 'mica', 'tabbed']) {
+  await call('window.backgroundMaterial', { windowId: 2, material })
+  assert.equal(main.material, material)
+  assert.equal(main.getBackgroundColor(), '#00000000')
+}
+await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
+assert.equal(main.getBackgroundColor(), '#00000000')
+await call('window.backgroundMaterial', { windowId: 2, material: 'acrylic' })
+await call('window.backgroundColor', { windowId: 2, color: '#123456' })
+await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
+assert.equal(main.getBackgroundColor(), '#123456')
+assert.throws(() => call('window.backgroundMaterial', { windowId: 2, material: 'blur' }), /invalid background material/)
+context.process.platform = 'linux'
+assert.throws(() => call('window.backgroundMaterial', { windowId: 2, material: 'acrylic' }), /Windows 11 22H2/)
+context.process.platform = 'win32'
 await call('webview.visibility', { webviewId: 20, visible: false })
 assert.equal(main.visible, false)
 await call('webview.close', { webviewId: 20 })
