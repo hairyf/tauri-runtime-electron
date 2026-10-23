@@ -32,6 +32,10 @@ function log(...args) {
   fs.appendFileSync(logFile, `${new Date().toISOString()} ${args.join(' ')}\n`)
 }
 
+function trace(...args) {
+  if (process.env.TAURI_RUNTIME_ELECTRON_TRACE === '1') console.error('[electron trace]', new Date().toISOString(), ...args)
+}
+
 const openingDevtools = new WeakMap()
 
 function openDevtools(contents) {
@@ -40,6 +44,7 @@ function openDevtools(contents) {
   // Visibility can become true before the frontend finishes loading. Electron
   // exposes devToolsWebContents only after its devtools-opened lifecycle step.
   if (contents.devToolsWebContents) return null
+  const contentsId = contents.id
   let finish
   const opening = new Promise((resolve, reject) => {
     finish = (error) => {
@@ -48,6 +53,7 @@ function openDevtools(contents) {
       contents.removeListener('devtools-closed', closed)
       contents.removeListener('destroyed', destroyed)
       openingDevtools.delete(contents)
+      trace('devtools.open.finished', contentsId, error ? serializeError(error) : 'ready')
       if (error) reject(error)
       else resolve(null)
     }
@@ -60,8 +66,11 @@ function openDevtools(contents) {
     contents.once('destroyed', destroyed)
   })
   openingDevtools.set(contents, opening)
-  try { contents.openDevTools({ mode: 'detach' }) }
-  catch (error) { finish(error) }
+  try {
+    trace('devtools.open.enter', contents.id)
+    contents.openDevTools({ mode: 'detach' })
+    trace('devtools.open.return', contents.id)
+  } catch (error) { finish(error) }
   return opening
 }
 
@@ -1031,9 +1040,13 @@ function handle(method, params) {
       return contentsFor(params.webviewId).navigationHistory.canGoForward()
     case 'webview.openDevtools':
       return openDevtools(contentsFor(params.webviewId))
-    case 'webview.closeDevtools':
-      contentsFor(params.webviewId).closeDevTools()
+    case 'webview.closeDevtools': {
+      const contents = contentsFor(params.webviewId)
+      trace('devtools.close.enter', contents.id)
+      contents.closeDevTools()
+      trace('devtools.close.return', contents.id)
       return null
+    }
     case 'webview.isDevtoolsOpen':
       return contentsFor(params.webviewId).isDevToolsOpened()
     case 'webview.setZoom':
@@ -1299,9 +1312,12 @@ async function onLine(line) {
   try {
     // Native lifecycle calls may reenter Node; start them in the socket callback,
     // rather than in a Promise microtask. Await only their result.
+    trace('rpc.enter', message.id, message.method)
     const result = await handle(message.method, message.params ?? {})
+    trace('rpc.return', message.id, message.method)
     send({ id: message.id, result: result ?? null })
   } catch (error) {
+    trace('rpc.error', message.id, message.method, serializeError(error))
     log('error', message.method, serializeError(error))
     send({ id: message.id, error: serializeError(error) })
   }
@@ -1356,6 +1372,15 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(null)
   // Covers the window's own contents and every `<webview>` guest created later.
   app.on('web-contents-created', (_event, contents) => {
+    if (process.env.TAURI_RUNTIME_ELECTRON_TRACE === '1') {
+      const id = contents.id
+      trace('contents.created', id, contents.getType())
+      for (const event of ['did-start-loading', 'did-stop-loading', 'dom-ready', 'did-finish-load', 'devtools-opened', 'devtools-closed', 'destroyed']) {
+        contents.on(event, () => trace('contents.event', id, event))
+      }
+      contents.on('did-fail-load', (_event, code, description, url) => trace('contents.load.failed', id, code, description, url))
+      contents.on('render-process-gone', (_event, details) => trace('contents.process.gone', id, JSON.stringify(details)))
+    }
     installDevtoolsShortcut(contents)
     installContextMenu(contents)
   })
@@ -1370,8 +1395,11 @@ app.whenReady().then(async () => {
     buffer += chunk
     let index = buffer.indexOf('\n')
     while (index !== -1) {
-      onLine(buffer.slice(0, index))
+      const line = buffer.slice(0, index)
+      // Native handlers can pump the event loop: consume before dispatch so a
+      // nested socket callback never sees and executes this same request again.
       buffer = buffer.slice(index + 1)
+      onLine(line)
       index = buffer.indexOf('\n')
     }
   })

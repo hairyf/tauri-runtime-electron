@@ -57,6 +57,9 @@ jobs:
       - name: Check library window API and effects queue
         run: node scripts/window-api-check.mjs
 
+      - name: Check native evidence failure diagnostics
+        run: node scripts/example-evidence-check.mjs
+
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -114,12 +117,16 @@ jobs:
 
       - name: Test
         if: runner.os != 'Linux'
+        env:
+          TAURI_RUNTIME_ELECTRON_TRACE: '1'
         run: cargo test -- --nocapture
 
       # Maximizing and resizing are window-manager operations, and a bare X
       # server has none, so openbox runs inside the virtual display.
       - name: Test under a virtual display
         if: runner.os == 'Linux'
+        env:
+          TAURI_RUNTIME_ELECTRON_TRACE: '1'
         run: >
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
           sh -c 'openbox & sleep 1; cargo test -- --nocapture'

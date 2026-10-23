@@ -5,7 +5,7 @@
 //   pnpm check                         # all local and official examples, sequentially
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -129,6 +129,7 @@ async function native(test, action, options = {}) {
   const args = Object.entries({ Action: action, RepositoryPath: root, ...options })
     .map(([key, value]) => typeof value === 'boolean' ? (value ? `-${key}` : '') : `-${key} ${literal(value)}`).join(' ')
   const lookup = test.nativePid ? `$ownerId = ${test.nativePid}` : `
+    [Console]::Error.WriteLine('[native-phase] owner lookup start')
     $rows = @(Get-CimInstance Win32_Process)
     $parents = @{}
     foreach ($row in $rows) { $parents[[int] $row.ProcessId] = [int] $row.ParentProcessId }
@@ -142,6 +143,7 @@ async function native(test, action, options = {}) {
         $ancestor = [int] $parents[$ancestor]
       }
     })
+    [Console]::Error.WriteLine('[native-phase] owner lookup done')
     if ($owners.Count -eq 0) { '{"ok":true,"windows":[]}'; exit 0 }
     if ($owners.Count -ne 1) { throw 'Ambiguous Electron descendants of this runner' }
     $ownerId = [int] $owners[0].ProcessId
@@ -151,18 +153,27 @@ async function native(test, action, options = {}) {
     const child = spawn('pwsh', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
-    const timer = setTimeout(() => { child.kill(); reject(new Error('native helper timed out')) }, 20_000)
+    const failure = (message) => {
+      const phase = [...stderr.matchAll(/^\[native-phase\] (.+)$/gm)].at(-1)?.[1] ?? 'pwsh startup'
+      return Object.assign(new Error(`${action}: ${message}; last phase: ${phase}; stderr: ${stderr.trim() || '(empty)'}; stdout: ${stdout.trim() || '(empty)'}`), { stderr, raw: stdout, phase })
+    }
+    const timer = setTimeout(() => { child.kill(); reject(failure('native helper timed out after 60000ms')) }, 60_000)
     child.stdout.on('data', (data) => { stdout += data })
     child.stderr.on('data', (data) => { stderr += data })
-    child.on('error', (error) => { clearTimeout(timer); reject(error) })
+    child.on('error', (error) => { clearTimeout(timer); reject(failure(error.message)) })
     child.on('close', (code) => {
       clearTimeout(timer)
       try {
         const value = JSON.parse(stdout.trim().replace(/^\uFEFF/, ''))
         resolve({ value, exitCode: code, stderr, raw: stdout })
-      } catch (error) { reject(new Error(`${action}: ${error.message}${stderr ? `; ${stderr.trim()}` : ''}`)) }
+      } catch (error) { reject(failure(error.message)) }
     })
-  }).catch((error) => nativeBlocked(error.message))
+  }).catch((error) => {
+    test.nativeObservations ??= []
+    test.nativeObservations.push({ observedAt: new Date().toISOString(), action, ok: false, error: error.message, phase: error.phase, stderr: error.stderr, raw: error.raw })
+    writeFileSync(path.join(test.directory, 'native-observations.json'), `${JSON.stringify(test.nativeObservations, null, 2)}\n`)
+    nativeBlocked(error.message)
+  })
   if (value.windows?.length) {
     const owners = new Set(value.windows.map((window) => window.pid))
     assert.equal(owners.size, 1, 'native windows must share the runner-owned Electron PID')
@@ -587,6 +598,13 @@ async function freePort() {
 async function check(name) {
   const directory = path.join(artifacts, name)
   mkdirSync(directory, { recursive: true })
+  assert.equal(path.dirname(path.resolve(directory)), path.resolve(root, 'target/example-checks'), 'evidence cleanup must stay inside target/example-checks')
+  assert.equal(realpathSync(directory), path.resolve(directory), 'evidence cleanup must not follow a redirected directory')
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.isFile() && (entry.name.endsWith('.png') || ['native-observations.json', 'result.json', 'run.log'].includes(entry.name))) {
+      rmSync(path.join(directory, entry.name))
+    }
+  }
   const log = path.join(directory, 'run.log')
   const output = openSync(log, 'w')
   const port = await freePort()

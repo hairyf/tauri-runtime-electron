@@ -9,6 +9,10 @@ import vm from 'node:vm'
 
 const require = createRequire(import.meta.url)
 let nextId = 0
+let ready
+const transport = new EventEmitter()
+transport.setEncoding = () => {}
+transport.write = () => {}
 const allContents = []
 class Contents extends EventEmitter {
   id = ++nextId
@@ -81,7 +85,9 @@ class Window extends EventEmitter {
 }
 const context = vm.createContext({
   require: (name) => name === 'electron' ? {
-    app: { on() {}, whenReady: () => new Promise(() => {}) },
+    app: { on() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
+    Menu: { setApplicationMenu() {} },
+    session: { defaultSession: { on() {}, setPermissionRequestHandler() {}, webRequest: { onCompleted() {}, onErrorOccurred() {}, onBeforeRequest() {} } } },
     BrowserWindow: Window, WebContentsView: View,
     ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} },
     screen: {
@@ -96,7 +102,8 @@ const context = vm.createContext({
         width: rect.width * 2, height: rect.height * 2,
       }),
     },
-  } : name === 'node:fs' ? { appendFileSync() {} }
+  } : name === 'node:net' ? { connect: () => transport }
+    : name === 'node:fs' ? { appendFileSync() {} }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
   Buffer, URL, console, setTimeout, clearTimeout, __dirname: new URL('../electron', import.meta.url).pathname,
@@ -253,6 +260,22 @@ try {
   await context.onLine('invalid JSON')
   await context.onLine(JSON.stringify({ method: 'webview.closeDevtools' }))
   assert.equal(replies.length, 0, 'invalid requests produce no uncorrelated replies')
+  // A native close can pump the event loop and deliver more socket data before
+  // returning. Each line must be consumed before dispatch, exactly once.
+  ready()
+  await Promise.resolve()
+  const nativeClose = first.webContents.closeDevTools
+  let closeCalls = 0
+  first.webContents.closeDevTools = () => {
+    closeCalls++
+    if (closeCalls === 1) transport.emit('data', `${JSON.stringify({ id: 7, method: 'webview.isDevtoolsOpen', params: { webviewId: 10 } })}\n`)
+  }
+  try {
+    transport.emit('data', `${JSON.stringify({ id: 6, method: 'webview.closeDevtools', params: { webviewId: 10 } })}\n`)
+    await Promise.resolve()
+    assert.equal(closeCalls, 1, 'reentrant native calls must not redispatch the current line')
+    assert.deepEqual(replies.map((reply) => reply.id).sort(), [6, 7], 'each request receives exactly one reply')
+  } finally { first.webContents.closeDevTools = nativeClose }
 } finally { context.send = originalSend }
 assert.equal(first.webContents.reloaded, true)
 assert.equal(first.webContents.zoom, 1.25)

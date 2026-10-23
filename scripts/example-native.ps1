@@ -82,6 +82,7 @@ try {
     throw 'RepositoryPath must identify the tauri-runtime-electron repository, not a broad parent directory.'
   }
 
+  [Console]::Error.WriteLine('[native-phase] Add-Type start')
   Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -139,6 +140,7 @@ public static class ExampleNative {
   }
 }
 '@
+  [Console]::Error.WriteLine('[native-phase] Add-Type done')
 
   if ($Action -eq 'SelfTest') {
     @{ ok = $true; action = $Action; checks = 7; interopCompiled = $true; nativeInput = $false } | ConvertTo-Json -Compress
@@ -221,7 +223,9 @@ public static class ExampleNative {
   if ($oldDpi -eq [IntPtr]::Zero) { throw 'Cannot enable per-monitor physical coordinates (requires Windows 10+).' }
   try {
     $processes = @{}
+    [Console]::Error.WriteLine('[native-phase] repository CIM start')
     Get-CimInstance Win32_Process | ForEach-Object { $processes[[int] $_.ProcessId] = $_ }
+    [Console]::Error.WriteLine('[native-phase] repository CIM done')
     if ($ProcessId -ne 0 -and (-not $processes.ContainsKey($ProcessId) -or -not (Test-RepoProcess $processes[$ProcessId] $processes $repo))) {
       throw 'ProcessId is not a live process belonging to this repository.'
     }
@@ -231,6 +235,7 @@ public static class ExampleNative {
       if ($value -le 0) { throw 'WindowHandle must be a positive decimal or hexadecimal HWND.' }
       $requestedHandle = [IntPtr]::new($value)
     }
+    [Console]::Error.WriteLine('[native-phase] window enumeration start')
     $windows = @([ExampleNative]::Windows() | ForEach-Object {
       $candidate = $_
       [uint32] $ownerId = 0
@@ -243,8 +248,10 @@ public static class ExampleNative {
       if (-not (Test-RepoProcess $record $processes $repo) -or ($Title -and $caption -cne $Title)) { return }
       Get-WindowInfo $candidate ([int] $ownerId)
     })
+    [Console]::Error.WriteLine('[native-phase] window enumeration done')
     if ($Action -eq 'List') {
       @{ ok = $true; action = $Action; windows = $windows } | ConvertTo-Json -Depth 8 -Compress
+      [Console]::Error.WriteLine('[native-phase] List done')
       exit 0
     }
     if ($windows.Count -ne 1) { throw "Expected one repo-scoped window, found $($windows.Count). Use List, then an exact WindowHandle (and optionally ProcessId/Title)." }
