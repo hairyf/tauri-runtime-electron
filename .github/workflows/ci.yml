@@ -39,8 +39,8 @@ jobs:
       # No package install, source submodules, Electron process or GUI is needed.
       - name: Check Electron script syntax
         run: |
-          node --check electron/main.cjs
-          node --check electron/preload.cjs
+          node --check electron-rs/assets/main.cjs
+          node --check electron-rs/assets/preload.cjs
 
       - name: Check protocols and authenticated IPC
         run: node scripts/protocol-check.mjs
@@ -103,6 +103,9 @@ jobs:
       # steps below also prove that acquisition works on every target.
       - name: Check
         run: cargo check --locked --all-targets --all-features
+
+      - name: Test independent Electron glue
+        run: cargo test --manifest-path electron-rs/Cargo.toml --locked
 
       # The smoke test opens a real Electron window and checks its named desktop
       # subset, reporting platform skips. Official-example GUI checks are separate.

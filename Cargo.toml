@@ -13,10 +13,24 @@ publish = false
 # Only applications using the library-owned window API need Tauri itself.
 tauri = ["dep:tauri"]
 
+[build-dependencies]
+electron-rs = { path = "electron-rs" }
+json-patch = { version = "4", default-features = false }
+serde_json = "1"
+tauri-utils = { version = "2.10", features = ["config-json5", "config-toml"] }
+
+[dev-dependencies]
+json-patch = { version = "4", default-features = false }
+
+[[test]]
+name = "build_config"
+path = "build_support.rs"
+
 [dependencies]
 tauri = { version = "2", default-features = false, features = ["unstable"], optional = true }
 tauri-runtime = "2.12"
 tauri-utils = { version = "2.10", features = ["resources"] }
+electron-rs = { path = "electron-rs" }
 http = "1"
 cookie = "0.18"
 base64 = "0.22"

@@ -53,7 +53,7 @@ const context = vm.createContext({
   clearTimeout: (timer) => timers.delete(timer),
   testSocket: { write: (line) => messages.push(JSON.parse(line)) },
 })
-vm.runInContext(`${fs.readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8')}
+vm.runInContext(`${fs.readFileSync(new URL('../electron-rs/assets/main.cjs', import.meta.url), 'utf8')}
 ;socket = testSocket; installPolicyHandlers();
 webviewByContents.set(7, 70); handlerPolicy.set(70, { download: true });`, context)
 const inspect = (expression) => vm.runInContext(expression, context)

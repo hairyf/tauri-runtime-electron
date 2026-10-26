@@ -1,106 +1,60 @@
-//! Stages an Electron runtime for the current target so `cargo run` works
-//! without a Node toolchain.
-//!
-//! Resolution order and download behaviour live in `src/acquisition_shared.rs`
-//! (the same file the runtime uses), so a build never disagrees with a launch.
-//! The staged copy lands in `target/electron/<platform>-<arch>` and is exported
-//! as `TAURI_RUNTIME_ELECTRON_ELECTRON_DIR` / `_BINARY` for the runtime.
-//!
-//! Failures only warn: a build without network still links, and the runtime
-//! downloads Electron on first launch instead.
+//! Acquire and brand Electron at build time; launching only reads packaged files.
 
-include!("src/acquisition_shared.rs");
+mod build_support;
+
+use std::{env, path::PathBuf};
+use tauri_utils::platform::Target;
 
 fn main() {
-  println!("cargo:rerun-if-changed=build.rs");
-  println!("cargo:rerun-if-changed=src/acquisition_shared.rs");
-  println!("cargo:rerun-if-changed=electron/main.cjs");
-  println!("cargo:rerun-if-changed=electron/preload.cjs");
-  println!("cargo:rerun-if-env-changed=TAURI_RUNTIME_ELECTRON_ELECTRON_DIR");
-  println!("cargo:rerun-if-env-changed=TAURI_RUNTIME_ELECTRON_DOWNLOAD");
-  println!("cargo:rerun-if-env-changed=ELECTRON_MIRROR");
-  println!("cargo:rerun-if-env-changed=ELECTRON_CUSTOM_DIR");
-  println!("cargo:rerun-if-env-changed=ELECTRON_CACHE");
-
-  if env::var("TAURI_RUNTIME_ELECTRON_DOWNLOAD").is_ok_and(|value| value == "0") {
-    return;
-  }
-
-  let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-  let searched = [manifest.clone(), env::current_dir().unwrap_or_default()];
-  let source = match explicit_dir()
-    .or_else(|| searched.iter().find_map(|dir| local_install(dir)))
-    .or_else(cached_dist)
-  {
-    Some(path) => path,
-    None => match download() {
-      Ok(path) => path,
-      Err(error) => {
-        println!("cargo:warning=electron download skipped: {error}");
-        return;
-      }
-    },
-  };
-
-  match stage(&source) {
-    Ok(staged) => {
-      println!(
-        "cargo:rustc-env=TAURI_RUNTIME_ELECTRON_ELECTRON_DIR={}",
-        staged.display()
-      );
-      let binary = staged.join(executable());
-      println!(
-        "cargo:rustc-env=TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY={}",
-        binary.display()
-      );
-      // Re-stage when someone deletes or moves the runtime, like cef-dll-sys does.
-      println!("cargo:rerun-if-changed={}", staged.display());
-    }
-    Err(error) => println!("cargo:warning=could not stage electron: {error}"),
+  if let Err(error) = prepare() {
+    panic!("Electron build failed: {error}");
   }
 }
 
-
-/// Copies `source` into `$CARGO_TARGET_DIR/electron/<platform>-<arch>` (once per
-/// version) and returns that path.
-fn stage(source: &Path) -> Result<PathBuf, String> {
-  let target = target_dir()?
-    .join("electron")
-    .join(format!("{}-{}", platform(), arch()));
-  let marker = target.join(format!(".version-{VERSION}"));
-  if !marker.exists() {
-    let _ = fs::remove_dir_all(&target);
-    copy_dir(source, &target)?;
+fn prepare() -> Result<(), String> {
+  for path in ["build_support.rs", "electron-rs/assets/main.cjs", "electron-rs/assets/preload.cjs"] {
+    println!("cargo:rerun-if-changed={path}");
   }
-  // The main-process scripts change far more often than the distribution, so
-  // they are refreshed on every build instead of only with a fresh stage.
-  let scripts = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("electron");
-  for name in ["main.cjs", "preload.cjs"] {
-    let from = scripts.join(name);
-    if from.exists() {
-      fs::copy(&from, target.join(name))
-        .map_err(|error| format!("{}: {error}", from.display()))?;
+  for key in ["CARGO_TARGET_DIR", "INIT_CWD", "PWD", "TAURI_CONFIG"] {
+    println!("cargo:rerun-if-env-changed={key}");
+  }
+  let target_root = target_dir()?;
+  let triple = env::var("TARGET").map_err(|error| error.to_string())?;
+  let target = Target::from_triple(&triple);
+  let app = build_support::discover(&target_root, target)?;
+  let mut metadata = electron_rs::Metadata::default();
+  if let Some(app) = app {
+    for input in &app.inputs {
+      println!("cargo:rerun-if-changed={}", input.display());
+    }
+    if let Some(icon) = &app.icon {
+      println!("cargo:rerun-if-changed={}", icon.display());
+    }
+    println!("cargo:rustc-env=ELECTRON_RS_TAURI_PRODUCT_NAME={}", app.name);
+    if let Some(identifier) = &app.identifier {
+      println!("cargo:rustc-env=ELECTRON_RS_TAURI_IDENTIFIER={identifier}");
+    }
+    metadata.app_name = Some(app.name);
+    if matches!(target, Target::Windows | Target::MacOS) {
+      metadata.identifier = app.identifier;
+      metadata.icon = app.icon;
     }
   }
-  fs::write(marker, VERSION).map_err(|error| format!("{}: {error}", target.display()))?;
-  Ok(target)
+  let directory = target_root.join("electron").join(format!("{}-{}", electron_rs::platform(), electron_rs::arch()));
+  let builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION)
+    .output(&directory).metadata(metadata);
+  builder.build()?;
+  println!("cargo:rustc-env=ELECTRON_RS_STAGED_BINARY={}", builder.binary()?.display());
+  Ok(())
 }
 
-/// `$CARGO_TARGET_DIR`, else the profile directory above `OUT_DIR`.
 fn target_dir() -> Result<PathBuf, String> {
-  if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
-    return Ok(PathBuf::from(dir));
+  // OUT_DIR belongs to the consuming Cargo build, unlike this dependency's cwd.
+  let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("no Cargo OUT_DIR")?);
+  let profile = out.ancestors().nth(3).ok_or("unexpected Cargo OUT_DIR layout")?;
+  let mut target = profile.parent().ok_or("Cargo profile has no target directory")?;
+  if target.file_name().is_some_and(|name| env::var_os("TARGET").as_deref() == Some(name)) {
+    target = target.parent().ok_or("Cargo target triple has no parent directory")?;
   }
-  let out = PathBuf::from(env::var("OUT_DIR").map_err(|_| "no OUT_DIR")?);
-  out
-    .ancestors()
-    .find(|dir| {
-      dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "debug" || name == "release")
-    })
-    .and_then(Path::parent)
-    .map(Path::to_path_buf)
-    .ok_or_else(|| format!("could not locate the target directory above {}", out.display()))
+  Ok(target.to_path_buf())
 }

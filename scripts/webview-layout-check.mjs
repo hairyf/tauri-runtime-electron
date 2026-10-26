@@ -106,9 +106,9 @@ const context = vm.createContext({
     : name === 'node:fs' ? { appendFileSync() {} }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
-  Buffer, URL, console, setTimeout, clearTimeout, setImmediate, __dirname: new URL('../electron', import.meta.url).pathname,
+  Buffer, URL, console, setTimeout, clearTimeout, setImmediate, __dirname: new URL('../electron-rs/assets', import.meta.url).pathname,
 })
-vm.runInContext(readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8'), context)
+vm.runInContext(readFileSync(new URL('../electron-rs/assets/main.cjs', import.meta.url), 'utf8'), context)
 const inspect = (expression) => vm.runInContext(expression, context)
 const plain = (value) => JSON.parse(JSON.stringify(value))
 const call = (method, params) => context.handle(method, params)

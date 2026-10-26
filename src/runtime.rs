@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-  electron_impl::ipc::Ipc, environment, environment::DebugEnvironment, locale, platform, switches,
+  environment, environment::DebugEnvironment, locale, platform, switches,
   webview::ElectronWebviewDispatcher, window::ElectronWindowDispatcher,
   window_handle::ElectronRuntimeHandle,
 };
+use electron_rs::Electron as ElectronProcess;
 use serde_json::{json, Value};
 use tauri_runtime::{
   DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
@@ -26,10 +27,15 @@ use tauri_utils::Theme;
 /// The `tauri-runtime` handler aliases are private in the 2.x line, so these
 /// restate the same signatures locally.
 type DownloadHandler = dyn Fn(DownloadEvent<'_>) -> bool + Send + Sync;
+type IpcHandler = dyn Fn(Request<String>) + Send;
+type NavigationHandler = dyn Fn(&url::Url) -> bool + Send;
+type WebviewEventHandler = dyn Fn(&tauri_runtime::window::WebviewEvent) + Send;
+type WindowEventHandler = dyn Fn(&WindowEvent) + Send;
+type UriSchemeProtocolResponder = dyn FnOnce(Response<std::borrow::Cow<'static, [u8]>>) + Send;
 type UriSchemeProtocolHandler = dyn Fn(
     &str,
     http::Request<Vec<u8>>,
-    Box<dyn FnOnce(http::Response<std::borrow::Cow<'static, [u8]>>) + Send>,
+    Box<UriSchemeProtocolResponder>,
   ) + Send
   + Sync;
 
@@ -151,6 +157,7 @@ pub(crate) fn rect_size(rect: &Value) -> PhysicalSize<u32> {
 }
 
 type ShortcutMap = HashMap<String, Box<dyn Fn() + Send + 'static>>;
+type ProtocolHandlerMap = HashMap<(String, Option<u32>), (String, Rc<UriSchemeProtocolHandler>)>;
 
 pub(crate) enum Message {
   Task(Box<dyn FnOnce() + Send>),
@@ -166,7 +173,7 @@ struct Webview {
   /// Label Tauri gave the webview (`navigate` keeps its origin in sync).
   label: String,
   /// Handlers registered by Tauri to observe this webview's events.
-  handlers: Vec<(tauri_runtime::WebviewEventId, Rc<dyn Fn(&tauri_runtime::window::WebviewEvent) + Send>)>,
+  handlers: Vec<(tauri_runtime::WebviewEventId, Rc<WebviewEventHandler>)>,
 }
 
 struct Window {
@@ -175,7 +182,7 @@ struct Window {
   serial: u32,
   webviews: Vec<Webview>,
   /// Handlers registered by Tauri to observe this window's events.
-  handlers: Vec<(WindowEventId, Rc<dyn Fn(&WindowEvent) + Send>)>,
+  handlers: Vec<(WindowEventId, Rc<WindowEventHandler>)>,
 }
 
 #[derive(Clone)]
@@ -191,7 +198,7 @@ pub struct RuntimeContext {
   next_window_event_id: Arc<AtomicU32>,
   next_webview_event_id: Arc<AtomicU32>,
   /// Connection to the Electron main process.
-  pub(crate) ipc: Arc<Ipc>,
+  pub(crate) ipc: Arc<ElectronProcess>,
   /// When set, `tauri://localhost` URLs are rewritten to this origin (dev server).
   dev_url: Option<String>,
   /// Window icon forwarded to Electron on `window.create`.
@@ -201,12 +208,12 @@ pub struct RuntimeContext {
   ///
   /// The handler is closed over the [`DetachedWebview`] it belongs to, so the
   /// map does not need to know the runtime's generic parameters.
-  ipc_handlers: Rc<RefCell<HashMap<u32, Rc<dyn Fn(Request<String>) + Send>>>>,
+  ipc_handlers: Rc<RefCell<HashMap<u32, Rc<IpcHandler>>>>,
   /// Tauri's page-load, title and new-window callbacks, by webview serial.
   webview_handlers: Rc<RefCell<HashMap<u32, WebviewHandlers>>>,
   /// Custom protocols registered by Tauri, served through Electron's
   /// `protocol.handle`.
-  protocol_handlers: Rc<RefCell<HashMap<(String, Option<u32>), (String, Rc<UriSchemeProtocolHandler>)>>>,
+  protocol_handlers: Rc<RefCell<ProtocolHandlerMap>>,
   /// Page origin per webview label, injected as the `Origin` header on
   /// custom-protocol requests (Electron reports the request URL instead).
   webview_origins: Rc<RefCell<HashMap<String, String>>>,
@@ -364,7 +371,7 @@ impl RuntimeContext {
     &self,
     window_id: WindowId,
     event_id: WindowEventId,
-    handler: Rc<dyn Fn(&WindowEvent) + Send>,
+    handler: Rc<WindowEventHandler>,
   ) {
     if let Some(window) = self.windows.borrow_mut().get_mut(&window_id) {
       window.handlers.push((event_id, handler));
@@ -375,7 +382,7 @@ impl RuntimeContext {
     &self,
     serial: u32,
     event_id: tauri_runtime::WebviewEventId,
-    handler: Rc<dyn Fn(&tauri_runtime::window::WebviewEvent) + Send>,
+    handler: Rc<WebviewEventHandler>,
   ) {
     for window in self.windows.borrow_mut().values_mut() {
       if let Some(webview) = window
@@ -446,7 +453,7 @@ pub struct ElectronRuntime {
 
 impl ElectronRuntime {
   fn init(
-    ipc: Arc<Ipc>,
+    ipc: Arc<ElectronProcess>,
     event_rx: Receiver<Value>,
     dev_url: Option<String>,
     icon: Option<PathBuf>,
@@ -484,24 +491,8 @@ impl ElectronRuntime {
 
   fn start(attrs: Electron, custom_schemes: &[&str]) -> Result<Self> {
     crate::platform::dpi::enable_per_monitor_v2();
-    let binary = attrs.resolve_binary();
-    // Task Manager and Explorer name and icon a process after its executable,
-    // so the Electron binary borrows the application's resources.
-    if let Ok(app_exe) = std::env::current_exe() {
-      crate::branding::apply(&binary, &app_exe);
-    }
-    let main_script = attrs.resolve_main_script(&binary);
-    if !main_script.exists() {
-      return Err(create_window_err(format!(
-        "Electron main script not found at {}; configure it with Electron::default().main_script(..)",
-        main_script.display()
-      )));
-    }
-    eprintln!(
-      "[electron] launching {} {}",
-      binary.display(),
-      main_script.display()
-    );
+    let binary = attrs.resolve_binary().map_err(create_window_err)?;
+    eprintln!("[electron] launching {}", binary.display());
     let mut args = extra_args(&attrs.args);
     switches::warn_about_dangerous_switches(&args);
     // Chromium reads its diagnostic environment variables before any embedder
@@ -527,17 +518,17 @@ impl ElectronRuntime {
     }
     args.push("--tauri-schemes".to_string());
     args.push(schemes.join(","));
-    if let Some(identifier) = &attrs.identifier {
+    if let Some(identifier) = attrs.identifier.as_deref().or(option_env!("ELECTRON_RS_TAURI_IDENTIFIER")) {
       args.push("--tauri-identifier".to_string());
-      args.push(identifier.clone());
+      args.push(identifier.to_string());
     }
-    let (ipc, event_rx) = Ipc::launch(
+    let ipc = ElectronProcess::with_args(
       &binary,
-      &main_script,
+      0,
       &args,
       attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
-    )
-    .map_err(create_window_err)?;
+    ).map_err(create_window_err)?;
+    let event_rx = ipc.events().map_err(create_window_err)?;
     let icon = attrs.resolve_icon().or_else(|| {
       // A packaged app has no icon file beside it: the bundler embedded the
       // icon in the executable, so copy it back out for Electron.
@@ -549,12 +540,12 @@ impl ElectronRuntime {
   }
 }
 
-/// Selects the [`ElectronRuntime`], e.g.
-/// `tauri::Builder::default().runtime(Electron::default())`.
+/// Startup options for [`ElectronRuntime`].
+///
+/// Select the runtime with `tauri::Builder::<ElectronRuntime>::new()`.
 #[derive(Debug, Clone, Default)]
 pub struct Electron {
   binary: Option<PathBuf>,
-  main_script: Option<PathBuf>,
   args: Vec<String>,
   /// Dev server origin; `tauri://localhost` URLs are rewritten to it.
   dev_url: Option<String>,
@@ -572,32 +563,17 @@ impl Electron {
     Self::default()
   }
 
-  /// Reads the knobs the build supplies as environment variables.
-  ///
-  /// Tauri 2 has no runtime init attributes, so this is how a v2 app configures
-  /// the runtime without editing its own code: `TAURI_DEV_URL`,
-  /// `TAURI_RUNTIME_ELECTRON_ICON` and `TAURI_RUNTIME_ELECTRON_IDENTIFIER`.
+  /// Reads Tauri's official development URL from `TAURI_DEV_URL`.
   pub fn from_env() -> Self {
     let mut electron = Self::default();
     if let Ok(dev_url) = std::env::var("TAURI_DEV_URL") {
       electron.dev_url = Some(dev_url.trim_end_matches('/').to_string());
-    }
-    if let Some(icon) = std::env::var_os("TAURI_RUNTIME_ELECTRON_ICON") {
-      electron.icon = Some(PathBuf::from(icon));
-    }
-    if let Ok(identifier) = std::env::var("TAURI_RUNTIME_ELECTRON_IDENTIFIER") {
-      electron.identifier = Some(identifier);
     }
     electron
   }
 
   pub fn binary(mut self, binary: impl Into<PathBuf>) -> Self {
     self.binary = Some(binary.into());
-    self
-  }
-
-  pub fn main_script(mut self, script: impl Into<PathBuf>) -> Self {
-    self.main_script = Some(script.into());
     self
   }
 
@@ -630,99 +606,33 @@ impl Electron {
     self
   }
 
-  fn resolve_binary(&self) -> PathBuf {
-    if let Some(binary) = std::env::var_os("TAURI_RUNTIME_ELECTRON_BINARY") {
-      return PathBuf::from(binary);
+  fn resolve_binary(&self) -> std::result::Result<PathBuf, String> {
+    if let Some(path) = &self.binary {
+      return electron_rs::find_binary(path);
     }
-    if let Some(binary) = &self.binary {
-      return binary.clone();
-    }
-    // `build.rs` stages a runtime under `target/electron/<platform>-<arch>` and
-    // reports it here, which covers `cargo install`-style builds without Node.
-    if let Some(staged) = option_env!("TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY") {
-      let staged = PathBuf::from(staged);
-      if staged.exists() {
-        return staged;
-      }
-    }
-    // A packaged app ships the runtime next to (or under `resources/` beside)
-    // its executable, so those layouts beat anything found in the source tree.
-    // `"resources": { "target/electron": "runtime" }` lands the staged payload in
-    // `runtime/<platform>-<arch>/`, which the bundle target below covers.
-    if let Ok(executable) = std::env::current_exe() {
-      if let Some(dir) = executable.parent() {
-        for candidate in [
-          dir.join("electron").join(electron_executable()),
-          dir.join("resources").join("electron").join(electron_executable()),
-          dir
-            .join("runtime")
-            .join(format!("{}-{}", crate::acquisition::platform(), crate::acquisition::arch()))
-            .join(electron_executable()),
-          dir
-            .join("resources")
-            .join("runtime")
-            .join(format!("{}-{}", crate::acquisition::platform(), crate::acquisition::arch()))
-            .join(electron_executable()),
-          dir.join("runtime").join(electron_executable()),
-        ] {
-          if candidate.exists() {
-            return candidate;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut lookup_error = None;
+    if let Some(dir) = executable.parent() {
+      let product_name = option_env!("ELECTRON_RS_TAURI_PRODUCT_NAME")
+        .filter(|_| cfg!(target_os = "linux"));
+      let app_dir = std::env::var_os("APPDIR").map(PathBuf::from);
+      for root in bundled_roots(dir, product_name, app_dir.as_deref()) {
+        if root.is_dir() {
+          match electron_rs::find_binary(&root) {
+            Ok(binary) => return Ok(binary),
+            Err(error) => { lookup_error.get_or_insert(error); }
           }
         }
       }
     }
-    // Probe the usual pnpm/npm layout next to (or above) the current directory.
-    let name = format!("node_modules/electron/dist/{}", electron_executable());
-    let mut dir = std::env::current_dir().ok();
-    for _ in 0..6 {
-      let Some(current) = dir else { break };
-      let candidate = current.join(&name);
-      if candidate.exists() {
-        return candidate;
-      }
-      dir = current.parent().map(PathBuf::from);
-    }
-    // A packaged app ships no Electron payload; the first launch fetches it into
-    // the user cache (verified against the release checksums) and later launches
-    // reuse that copy.
-    match crate::acquisition::ensure_installed() {
-      Ok(binary) => return binary,
-      Err(error) => eprintln!("[electron] could not acquire Electron: {error}"),
-    }
-    PathBuf::from("electron")
-  }
-
-  fn resolve_main_script(&self, binary: &Path) -> PathBuf {
-    if let Some(script) = &self.main_script {
-      return script.clone();
-    }
-    // The staged runtime keeps `main.cjs` beside the Electron binary, which is
-    // the only layout a packaged app is guaranteed to have.
-    let sibling = binary.with_file_name("main.cjs");
-    if sibling.exists() {
-      return sibling;
-    }
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("electron/main.cjs");
-    if manifest.exists() {
-      return manifest;
-    }
-    // Packaged layout: the scripts are copied next to the Electron binary.
-    if let Some(binary) = option_env!("TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY") {
-      let sibling = PathBuf::from(binary).with_file_name("main.cjs");
-      if sibling.exists() {
-        return sibling;
+    // Release builds must never use a path on the build machine.
+    #[cfg(debug_assertions)]
+    if let Some(path) = option_env!("ELECTRON_RS_STAGED_BINARY") {
+      if Path::new(path).is_file() {
+        return electron_rs::find_binary(path);
       }
     }
-    if let Ok(executable) = std::env::current_exe() {
-      if let Some(dir) = executable.parent() {
-        for candidate in [dir.join("main.cjs"), dir.join("electron").join("main.cjs")] {
-          if candidate.exists() {
-            return candidate;
-          }
-        }
-      }
-    }
-    manifest
+    Err(lookup_error.unwrap_or_else(|| "Electron runtime was not bundled; include target/electron as runtime. Runtime downloads are disabled.".into()))
   }
 
   /// Bundle icon paths are relative to the app's `tauri.conf.json` (the crate
@@ -756,6 +666,25 @@ impl Electron {
   }
 }
 
+fn bundled_roots(dir: &Path, product_name: Option<&str>, app_dir: Option<&Path>) -> Vec<PathBuf> {
+  let mut roots = vec![
+    dir.join("runtime"),
+    dir.join("resources/runtime"),
+    dir.join("../Resources/runtime"),
+    dir.join("electron"),
+    dir.join("resources/electron"),
+  ];
+  // The build script validates productName before emitting compile-time metadata.
+  if let Some(product_name) = product_name {
+    roots.push(dir.join("../lib").join(product_name).join("runtime"));
+    if let Some(app_dir) = app_dir {
+      roots.push(app_dir.join("usr/lib").join(product_name).join("runtime"));
+    }
+    roots.push(Path::new("/usr/lib").join(product_name).join("runtime"));
+  }
+  roots
+}
+
 impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type WindowDispatcher = ElectronWindowDispatcher;
   type WebviewDispatcher = ElectronWebviewDispatcher;
@@ -763,7 +692,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   type EventLoopProxy = EventProxy;
 
   fn new(_args: RuntimeInitArgs) -> Result<Self> {
-    Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
+    Self::start(Electron::from_env(), DEFAULT_SCHEMES)
   }
 
   #[cfg(any(
@@ -775,7 +704,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "openbsd"
   ))]
   fn new_any_thread(_args: RuntimeInitArgs) -> Result<Self> {
-    Self::start(Electron::from_env(), &DEFAULT_SCHEMES)
+    Self::start(Electron::from_env(), DEFAULT_SCHEMES)
   }
 
   fn create_proxy(&self) -> EventProxy {
@@ -1247,7 +1176,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             set_missing_origin(request.headers_mut(), origin.as_deref());
             let ipc = self.context.ipc.clone();
             let request_uri = uri.clone();
-            let responder: Box<dyn FnOnce(Response<std::borrow::Cow<'static, [u8]>>) + Send> =
+            let responder: Box<UriSchemeProtocolResponder> =
               Box::new(move |response: Response<std::borrow::Cow<'static, [u8]>>| {
                 use base64::Engine;
                 let headers: serde_json::Map<String, Value> = response
@@ -1339,15 +1268,6 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       point["x"].as_f64().unwrap_or_default(),
       point["y"].as_f64().unwrap_or_default(),
     ))
-  }
-}
-
-/// Name of the Electron executable on the host platform.
-fn electron_executable() -> &'static str {
-  if cfg!(windows) {
-    "electron.exe"
-  } else {
-    "electron"
   }
 }
 
@@ -1768,7 +1688,7 @@ fn register_ipc_handler<T: UserEvent>(
       last_evaluated_script: Default::default(),
     },
   };
-  let handler: Rc<dyn Fn(Request<String>) + Send> =
+  let handler: Rc<IpcHandler> =
     Rc::new(move |request| handler(detached.clone(), request));
   context.ipc_handlers.borrow_mut().insert(webview_id, handler);
 }
@@ -1831,7 +1751,7 @@ pub(crate) struct WebviewHandlers {
 pub(crate) struct PolicyHandlers {
   download: Option<Arc<DownloadHandler>>,
   permission: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
-  navigation: Option<Rc<dyn Fn(&url::Url) -> bool + Send>>,
+  navigation: Option<Rc<NavigationHandler>>,
 }
 
 impl PolicyHandlers {
@@ -1914,9 +1834,54 @@ fn register_policy_handlers<T: UserEvent>(
   wired
 }
 
+/// Drains the thread's window-message queue.
+///
+/// `tray-icon` and `muda` (used by `tauri::tray` and the menu API) create hidden
+/// windows on the calling thread and only dispatch their callbacks from that
+/// thread's message loop. Electron pumps its own process, not this one, so the
+/// runtime has to do it.
+#[cfg(windows)]
+fn pump_thread_messages() {
+  use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+  };
+
+  let mut message = MSG::default();
+  while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+    unsafe {
+      let _ = TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+}
+
+#[cfg(not(windows))]
+fn pump_thread_messages() {}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn bundled_roots_include_linux_product_paths_after_adjacent_resources() {
+    let dir = Path::new("/opt/example/bin");
+    let app_dir = Path::new("/appimage");
+    let adjacent = vec![
+      dir.join("runtime"),
+      dir.join("resources/runtime"),
+      dir.join("../Resources/runtime"),
+      dir.join("electron"),
+      dir.join("resources/electron"),
+    ];
+    assert_eq!(bundled_roots(dir, None, Some(app_dir)), adjacent);
+    let mut expected = adjacent;
+    expected.push(dir.join("../lib/Example App/runtime"));
+    expected.push(app_dir.join("usr/lib/Example App/runtime"));
+    expected.push(PathBuf::from("/usr/lib/Example App/runtime"));
+    assert_eq!(bundled_roots(dir, Some("Example App"), Some(app_dir)), expected);
+    expected.remove(6);
+    assert_eq!(bundled_roots(dir, Some("Example App"), None), expected);
+  }
 
   #[test]
   fn validates_deduplicates_and_consumes_startup_schemes() {
@@ -1957,27 +1922,3 @@ mod tests {
     assert_eq!(permission_response_name(PermissionResponse::Default), "default");
   }
 }
-
-/// Drains the thread's window-message queue.
-///
-/// `tray-icon` and `muda` (used by `tauri::tray` and the menu API) create hidden
-/// windows on the calling thread and only dispatch their callbacks from that
-/// thread's message loop. Electron pumps its own process, not this one, so the
-/// runtime has to do it.
-#[cfg(windows)]
-fn pump_thread_messages() {
-  use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-  };
-
-  let mut message = MSG::default();
-  while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-    unsafe {
-      let _ = TranslateMessage(&message);
-      DispatchMessageW(&message);
-    }
-  }
-}
-
-#[cfg(not(windows))]
-fn pump_thread_messages() {}

@@ -20,7 +20,7 @@ use crate::runtime::{rect_position, rect_size};
 pub(crate) mod cursor;
 pub(crate) mod dpi;
 
-/// Maps the monitor JSON shape produced by `electron/main.cjs` onto Tauri's
+/// Maps the monitor JSON shape produced by `electron-rs/assets/main.cjs` onto Tauri's
 /// physical-pixel `Monitor`.
 pub(crate) fn monitor_from_value(value: &Value) -> Option<Monitor> {
   if !value.is_object() {

@@ -329,7 +329,7 @@ impl ElectronWebviewDispatcher {
   }
 }
 
-/// Converts the physical-pixel rect reported by `electron/main.cjs`.
+/// Converts the physical-pixel rect reported by `electron-rs/assets/main.cjs`.
 fn rect_from_value(value: &Value) -> tauri_runtime::dpi::Rect {
   let position = Position::Physical(PhysicalPosition::new(
     value["x"].as_i64().unwrap_or_default() as i32,

@@ -24,6 +24,8 @@ const path = require('node:path')
 // Electron keys its profile by app name, and that name is "Electron" for every
 // app built on this runtime: without this, two running apps would share one
 // profile, cache and lock.
+const appName = process.env.ELECTRON_RS_APP_NAME
+if (appName) app.setName(appName)
 const owner = process.env.TAURI_RUNTIME_ELECTRON_OWNER
 if (owner) app.setPath('userData', path.join(app.getPath('appData'), owner))
 
@@ -133,7 +135,7 @@ if (!port) {
 // The Rust runtime passes the app identifier so the window looks like the Tauri
 // app instead of Electron itself; the window icon travels with the creation
 // request (the runtime extracts it from the executable when it is bundled).
-const appIdentifier = readArg('--tauri-identifier') || undefined
+const appIdentifier = readArg('--tauri-identifier') || process.env.ELECTRON_RS_IDENTIFIER || undefined
 
 // Tauri's custom schemes (`tauri://localhost`, plugin protocols) must be
 // privileged before the app is ready, so the Rust runtime passes them on the

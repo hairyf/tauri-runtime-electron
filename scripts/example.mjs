@@ -364,7 +364,7 @@ tauri-utils = { path = "../../../crates/tauri-utils" }
       // Cargo reads .cargo/config.toml from cwd, not --manifest-path. The
       // upstream workspace enables the Windows Common Controls v6 manifest here.
       cwd: name === 'streaming' ? app : workspace,
-      env: { ...process.env, CARGO_TARGET_DIR: path.join(root, 'target') },
+      env: { ...process.env, INIT_CWD: app, CARGO_TARGET_DIR: path.join(root, 'target') },
     })
   }
 } catch (error) {

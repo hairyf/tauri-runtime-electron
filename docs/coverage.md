@@ -143,8 +143,8 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:645](src/window.rs#L645) | implemented |
 | `WebviewDispatch::with_webview` | `error` | [src/webview.rs:84](src/webview.rs#L84) | implemented |
 | `WebviewDispatch::reparent` | `warned` | [src/webview.rs:222](src/webview.rs#L222) | implemented |
-| `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:917](src/runtime.rs#L917) | implemented |
-| `Runtime::run_iteration` | `no-op` | [src/runtime.rs:935](src/runtime.rs#L935) | implemented |
+| `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:846](src/runtime.rs#L846) | implemented |
+| `Runtime::run_iteration` | `no-op` | [src/runtime.rs:864](src/runtime.rs#L864) | implemented |
 | `RuntimeHandle::display_handle` | `panic` — Windows path wired | [src/window_handle.rs:98](src/window_handle.rs#L98) | implemented |
 | `RuntimeHandle::set_device_event_filter` | `warned` | [src/window_handle.rs:198](src/window_handle.rs#L198) | implemented |
 | `RuntimeHandle::find_class` | `panic` | [src/window_handle.rs:206](src/window_handle.rs#L206) | `noop` |

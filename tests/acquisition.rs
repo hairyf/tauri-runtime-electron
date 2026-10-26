@@ -1,27 +1,12 @@
 //! Proves the build script staged a runnable Electron for this platform.
-//!
-//! The binary is what the runtime launches at startup, so it is worth failing
-//! the build when acquisition silently produced nothing.
 
-use std::path::PathBuf;
 use std::process::Command;
-
-fn staged_binary() -> Option<PathBuf> {
-  option_env!("TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY")
-    .map(PathBuf::from)
-    .filter(|path| path.exists())
-}
 
 #[test]
 fn staged_electron_reports_its_version() {
-  let Some(binary) = staged_binary() else {
-    // A local build may legitimately run with `TAURI_RUNTIME_ELECTRON_DOWNLOAD=0`
-    // or point at `node_modules/electron`, so a missing stage is not a failure.
-    eprintln!("no staged Electron binary in this build");
-    return;
-  };
-
-  let output = Command::new(&binary)
+  let binary = env!("ELECTRON_RS_STAGED_BINARY");
+  assert!(std::path::Path::new(binary).is_file(), "build did not stage Electron: {binary}");
+  let output = Command::new(binary)
     .arg("--version")
     .env("ELECTRON_RUN_AS_NODE", "1")
     .output()

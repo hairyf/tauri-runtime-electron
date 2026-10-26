@@ -10,7 +10,7 @@ import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
 
 const require = createRequire(import.meta.url)
-const electronDirectory = fileURLToPath(new URL('../electron/', import.meta.url))
+const electronDirectory = fileURLToPath(new URL('../electron-rs/assets/', import.meta.url))
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'electron-webview-policy-check-'))
 const messages = []
 const timers = new Set()

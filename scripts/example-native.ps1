@@ -33,7 +33,7 @@ $activation = $null
 function Test-RepoProcess($Record, $Table, [string] $Root) {
   $seen = @{}
   $prefix = $Root.TrimEnd('\') + '\'
-  $mainArgument = '(?i)(?:^|[\s"])' + [regex]::Escape($prefix + 'electron\main.cjs') + '(?:"|\s|$)'
+  $mainArgument = '(?i)(?:^|[\s"])' + [regex]::Escape($prefix + 'electron-rs\assets\main.cjs') + '(?:"|\s|$)'
   while ($null -ne $Record -and -not $seen.ContainsKey([int] $Record.ProcessId)) {
     $seen[[int] $Record.ProcessId] = $true
     $image = ([string] $Record.ExecutablePath).Replace('/', '\')
@@ -77,7 +77,7 @@ try {
   }
   if (-not $IsWindows) { throw 'This helper requires Windows and an interactive desktop.' }
   $repo = (Resolve-Path -LiteralPath $RepositoryPath).Path.TrimEnd('\')
-  if (-not (Test-Path -LiteralPath (Join-Path $repo 'electron/main.cjs')) -or
+  if (-not (Test-Path -LiteralPath (Join-Path $repo 'electron-rs/assets/main.cjs')) -or
       -not (Select-String -LiteralPath (Join-Path $repo 'Cargo.toml') -Pattern '^name = "tauri-runtime-electron"$' -Quiet)) {
     throw 'RepositoryPath must identify the tauri-runtime-electron repository, not a broad parent directory.'
   }

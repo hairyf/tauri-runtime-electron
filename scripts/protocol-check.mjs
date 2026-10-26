@@ -57,7 +57,7 @@ const context = vm.createContext({
     },
   },
 })
-vm.runInContext(`${readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8')}
+vm.runInContext(`${readFileSync(new URL('../electron-rs/assets/main.cjs', import.meta.url), 'utf8')}
 ;socket = testSocket`, context)
 
 const timeout = setTimeout(() => { throw new Error('protocol regression timed out') }, 3000)

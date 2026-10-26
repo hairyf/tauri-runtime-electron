@@ -9,22 +9,20 @@
 //! process spawned as a child of the Tauri (Rust) process.
 //!
 //! ```ignore
-//! tauri::Builder::default()
-//!   .runtime(tauri_runtime_electron::Electron::default())
+//! use tauri_runtime_electron::ElectronRuntime;
+//!
+//! tauri::Builder::<ElectronRuntime>::new()
 //!   .run(tauri::generate_context!())
 //!   .unwrap();
 //! ```
 //!
 //! The file layout mirrors `tauri-runtime-cef`; modules that exist only because
 //! CEF exposes native handles (`cef_impl`, `dialog`, `frame`, `popup`,
-//! `sandbox`) have no Electron counterpart and are replaced by the IPC bridge in
-//! [`electron_impl`].
+//! `sandbox`) have no Electron counterpart. Process communication is provided by
+//! the independent `electron-rs` crate.
 
-mod acquisition;
 mod app_icon;
-mod branding;
 mod devtools;
-mod electron_impl;
 mod environment;
 mod locale;
 mod platform;

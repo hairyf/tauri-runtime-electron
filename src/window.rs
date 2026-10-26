@@ -13,7 +13,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{cell::RefCell, rc::Rc, sync::Weak};
-use crate::electron_impl::ipc::Ipc;
+use electron_rs::Electron as ElectronProcess;
 
 pub use tauri_utils::{config::{Color, WindowEffectsConfig}, WindowEffect as Effect, WindowEffectState as EffectState};
 
@@ -37,11 +37,11 @@ use tauri_utils::Theme;
 #[derive(Debug, Clone)]
 pub(crate) struct EffectsTarget {
   serial: u32,
-  ipc: Weak<Ipc>,
+  ipc: Weak<ElectronProcess>,
 }
 
 impl EffectsTarget {
-  pub(crate) fn new(serial: u32, ipc: &std::sync::Arc<Ipc>) -> Self {
+  pub(crate) fn new(serial: u32, ipc: &std::sync::Arc<ElectronProcess>) -> Self {
     Self { serial, ipc: std::sync::Arc::downgrade(ipc) }
   }
 
@@ -486,7 +486,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       if size.width == 0 || size.height == 0 || size.width > i32::MAX as u32 || size.height > i32::MAX as u32 {
         return Err(create_window_err("invalid or overflowing window size".into()));
       }
-      return imp::set_client_size(self.context.native_handle(self.id)?, size);
+      imp::set_client_size(self.context.native_handle(self.id)?, size)
     }
     #[cfg(not(windows))]
     self.window_call("window.size", size_payload(size))
@@ -507,7 +507,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       if !scale.is_finite() || scale <= 0.0 {
         return Err(create_window_err("invalid window scale factor".into()));
       }
-      return imp::set_position(self.context.native_handle(self.id)?, position.to_physical::<i32>(scale));
+      imp::set_position(self.context.native_handle(self.id)?, position.to_physical::<i32>(scale))
     }
     #[cfg(not(windows))]
     self.window_call("window.position", position_payload(position))

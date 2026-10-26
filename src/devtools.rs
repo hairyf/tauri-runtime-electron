@@ -12,7 +12,7 @@
 //! The F12/Ctrl+Shift+I binding is *not* here: Tauri's
 //! `devtools_shortcut_script()` injects a page-level shortcut for browser
 //! runtimes that do not have one, while Electron's window needs a native
-//! `before-input-event` hook — see `electron/main.cjs`.
+//! `before-input-event` hook — see `electron-rs/assets/main.cjs`.
 
 use serde_json::json;
 use tauri_runtime::Result;

@@ -1,29 +1,13 @@
-// Acquisition of the Electron distribution shared by the build script and the
-// runtime.
-//
-// Mirrors the resolution order of `@electron/get`: an explicit
-// `TAURI_RUNTIME_ELECTRON_ELECTRON_DIR` wins, then a local
-// `node_modules/electron` install, then the `ELECTRON_CACHE` /
-// `~/.cache/electron` cache, downloading from `ELECTRON_MIRROR` when the
-// artifact is missing and checking it against the release's
-// `SHASUMS256.txt`.
-//
-// Nothing new is pulled into the dependency graph: downloads use `curl`, the
-// digest is checked with `certutil`/`shasum`, and the zip is unpacked with
-// `tar` (libarchive, shipped with Windows 10+ and macOS) or `unzip`.
-//
-// `include!`d by `build.rs` and by `src/acquisition.rs`, so the two paths can
-// never disagree about a version, a mirror or a checksum.
+//! Build-time acquisition using the platform's curl, SHA-256 and ZIP tools.
+//! Downloaded archives must match the release checksum before extraction.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) const VERSION: &str = "45.0.0";
-
 /// The target being built for, so cross builds fetch the right archive.
-pub(crate) fn target_triple() -> String {
+pub fn target_triple() -> String {
   // `TARGET` is set for build scripts and missing at runtime; `env::consts::OS`
   // spells macOS "macos", while the triples below match on "apple-darwin".
   env::var("TARGET").unwrap_or_else(|_| {
@@ -36,7 +20,7 @@ pub(crate) fn target_triple() -> String {
 }
 
 /// Executable path inside an Electron distribution.
-pub(crate) fn executable() -> String {
+pub fn executable() -> String {
   if target_triple().contains("windows") {
     "electron.exe".into()
   } else if target_triple().contains("apple-darwin") {
@@ -47,7 +31,7 @@ pub(crate) fn executable() -> String {
 }
 
 /// Platform name used by Electron's release archives.
-pub(crate) fn platform() -> String {
+pub fn platform() -> String {
   let triple = target_triple();
   if triple.contains("windows") {
     "win32".into()
@@ -59,7 +43,7 @@ pub(crate) fn platform() -> String {
 }
 
 /// Architecture name used by Electron's release archives.
-pub(crate) fn arch() -> String {
+pub fn arch() -> String {
   let triple = target_triple();
   let cpu = triple.split('-').next().unwrap_or_default();
   match cpu {
@@ -73,15 +57,36 @@ pub(crate) fn arch() -> String {
 }
 
 /// The directory an Electron distribution root is expected in, if it exists.
-pub(crate) fn dist_in(dir: &Path) -> Option<PathBuf> {
-  dir.join(executable()).exists().then(|| dir.to_path_buf())
+pub fn dist_in(dir: &Path) -> Option<PathBuf> {
+  dir.join(executable()).is_file().then(|| dir.to_path_buf())
 }
 
-pub(crate) fn explicit_dir() -> Option<PathBuf> {
-  env::var("TAURI_RUNTIME_ELECTRON_ELECTRON_DIR")
-    .ok()
-    .map(PathBuf::from)
-    .and_then(|path| dist_in(&path))
+pub fn default_output() -> PathBuf {
+  PathBuf::from(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
+    .join("electron").join(format!("{}-{}", platform(), arch()))
+}
+
+pub fn unique_sibling(path: &Path, kind: &str) -> PathBuf {
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static NEXT: AtomicU64 = AtomicU64::new(0);
+  let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+  path.with_file_name(format!(".{}-{kind}-{}-{serial}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()))
+}
+
+/// Publish a prepared directory without discarding the previous output on failure.
+pub fn replace_directory(stage: &Path, output: &Path) -> Result<(), String> {
+  if !output.exists() {
+    return fs::rename(stage, output).map_err(|error| format!("{}: {error}", output.display()));
+  }
+  let backup = unique_sibling(output, "previous");
+  fs::rename(output, &backup).map_err(|error| format!("{}: {error}", output.display()))?;
+  if let Err(error) = fs::rename(stage, output) {
+    fs::rename(&backup, output).map_err(|rollback| {
+      format!("publish {}: {error}; previous output remains at {} (restore failed: {rollback})", output.display(), backup.display())
+    })?;
+    return Err(format!("publish {}: {error}", output.display()));
+  }
+  fs::remove_dir_all(&backup).map_err(|error| format!("clean previous output {}: {error}", backup.display()))
 }
 
 /// A `node_modules/electron` install between `start` and the filesystem root.
@@ -97,61 +102,52 @@ pub(crate) fn local_install(start: &Path) -> Option<PathBuf> {
   None
 }
 
-/// Cache root, matching `@electron/get`'s `ELECTRON_CACHE` override.
+/// Shared cache under the host platform's normal cache directory.
 pub(crate) fn cache_root() -> Option<PathBuf> {
-  if let Ok(path) = env::var("ELECTRON_CACHE") {
-    return Some(PathBuf::from(path));
+  if cfg!(windows) {
+    return env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("electron/Cache"));
   }
-  let home = if cfg!(windows) {
-    env::var("LOCALAPPDATA").ok()
-  } else {
-    env::var("HOME").ok()
-  }?;
-  Some(PathBuf::from(home).join(if cfg!(windows) {
-    "electron/Cache"
-  } else {
-    ".cache/electron"
-  }))
+  if cfg!(target_os = "macos") {
+    return env::var_os("HOME").map(|root| PathBuf::from(root).join("Library/Caches/electron"));
+  }
+  env::var_os("XDG_CACHE_HOME")
+    .map(PathBuf::from)
+    .filter(|root| root.is_absolute())
+    .or_else(|| env::var_os("HOME").map(|root| PathBuf::from(root).join(".cache")))
+    .map(|root| root.join("electron"))
 }
 
-fn artifact() -> String {
-  format!("electron-v{VERSION}-{}-{}.zip", platform(), arch())
+fn artifact(version: &str) -> String {
+  format!("electron-v{version}-{}-{}.zip", platform(), arch())
 }
 
 /// An already unpacked and cached artifact for this version/platform.
-pub(crate) fn cached_dist() -> Option<PathBuf> {
+pub fn cached_dist(version: &str) -> Option<PathBuf> {
   let dist = cache_root()?
     .join(format!("{}-{}", platform(), arch()))
-    .join(VERSION);
+    .join(version);
   dist_in(&dist)
 }
 
 /// Downloads and unpacks the artifact into the cache; returns the dist dir.
-pub(crate) fn download() -> Result<PathBuf, String> {
+pub fn download(version: &str) -> Result<PathBuf, String> {
   let cache = cache_root().ok_or("no cache directory")?;
-  let mirror = env::var("ELECTRON_MIRROR")
-    .unwrap_or_else(|_| "https://github.com/electron/electron/releases/download/".into());
-  let dir_name = env::var("ELECTRON_CUSTOM_DIR").unwrap_or_else(|_| format!("v{VERSION}"));
-  let base = format!(
-    "{}/{}",
-    mirror.trim_end_matches('/'),
-    dir_name.trim_end_matches('/')
-  );
-  let name = artifact();
+  let base = format!("https://github.com/electron/electron/releases/download/v{version}");
+  let name = artifact(version);
   fs::create_dir_all(&cache).map_err(|error| format!("{}: {error}", cache.display()))?;
   let archive = cache.join(&name);
 
   // Unpacked copies are versioned, so an older cache entry never shadows this one.
   let dist = cache
     .join(format!("{}-{}", platform(), arch()))
-    .join(VERSION);
+    .join(version);
   if let Some(dist) = dist_in(&dist) {
     return Ok(dist);
   }
 
   if !archive.exists() {
     let url = format!("{base}/{name}");
-    println!("[electron] downloading Electron {VERSION} from {url}");
+    println!("[electron] downloading Electron {version} from {url}");
     run(
       Command::new("curl")
         .args(["-fsSL", "--retry", "2", "-o"])
@@ -160,34 +156,48 @@ pub(crate) fn download() -> Result<PathBuf, String> {
     )
     .map_err(|error| format!("download {url}: {error}"))?;
   }
-  if let Some(expected) = expected_digest(&format!("{base}/SHASUMS256.txt"), &name)? {
-    let actual = digest(&archive)?;
-    if !actual.eq_ignore_ascii_case(&expected) {
-      let _ = fs::remove_file(&archive);
-      return Err(format!("checksum mismatch for {name}: {actual} != {expected}"));
-    }
+  let expected = expected_digest(&format!("{base}/SHASUMS256.txt"), &name)?;
+  let actual = digest(&archive)?;
+  if !actual.eq_ignore_ascii_case(&expected) {
+    let _ = fs::remove_file(&archive);
+    return Err(format!("checksum mismatch for {name}: {actual} != {expected}"));
   }
 
-  let _ = fs::remove_dir_all(&dist);
-  fs::create_dir_all(&dist).map_err(|error| format!("{}: {error}", dist.display()))?;
-  unpack(&archive, &dist).map_err(|error| format!("unpack {name}: {error}"))?;
-  dist_in(&dist).ok_or_else(|| format!("{} has no {}", dist.display(), executable()))
+  fs::create_dir_all(dist.parent().ok_or("cache path has no parent")?)
+    .map_err(|error| error.to_string())?;
+  let stage = unique_sibling(&dist, "unpack");
+  fs::create_dir(&stage).map_err(|error| format!("{}: {error}", stage.display()))?;
+  let result = (|| {
+    unpack(&archive, &stage).map_err(|error| format!("unpack {name}: {error}"))?;
+    if dist_in(&stage).is_none() { return Err(format!("{name} has no {}", executable())); }
+    replace_directory(&stage, &dist)?;
+    Ok(dist)
+  })();
+  if result.is_err() { let _ = fs::remove_dir_all(&stage); }
+  result
 }
 
 /// `SHASUMS256.txt` is a list of `<digest> *<file>` lines.
-fn expected_digest(url: &str, name: &str) -> Result<Option<String>, String> {
+fn expected_digest(url: &str, name: &str) -> Result<String, String> {
   let output = Command::new("curl")
     .args(["-fsSL", "--max-time", "60", url])
     .output()
     .map_err(|error| format!("fetch {url}: {error}"))?;
   if !output.status.success() {
-    return Ok(None);
+    return Err(format!("cannot verify Electron archive: fetch {url} failed ({})", output.status));
   }
-  let text = String::from_utf8_lossy(&output.stdout);
-  Ok(text.lines().find_map(|line| {
-    let (digest, file) = line.trim().split_once(' ')?;
-    (file.trim_start_matches('*') == name).then(|| digest.to_lowercase())
-  }))
+  checksum(&String::from_utf8_lossy(&output.stdout), name)
+    .ok_or_else(|| format!("no SHA-256 for {name} in {url}"))
+}
+
+fn checksum(text: &str, name: &str) -> Option<String> {
+  text.lines().find_map(|line| {
+    let mut parts = line.split_whitespace();
+    let digest = parts.next()?;
+    let file = parts.next()?.trim_start_matches('*');
+    (file == name && digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+      .then(|| digest.to_ascii_lowercase())
+  })
 }
 
 fn digest(path: &Path) -> Result<String, String> {
@@ -260,7 +270,7 @@ fn run(command: &mut Command) -> Result<(), String> {
   }
 }
 
-pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+pub fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
   fs::create_dir_all(to).map_err(|error| format!("{}: {error}", to.display()))?;
   for entry in fs::read_dir(from).map_err(|error| format!("{}: {error}", from.display()))? {
     let entry = entry.map_err(|error| error.to_string())?;
@@ -291,50 +301,16 @@ fn copy_symlink(from: PathBuf, to: &Path) -> Result<(), String> {
     .map_err(|error| format!("{}: {error}", from.display()))
 }
 
-/// Ensures a cached Electron distribution with our main-process scripts next to
-/// its executable, downloading it when necessary. Returns the executable.
-#[allow(dead_code)] // shared with the build script, which only stages the distribution.
-pub(crate) fn install(main_cjs: &str, preload_cjs: &str) -> Result<PathBuf, String> {
-  let dist = match cached_dist() {
-    Some(dist) => dist,
-    None => download()?,
-  };
-  // The scripts are ours and change with the crate, so they are refreshed on
-  // every run rather than only when missing.
-  for (name, contents) in [("main.cjs", main_cjs), ("preload.cjs", preload_cjs)] {
-    let script = dist.join(name);
-    fs::write(&script, contents).map_err(|error| format!("{}: {error}", script.display()))?;
-  }
-  Ok(dist.join(executable()))
-}
-
 #[cfg(test)]
 mod tests {
-  /// The runtime has no `TARGET` from cargo, so a wrong fallback used to fetch
-  /// a Linux Electron on macOS and then fail as "did not connect".
+  use super::*;
+
   #[test]
-  fn the_archive_name_matches_this_host() {
-    let platform = if cfg!(windows) {
-      "win32"
-    } else if cfg!(target_os = "macos") {
-      "darwin"
-    } else {
-      "linux"
-    };
-    assert_eq!(super::platform(), platform);
-    let arch = match std::env::consts::ARCH {
-      "x86_64" => "x64",
-      "aarch64" => "arm64",
-      other => other,
-    };
-    assert_eq!(super::arch(), arch);
-    let executable = if cfg!(windows) {
-      "electron.exe"
-    } else if cfg!(target_os = "macos") {
-      "Electron.app/Contents/MacOS/Electron"
-    } else {
-      "electron"
-    };
-    assert_eq!(super::executable(), executable);
+  fn checksum_requires_a_full_hex_digest_for_the_exact_artifact() {
+    let name = artifact("45.0.0");
+    let digest = "Ab".repeat(32);
+    let invalid = format!("short *{name}\n{} *{name}\n{digest} *{name}.bak\n", "g".repeat(64));
+    assert_eq!(checksum(&invalid, &name), None);
+    assert_eq!(checksum(&format!("{invalid}{digest} *{name}\n"), &name), Some(digest.to_ascii_lowercase()));
   }
 }
