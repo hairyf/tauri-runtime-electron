@@ -243,8 +243,10 @@ fn prepare_bridge() {
   assert!(prepared.cleanup_warning.is_none(), "{:?}", prepared.cleanup_warning);
   let directory = prepared.directory;
   let binary = prepared.binary;
-  assert_eq!(directory, fs::canonicalize(distribution()).unwrap());
-  assert_eq!(fs::canonicalize(builder.directory().unwrap()).unwrap(), directory);
+  assert!(directory.is_absolute(), "{directory:?}");
+  assert!(binary.is_absolute(), "{binary:?}");
+  assert_eq!(directory, distribution());
+  assert_eq!(builder.directory().unwrap(), directory);
   assert!(binary.starts_with(&directory));
   assert!(!directory.starts_with(&runtime) && !runtime.starts_with(&directory));
   assert_eq!(

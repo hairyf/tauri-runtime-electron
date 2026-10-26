@@ -1051,6 +1051,8 @@ function readGeometry(window) {
     scaleFactor,
     bounds: toPhysical(window.getBounds()),
     contentBounds: toPhysical(window.getContentBounds()),
+    // Native sizing must honor the same content limits (in DIPs) as window.size.
+    contentConstraints: contentConstraints(window),
     maximized: window.isMaximized(),
     minimized: window.isMinimized(),
     focused: window.isFocused(),

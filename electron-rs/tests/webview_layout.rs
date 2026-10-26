@@ -357,6 +357,10 @@ fn content_constraints_keep_each_axis_and_reapply_frame_and_physical_units() {
     );
     let framed = json!({ "min": [316, 238], "max": [516, 438] });
     assert_eq!(observed["atomic"], framed);
+    assert_eq!(
+        observed["nativeConstraints"],
+        json!({ "minWidth": 300, "minHeight": 200, "maxWidth": 500, "maxHeight": 400 })
+    );
     assert_eq!(observed["physicalClamped"], json!([500, 200]));
     assert_eq!(
         observed["menu"],
@@ -371,6 +375,16 @@ fn content_constraints_keep_each_axis_and_reapply_frame_and_physical_units() {
     assert_eq!(
         observed["dpi"],
         json!({ "min": [312, 350], "max": [812, 670] })
+    );
+    assert_eq!(
+        observed["nativeDpi"],
+        json!({ "scaleFactor": 1.25, "constraints": {
+            "minWidth": 300, "minHeight": 320, "maxWidth": 800, "maxHeight": 640
+        } })
+    );
+    assert_eq!(
+        observed["nativeCleared"],
+        json!({ "minWidth": 0, "minHeight": 0, "maxWidth": 0, "maxHeight": 0 })
     );
     assert_eq!(observed["cleared"], json!({ "min": [0, 0], "max": [0, 0] }));
     assert_eq!(

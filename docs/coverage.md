@@ -145,11 +145,11 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `WindowDispatch::activity_name` | `panic` | [src/window.rs:287](src/window.rs#L287) | implemented |
 | `WindowDispatch::scene_identifier` | `panic` | [src/window.rs:292](src/window.rs#L292) | implemented |
 | `WindowDispatch::set_decorations` | `warned` — Windows path wired | [src/window.rs:420](src/window.rs#L420) | implemented |
-| `WindowDispatch::set_cursor_grab` | `warned` — Windows path wired | [src/window.rs:549](src/window.rs#L549) | implemented |
-| `WindowDispatch::set_cursor_position` | `warned` | [src/window.rs:568](src/window.rs#L568) | implemented |
-| `WindowDispatch::start_dragging` | `warned` — Windows path wired | [src/window.rs:583](src/window.rs#L583) | implemented |
-| `WindowDispatch::start_resize_dragging` | `warned` — Windows path wired | [src/window.rs:598](src/window.rs#L598) | implemented |
-| `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:650](src/window.rs#L650) | implemented |
+| `WindowDispatch::set_cursor_grab` | `warned` — Windows path wired | [src/window.rs:542](src/window.rs#L542) | implemented |
+| `WindowDispatch::set_cursor_position` | `warned` | [src/window.rs:561](src/window.rs#L561) | implemented |
+| `WindowDispatch::start_dragging` | `warned` — Windows path wired | [src/window.rs:576](src/window.rs#L576) | implemented |
+| `WindowDispatch::start_resize_dragging` | `warned` — Windows path wired | [src/window.rs:591](src/window.rs#L591) | implemented |
+| `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:643](src/window.rs#L643) | implemented |
 | `WebviewDispatch::with_webview` | `error` | [src/webview.rs:83](src/webview.rs#L83) | implemented |
 | `WebviewDispatch::reparent` | `warned` | [src/webview.rs:225](src/webview.rs#L225) | implemented |
 | `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:962](src/runtime.rs#L962) | implemented |

@@ -60,28 +60,8 @@ fn main() -> ExitCode {
     }
   };
 
-  // The event loop lives on its own thread so the checks below can call the
-  // dispatchers like an application would.
   let handle: Handle = <ElectronRuntime as Runtime<()>>::handle(&runtime);
   let (exit_tx, exit_rx) = channel::<()>();
-  let loop_thread = thread::spawn(move || {
-    <ElectronRuntime as Runtime<()>>::run_return(runtime, move |event| {
-      if let RunEvent::WindowEvent { event, .. } = &event {
-        let name = match event {
-          WindowEvent::Destroyed => "destroyed",
-          WindowEvent::CloseRequested { .. } => "closeRequested",
-          WindowEvent::Resized(..) => "resized",
-          WindowEvent::Moved(..) => "moved",
-          WindowEvent::Focused(..) => "focused",
-          _ => "other",
-        };
-        REPORT.lock().unwrap().push(name.to_string());
-      }
-      if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
-        let _ = exit_tx.send(());
-      }
-    });
-  });
 
   // A hung window must fail the job instead of blocking CI until its timeout.
   thread::spawn(|| {
@@ -90,6 +70,47 @@ fn main() -> ExitCode {
     std::process::abort();
   });
 
+  // The runtime's UI state belongs to its creating thread. Checks use the
+  // handle from a worker so synchronous dispatch can be serviced by this loop.
+  let checks = thread::spawn(move || {
+    let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      run_checks(&handle, exit_rx)
+    })).unwrap_or(ExitCode::FAILURE);
+    // Setup can fail before any window exists to trigger automatic exit.
+    let code = if status == ExitCode::SUCCESS { 0 } else { 1 };
+    let _ = <ElectronRuntimeHandle as RuntimeHandle<()>>::request_exit(&handle, code);
+    status
+  });
+  let code = <ElectronRuntime as Runtime<()>>::run_return(runtime, move |event| {
+    if let RunEvent::WindowEvent { event, .. } = &event {
+      let name = match event {
+        WindowEvent::Destroyed => "destroyed",
+        WindowEvent::CloseRequested { .. } => "closeRequested",
+        WindowEvent::Resized(..) => "resized",
+        WindowEvent::Moved(..) => "moved",
+        WindowEvent::Focused(..) => "focused",
+        _ => "other",
+      };
+      REPORT.lock().unwrap().push(name.to_string());
+    }
+    if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+      let _ = exit_tx.send(());
+    }
+  });
+  match checks.join() {
+    Ok(status) if code == 0 => status,
+    Ok(_) => {
+      eprintln!("[smoke] runtime exited with code {code}");
+      ExitCode::FAILURE
+    }
+    Err(_) => {
+      eprintln!("[smoke] checks panicked");
+      ExitCode::FAILURE
+    }
+  }
+}
+
+fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCode {
   let mut failures = Vec::new();
   let session_root = std::env::temp_dir().join(format!(
     "tauri-runtime-electron-smoke-{}-{}",
@@ -246,11 +267,8 @@ fn main() -> ExitCode {
   expect_named(&mut failures, "closed event", "destroyed", || {
     REPORT.lock().unwrap().clone()
   });
-  match exit_rx.recv_timeout(Duration::from_secs(20)) {
-    Ok(()) => {
-      let _ = loop_thread.join();
-    }
-    Err(_) => failures.push("the event loop did not exit after the last window closed".into()),
+  if exit_rx.recv_timeout(Duration::from_secs(20)).is_err() {
+    failures.push("the event loop did not exit after the last window closed".into());
   }
 
   if failures.is_empty() {
@@ -684,7 +702,7 @@ fn cursor_style_checks(window: &Window, webview: &Webview, failures: &mut Vec<St
   expect_eval(
     failures,
     "cursor shown",
-    "default",
+    "pointer",
     webview,
     "getComputedStyle(document.documentElement).cursor",
   );

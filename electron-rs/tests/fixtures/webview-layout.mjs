@@ -468,6 +468,7 @@ switch (process.argv[2]) {
       minWidth: { value: 300, physical: false }, minHeight: { value: 400, physical: true },
       maxWidth: { value: 1000, physical: true }, maxHeight: { value: 800, physical: true } })
     const atomic = constraintsOf(host)
+    const nativeConstraints = (await call('window.geometry', { windowId: 40 })).contentConstraints
     await call('window.size', { windowId: 40, width: 2400, height: 100, physical: true })
     const physicalClamped = host.getContentSize()
     await call('window.setMenu', { windowId: 40, menu: [{ label: 'File', enabled: true, commandId: 1 }] })
@@ -489,6 +490,7 @@ switch (process.argv[2]) {
     screen.emit('display-metrics-changed', {}, { scaleFactor: 1.25 }, ['scaleFactor'])
     await settle()
     const dpi = constraintsOf(host)
+    const nativeDpi = await call('window.geometry', { windowId: 40 })
     await call('window.sizeConstraints', { windowId: 40,
       minWidth: null, minHeight: null, maxWidth: null, maxHeight: null })
     const cleared = constraintsOf(host)
@@ -498,7 +500,9 @@ switch (process.argv[2]) {
     await call('window.minSize', { windowId: 40 })
     await call('window.maxSize', { windowId: 40 })
     result = { creation, framed, clamped, heightOnlyMin, heightOnlyMax, atomic, physicalClamped,
-      menu, menuRemoved, undecorated, decorated, dpi, cleared, restoredHeightOnly,
+      menu, menuRemoved, undecorated, decorated, dpi, cleared, restoredHeightOnly, nativeConstraints,
+      nativeDpi: { scaleFactor: nativeDpi.scaleFactor, constraints: nativeDpi.contentConstraints },
+      nativeCleared: (await call('window.geometry', { windowId: 40 })).contentConstraints,
       legacyCleared: constraintsOf(host) }
     break
   }

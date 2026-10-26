@@ -479,14 +479,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_size(&self, size: Size) -> Result<()> {
     #[cfg(windows)]
     {
-      let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
-      if !scale.is_finite() || scale <= 0.0 {
-        return Err(create_window_err("invalid window scale factor".into()));
-      }
-      let size = size.to_physical::<u32>(scale);
-      if size.width == 0 || size.height == 0 || size.width > i32::MAX as u32 || size.height > i32::MAX as u32 {
-        return Err(create_window_err("invalid or overflowing window size".into()));
-      }
+      let size = imp::constrained_client_size(size, &self.geometry()?)?;
       imp::set_client_size(self.context.native_handle(self.id)?, size)
     }
     #[cfg(not(windows))]
@@ -945,6 +938,36 @@ pub(crate) mod imp {
     }
   }
 
+  pub(super) fn constrained_client_size(
+    size: tauri_runtime::dpi::Size,
+    geometry: &serde_json::Value,
+  ) -> tauri_runtime::Result<tauri_runtime::dpi::PhysicalSize<u32>> {
+    let scale = geometry["scaleFactor"].as_f64().unwrap_or_default();
+    if !scale.is_finite() || scale <= 0.0 {
+      return Err(super::create_window_err("invalid window scale factor".into()));
+    }
+    let size = size.to_physical::<u32>(scale);
+    if size.width == 0 || size.height == 0 || size.width > i32::MAX as u32 || size.height > i32::MAX as u32 {
+      return Err(super::create_window_err("invalid or overflowing window size".into()));
+    }
+    let limit = |key: &str| -> tauri_runtime::Result<u32> {
+      let value = geometry["contentConstraints"][key].as_f64()
+        .map(|value| (value * scale).round())
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(i32::MAX))
+        .ok_or_else(|| super::create_window_err("invalid or overflowing window size constraint".into()))?;
+      Ok(value as u32)
+    };
+    let clamp = |value: u32, minimum: &str, maximum: &str| -> tauri_runtime::Result<u32> {
+      let minimum = limit(minimum)?;
+      let maximum = limit(maximum)?;
+      Ok(if maximum > 0 { value.min(maximum) } else { value }.max(minimum))
+    };
+    Ok(tauri_runtime::dpi::PhysicalSize::new(
+      clamp(size.width, "minWidth", "maxWidth")?,
+      clamp(size.height, "minHeight", "maxHeight")?,
+    ))
+  }
+
   fn outer_size_for_client(
     size: tauri_runtime::dpi::PhysicalSize<u32>,
     outer: RECT,
@@ -979,6 +1002,24 @@ pub(crate) mod imp {
       SetWindowPos(window, None, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
         .map_err(|_| tauri_runtime::Error::FailedToSendMessage)
     }
+  }
+
+  #[test]
+  fn native_client_size_honors_current_content_constraints() {
+    use tauri_runtime::dpi::{LogicalSize, PhysicalSize, Size};
+    use serde_json::json;
+    let mut geometry = json!({ "scaleFactor": 1.25, "contentConstraints": {
+      "minWidth": 300, "minHeight": 320, "maxWidth": 800, "maxHeight": 640,
+    }});
+    let physical = Size::Physical(PhysicalSize::new(1200, 100));
+    assert_eq!(constrained_client_size(physical, &geometry).unwrap(), PhysicalSize::new(1000, 400));
+    assert_eq!(constrained_client_size(Size::Logical(LogicalSize::new(400.0, 400.0)), &geometry).unwrap(), PhysicalSize::new(500, 500));
+    geometry["contentConstraints"] = json!({ "minWidth": 0, "minHeight": 0, "maxWidth": 0, "maxHeight": 0 });
+    assert_eq!(constrained_client_size(physical, &geometry).unwrap(), PhysicalSize::new(1200, 100));
+    geometry["contentConstraints"]["minHeight"] = json!(-1);
+    assert!(constrained_client_size(physical, &geometry).is_err());
+    geometry["scaleFactor"] = json!(0);
+    assert!(constrained_client_size(physical, &geometry).is_err());
   }
 
   #[test]
