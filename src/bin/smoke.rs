@@ -245,6 +245,11 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
     }
   }
 
+  // The initial document can replace the window title while it loads. Wait
+  // for its existing lifecycle check before exercising the title setter.
+  expect_named(&mut failures, "page load finished", "Finished", || {
+    LOADS.lock().unwrap().clone()
+  });
   native_access_checks(&window, &mut failures);
   window_checks(&window, &handle, &mut failures);
   if let Some(webview) = webview.as_ref() {
@@ -826,10 +831,7 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     "String(window.devicePixelRatio)",
   );
 
-  // The runtime reports the page's lifecycle to the handlers an app registers.
-  expect_named(failures, "page load finished", "Finished", || {
-    LOADS.lock().unwrap().clone()
-  });
+  // The runtime reports document titles to the handler an app registers.
   expect_named(failures, "document title", "smoke-page", || {
     TITLES.lock().unwrap().clone()
   });
