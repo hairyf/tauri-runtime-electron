@@ -200,7 +200,6 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(self.geometry()?["resizable"].as_bool().unwrap_or(true))
   }
 
-  // Electron's main process tracks requested values on Linux too.
   fn is_maximizable(&self) -> Result<bool> {
     Ok(self.geometry()?["maximizable"].as_bool().unwrap_or(true))
   }
@@ -415,12 +414,12 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(())
   }
 
-  // Electron cannot flip the frame through its own API, but the window is a real
-  // Win32 window: toggle the caption/thick-frame styles and let it repaint.
+  // Electron cannot flip the frame through its own API; change only the Win32
+  // caption, leaving resize and caption-button capabilities intact.
   fn set_decorations(&self, decorations: bool) -> Result<()> {
     #[cfg(windows)]
     {
-      imp::set_decorations(self.context.native_handle(self.id)?, decorations);
+      imp::set_decorations(self.context.native_handle(self.id)?, decorations)?;
       self
         .window_call("window.decorations", json!({ "value": decorations }))
         .map(|_| ())
@@ -560,12 +559,22 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   fn set_cursor_position<Pos: Into<Position>>(&self, position: Pos) -> Result<()> {
     let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
-    let physical = position.into().to_physical::<i32>(scale);
-    // Electron exposes no way to move the cursor, so the OS has to do this one.
-    if let Err(reason) = crate::platform::cursor::warp(physical, scale) {
-      crate::runtime::unsupported("WindowDispatch::set_cursor_position", &reason);
+    let position = position.into();
+    if let Position::Logical(point) = position {
+      if ![point.x * scale, point.y * scale].iter().all(|axis| axis.is_finite()
+        && *axis >= f64::from(i32::MIN) && *axis <= f64::from(i32::MAX)) {
+        return Err(create_window_err("invalid or overflowing cursor position".into()));
+      }
     }
-    Ok(())
+    let offset = position.to_physical::<i32>(scale);
+    #[cfg(windows)]
+    let origin = imp::client_origin(self.context.native_handle(self.id)?)?;
+    #[cfg(not(windows))]
+    let origin = <Self as WindowDispatch<T>>::inner_position(self)?;
+    let translate = |origin: i32, offset: i32| origin.checked_add(offset)
+      .ok_or_else(|| create_window_err("cursor position exceeds screen coordinates".into()));
+    let screen = PhysicalPosition::new(translate(origin.x, offset.x)?, translate(origin.y, offset.y)?);
+    crate::platform::cursor::warp(screen, scale).map_err(create_window_err)
   }
 
   fn set_ignore_cursor_events(&self, ignore: bool) -> Result<()> {
@@ -714,15 +723,15 @@ fn color_css(color: tauri_utils::config::Color) -> String {
 pub(crate) mod imp {
   use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
   use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed,
+    GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed, SetWindowPos,
     HTCAPTION, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST,
     SC_MOVE, SC_SIZE, ShowWindowAsync, SW_MAXIMIZE, SW_RESTORE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOMOVE, SWP_NOSIZE,
     WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT,
     WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
-    SetWindowLongPtrW, SetWindowPos, PostMessageW, WM_CANCELMODE, WM_SYSCOMMAND, WS_CAPTION, WS_THICKFRAME,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE, SWP_NOMOVE, SWP_NOSIZE,
-    GWL_EXSTYLE, WS_EX_TOPMOST,
+    SetWindowLongPtrW, PostMessageW, WM_CANCELMODE, WM_SYSCOMMAND, WS_CAPTION, WS_THICKFRAME,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, GWL_STYLE,
+    GWL_EXSTYLE, WS_EX_TOPMOST, WS_CHILD, WS_POPUP,
   };
   use tauri_runtime::ResizeDirection;
 
@@ -879,6 +888,15 @@ pub(crate) mod imp {
     unsafe { SendMessageW(hwnd(handle), WM_COMMAND, Some(WPARAM(command as usize)), Some(LPARAM(0))); }
   }
 
+  pub(crate) fn client_origin(handle: isize) -> tauri_runtime::Result<tauri_runtime::dpi::PhysicalPosition<i32>> {
+    let mut point = POINT::default();
+    // SAFETY: copies the live Electron HWND's client origin into a stack value.
+    if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd(handle), &mut point) }.as_bool() {
+      return Err(super::create_window_err("could not locate cursor's window client area".into()));
+    }
+    Ok(tauri_runtime::dpi::PhysicalPosition::new(point.x, point.y))
+  }
+
   pub(crate) fn clip_cursor(handle: isize, grab: bool) -> tauri_runtime::Result<()> {
     use windows::Win32::{Graphics::Gdi::ClientToScreen, UI::WindowsAndMessaging::ClipCursor};
     // SAFETY: only copies the live client rectangle and applies an OS clip.
@@ -897,8 +915,17 @@ pub(crate) mod imp {
     }
   }
 
+  pub(crate) fn validate_window_handle(handle: isize) -> tauri_runtime::Result<()> {
+    if handle == 0 || !unsafe { IsWindow(Some(hwnd(handle))) }.as_bool() {
+      return Err(super::create_window_err("invalid native window handle".into()));
+    }
+    Ok(())
+  }
+
   pub(crate) fn set_owner(handle: isize, owner: isize) -> tauri_runtime::Result<()> {
     use windows::Win32::{Foundation::{GetLastError, SetLastError, WIN32_ERROR}, UI::WindowsAndMessaging::GWLP_HWNDPARENT};
+    validate_window_handle(handle)?;
+    validate_window_handle(owner)?;
     // SAFETY: HWND ownership changes do not transfer memory; zero may also be a
     // successful previous owner, so only GetLastError determines failure.
     unsafe {
@@ -908,6 +935,57 @@ pub(crate) mod imp {
       if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
     }
     Ok(())
+  }
+
+  pub(crate) fn set_parent(handle: isize, parent: isize) -> tauri_runtime::Result<()> {
+    use windows::Win32::{Foundation::{GetLastError, SetLastError, WIN32_ERROR}, UI::WindowsAndMessaging::{SetParent, GWL_STYLE}};
+    validate_window_handle(handle)?;
+    validate_window_handle(parent)?;
+    let window = hwnd(handle);
+    // SetParent changes the relationship but not the styles. Convert the popup
+    // to a real child while leaving every unrelated capability bit untouched.
+    unsafe {
+      SetLastError(WIN32_ERROR(0));
+      let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+      SetLastError(WIN32_ERROR(0));
+      SetWindowLongPtrW(window, GWL_STYLE, (style & !WS_POPUP.0 | WS_CHILD.0) as isize);
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+      SetLastError(WIN32_ERROR(0));
+      let _ = SetParent(window, Some(hwnd(parent)));
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+      SetWindowPos(window, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        .map_err(|error| super::create_window_err(error.to_string()))?;
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn native_parent_is_a_child_and_invalid_handles_are_rejected() {
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, GetParent, GetWindow, GW_OWNER};
+    let parent = MenuOwner::new().unwrap();
+    let child = MenuOwner::new().unwrap();
+    set_parent(child.handle, parent.handle).unwrap();
+    let style = unsafe { GetWindowLongPtrW(hwnd(child.handle), GWL_STYLE) } as u32;
+    assert_ne!(style & WS_CHILD.0, 0);
+    assert_eq!(style & WS_POPUP.0, 0);
+    assert_eq!(unsafe { GetParent(hwnd(child.handle)) }.unwrap().0 as isize, parent.handle);
+    assert!(set_parent(child.handle, 0).is_err());
+
+    let owner = MenuOwner::new().unwrap();
+    set_owner(owner.handle, parent.handle).unwrap();
+    let owner_style = unsafe { GetWindowLongPtrW(hwnd(owner.handle), GWL_STYLE) } as u32;
+    assert_eq!(owner_style & WS_CHILD.0, 0);
+    assert_eq!(unsafe { GetWindow(hwnd(owner.handle), GW_OWNER) }.unwrap().0 as isize, parent.handle);
+    assert!(set_owner(owner.handle, 0).is_err());
+    unsafe {
+      DestroyWindow(hwnd(child.handle)).unwrap();
+      DestroyWindow(hwnd(owner.handle)).unwrap();
+      DestroyWindow(hwnd(parent.handle)).unwrap();
+    }
   }
 
   pub(super) fn is_maximized(handle: isize) -> tauri_runtime::Result<bool> {
@@ -1083,28 +1161,60 @@ pub(crate) mod imp {
     style & WS_EX_TOPMOST.0 != 0
   }
 
-  pub(super) fn set_decorations(handle: isize, decorations: bool) {
+  pub(super) fn set_decorations(handle: isize, decorations: bool) -> tauri_runtime::Result<()> {
+    use windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
     let window = hwnd(handle);
-    let style = unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32;
-    let frame = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
-    let style = if decorations {
-      style | frame.0
-    } else {
-      style & !frame.0
-    };
-    // SAFETY: plain Win32 style juggling on a window we were handed.
+    // SAFETY: HWND styles are integer values, not process-local pointers. Zero
+    // can be a successful Get/SetWindowLongPtr result, so clear/check last error.
     unsafe {
+      SetLastError(WIN32_ERROR(0));
+      let original = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+      // Keep THICKFRAME, MIN/MAXIMIZEBOX and SYSMENU (including SC_CLOSE state):
+      // removing decorations must not rewrite independent native capabilities.
+      let style = if decorations { original | WS_CAPTION.0 } else { original & !WS_CAPTION.0 };
+      SetLastError(WIN32_ERROR(0));
       SetWindowLongPtrW(window, GWL_STYLE, style as isize);
-      let _ = SetWindowPos(
-        window,
-        None,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-      );
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+      SetWindowPos(window, None, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        .map_err(|error| super::create_window_err(error.to_string()))?;
+      SetLastError(WIN32_ERROR(0));
+      let applied = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+      let checked = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+      if applied & checked.0 != style & checked.0 {
+        return Err(super::create_window_err("native window did not retain its frame and capability styles".into()));
+      }
     }
+    Ok(())
+  }
+
+  #[test]
+  fn decorations_preserve_native_capability_styles_and_reject_stale_handles() {
+    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+    let owner = MenuOwner::new().unwrap();
+    let window = hwnd(owner.handle);
+    let capabilities = WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    for enabled in [false, true] {
+      let original = unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32;
+      let style = (original & !capabilities.0) | WS_CAPTION.0 | WS_SYSMENU.0
+        | if enabled { capabilities.0 } else { 0 };
+      unsafe { SetWindowLongPtrW(window, GWL_STYLE, style as isize); }
+      for decorated in [false, true, false, true] {
+        set_decorations(owner.handle, decorated).unwrap();
+        let applied = unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32;
+        assert_eq!(applied & capabilities.0, style & capabilities.0);
+        assert_eq!(applied & WS_SYSMENU.0, style & WS_SYSMENU.0);
+        assert_eq!(applied & WS_CAPTION.0, if decorated { WS_CAPTION.0 } else { 0 });
+      }
+    }
+    // No muda object references this test proxy.
+    unsafe { DestroyWindow(window) }.unwrap();
+    assert!(set_decorations(owner.handle, true).is_err());
   }
 
   fn screen_position_lparam(point: POINT) -> LPARAM {

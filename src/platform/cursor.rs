@@ -11,11 +11,9 @@
 
 use tauri_runtime::dpi::PhysicalPosition;
 
-/// Moves the cursor to `position`, given in physical pixels like the rest of
-/// Tauri. `scale` is the physical-pixels-per-point ratio (macOS warps in points).
-///
-/// A failure is reported as a message instead of an error so the caller can log
-/// it once through [`crate::runtime::unsupported`] and stay silent afterwards.
+/// Moves the cursor to a screen position in physical pixels. The window
+/// dispatcher translates client offsets first. `scale` converts macOS points.
+/// Native failures and unsupported platforms are returned to the caller.
 pub(crate) fn warp(position: PhysicalPosition<i32>, scale: f64) -> Result<(), String> {
   imp::warp(position, scale)
 }

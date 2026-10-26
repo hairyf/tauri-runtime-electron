@@ -5,7 +5,7 @@ import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
 
-const require = createRequire(import.meta.url)
+const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const root = path.resolve('download-fixture')
 const files = new Map()
 const directories = new Set()
@@ -67,7 +67,7 @@ const context = vm.createContext({
     return timer
   },
   clearTimeout: (timer) => timers.delete(timer),
-  testSocket: { write: (line) => messages.push(JSON.parse(line)) },
+  testSocket: { send: (message) => messages.push(message) },
 })
 vm.runInContext(`${readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8')}
 ;socket = testSocket; installPolicyHandlers();

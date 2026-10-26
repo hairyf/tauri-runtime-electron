@@ -12,7 +12,7 @@ fn main() {
 }
 
 fn prepare() -> Result<(), String> {
-  for path in ["build_support.rs", "electron-rs/assets/main.cjs", "electron-rs/assets/preload.cjs"] {
+  for path in ["build_support.rs", "electron-rs/assets/main.cjs", "electron-rs/assets/preload.cjs", "electron-rs/assets/ipc.cjs"] {
     println!("cargo:rerun-if-changed={path}");
   }
   for key in ["CARGO_TARGET_DIR", "INIT_CWD", "PWD", "TAURI_CONFIG"] {

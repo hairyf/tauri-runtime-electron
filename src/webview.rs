@@ -19,7 +19,6 @@ use url::Url;
 pub struct ElectronWebviewDispatcher {
   pub(crate) id: u32,
   pub(crate) context: RuntimeContext,
-  pub(crate) url: Arc<Mutex<String>>,
   pub(crate) last_evaluated_script: Arc<Mutex<Option<String>>>,
 }
 
@@ -66,7 +65,10 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   type Runtime = ElectronRuntime;
 
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
-    self.context.send_message(Message::Task(Box::new(f)))
+    let webview = self.clone();
+    self.context.send_message(Message::Task(Box::new(move || {
+      crate::new_window::with_webview(webview, f)
+    })))
   }
 
   fn on_webview_event<F: Fn(&tauri_runtime::window::WebviewEvent) + Send + 'static>(
@@ -148,21 +150,24 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
       .lock()
       .unwrap()
       .replace(script.clone());
-    match self.context.ipc.call(
+    self.context.window_for_webview(self.id)?;
+    let run_tx = self.context.run_tx.clone();
+    self.context.ipc.call_async(
       "webview.eval",
       json!({ "webviewId": self.id, "script": script }),
       IPC_TIMEOUT,
-    ) {
-      Ok(value) => {
-        callback(value.to_string());
-        Ok(())
-      }
-      Err(e) => Err(create_webview_err(e.to_string())),
-    }
+      move |result| {
+        // Only a Send channel crosses threads, never the runtime's RefCells.
+        let _ = run_tx.send(Message::Task(Box::new(move || match result {
+          Ok(value) => callback(value.to_string()),
+          Err(error) => eprintln!("[electron] script evaluation failed: {error}"),
+        })));
+      },
+    ).map_err(|error| create_webview_err(error.to_string()))
   }
 
   fn url(&self) -> Result<String> {
-    Ok(self.url.lock().unwrap().clone())
+    self.current_url()
   }
 
   fn bounds(&self) -> Result<tauri_runtime::dpi::Rect> {
@@ -178,10 +183,6 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn navigate(&self, url: Url) -> Result<()> {
-    *self.url.lock().unwrap() = url.to_string();
-    self
-      .context
-      .set_webview_origin_by_serial(self.id, url.as_str());
     self
       .webview_call("webview.navigate", json!({ "url": url.to_string() }))
       .map(|_| ())
@@ -196,8 +197,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn close(&self) -> Result<()> {
-    // The main page can veto its window close. Cleanup follows webview.closed
-    // for children and window.closed for the main page.
+    // Native views are owned independently; closing a page leaves its window alive.
     self.webview_call("webview.close", json!({})).map(|_| ())
   }
 
@@ -220,14 +220,8 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self.webview_call("webview.focus", json!({})).map(|_| ())
   }
 
-  /// A `<webview>` guest is anchored to the page that hosts it; Electron has no
-  /// API to move a guest into another window.
-  fn reparent(&self, _window_id: WindowId) -> Result<()> {
-    crate::runtime::unsupported(
-      "WebviewDispatch::reparent",
-      "an Electron <webview> guest cannot move to another window",
-    );
-    Ok(())
+  fn reparent(&self, window_id: WindowId) -> Result<()> {
+    self.context.reparent_webview(self.id, window_id)
   }
 
   fn cookies(&self) -> Result<Vec<tauri_runtime::Cookie<'static>>> {
@@ -241,7 +235,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn set_cookie(&self, cookie: tauri_runtime::Cookie<'_>) -> Result<()> {
-    let url = self.cookie_url(&cookie);
+    let url = self.cookie_url(&cookie)?;
     self
       .webview_call(
         "webview.setCookie",
@@ -260,7 +254,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn delete_cookie(&self, cookie: tauri_runtime::Cookie<'_>) -> Result<()> {
-    let url = self.cookie_url(&cookie);
+    let url = self.cookie_url(&cookie)?;
     self
       .webview_call(
         "webview.deleteCookie",
@@ -303,19 +297,20 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
 }
 
 impl ElectronWebviewDispatcher {
-  /// Electron cookies are stored against a URL; derive one from the cookie.
-  fn cookie_url(&self, cookie: &tauri_runtime::Cookie<'_>) -> String {
-    if let Some(domain) = cookie.domain() {
-      let scheme = if cookie.secure().unwrap_or(false) { "https" } else { "http" };
-      return format!("{scheme}://{domain}/");
-    }
-    self
-      .url
-      .lock()
-      .unwrap()
-      .parse::<Url>()
-      .map(|url| format!("{}://{}/", url.scheme(), url.host_str().unwrap_or("localhost")))
-      .unwrap_or_else(|_| "http://localhost/".into())
+  fn current_url(&self) -> Result<String> {
+    self.webview_call("webview.url", json!({}))?.as_str().map(str::to_owned)
+      .ok_or_else(|| create_webview_err("Electron returned no webview URL".into()))
+  }
+
+  /// Use the committed page, not the builder URL or a requested navigation.
+  fn cookie_url(&self, cookie: &tauri_runtime::Cookie<'_>) -> Result<String> {
+    let raw = match cookie.domain() {
+      Some(domain) => format!("{}://{}/", if cookie.secure().unwrap_or(false) { "https" } else { "http" }, domain.trim_start_matches('.')),
+      None => self.current_url()?,
+    };
+    let mut url = Url::parse(&raw).map_err(|error| create_webview_err(error.to_string()))?;
+    if let Some(path) = cookie.path() { url.set_path(path); }
+    Ok(url.into())
   }
 }
 

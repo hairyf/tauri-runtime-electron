@@ -3,7 +3,7 @@ use std::{
   io::{self, BufRead, BufReader, Write},
   net::{Shutdown, TcpListener, TcpStream},
   path::{Path, PathBuf},
-  process::{Child, Command},
+  process::{Child, Command, Stdio},
   sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
@@ -79,8 +79,10 @@ impl Electron {
       .map_err(|error| Error::with_source("bind IPC", error))?;
     let port = listener.local_addr()?.port();
     listener.set_nonblocking(true)?;
+    let token = handshake_token()?;
     let mut command = Command::new(&binary);
     command
+      .stdin(Stdio::piped())
       .arg(script)
       .arg("--port")
       .arg(port.to_string())
@@ -121,12 +123,25 @@ impl Electron {
       .spawn()
       .map_err(|error| Error::with_source(format!("spawn {}", binary.display()), error))?;
     let startup = (|| {
-      let stream = loop {
+      // Only the child inherits this pipe. Never expose the credential in argv,
+      // environment variables, files or diagnostics readable by another app.
+      writeln!(child.stdin.take().ok_or("Electron stdin unavailable")?, "{token}")?;
+      loop {
         if Instant::now() >= deadline {
-          return Err(format!("Electron did not connect within {timeout:?}").into());
+          return Err(format!("Electron did not authenticate within {timeout:?}").into());
         }
         match listener.accept() {
-          Ok((stream, _)) => break stream,
+          Ok((stream, _)) => {
+            // Accepted sockets inherit nonblocking mode on Windows. An invalid
+            // first client must neither become Electron nor prevent a real one.
+            stream.set_nonblocking(false)?;
+            let mut reader = BufReader::new(stream);
+            let peer_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+            if let Ok(version) = read_handshake(&mut reader, peer_deadline, &token) {
+              let writer = reader.get_ref().try_clone()?;
+              return Ok((reader, writer, version));
+            }
+          }
           Err(error)
             if matches!(
               error.kind(),
@@ -140,7 +155,7 @@ impl Electron {
         {
           return Err(
             format!(
-              "Electron exited before connecting ({status}): {}",
+              "Electron exited before authenticating ({status}): {}",
               binary.display()
             )
             .into(),
@@ -149,13 +164,7 @@ impl Electron {
         std::thread::sleep(
           Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
         );
-      };
-      // Accepted sockets inherit the listener's nonblocking mode on Windows.
-      stream.set_nonblocking(false)?;
-      let mut reader = BufReader::new(stream);
-      let version = read_handshake(&mut reader, deadline)?;
-      let writer = reader.get_ref().try_clone()?;
-      Ok((reader, writer, version))
+      }
     })();
     let (reader, writer, version) = match startup {
       Ok(connection) => connection,
@@ -237,8 +246,41 @@ impl Electron {
 
   /// Execute a synchronous RPC with a response timeout.
   pub fn call(&self, method: &str, params: Value, timeout: Duration) -> RpcResult {
+    let (id, receiver) = self.begin_call(method, params, timeout, false)?;
+    self.receive_response(id, receiver, method, timeout)
+  }
+
+  /// Send in call order without blocking the caller; complete on a waiter thread.
+  pub fn call_async(
+    self: &Arc<Self>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    callback: impl FnOnce(RpcResult) + Send + 'static,
+  ) -> Result<(), Error> {
+    let (id, receiver) = self.begin_call(method, params, timeout, true)?;
+    let electron = self.clone();
+    let method = method.to_owned();
+    // ponytail: one bounded waiter thread per callback; use a shared completion
+    // loop if measured concurrent evaluation volume makes this expensive.
+    if let Err(error) = std::thread::Builder::new().name("electron-rpc-callback".into()).spawn(move || {
+      callback(electron.receive_response(id, receiver, &method, timeout));
+    }) {
+      self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+      return Err(Error::with_source("start Electron RPC callback", error));
+    }
+    Ok(())
+  }
+
+  fn begin_call(
+    &self,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    asynchronous: bool,
+  ) -> Result<(u64, Receiver<RpcResult>), Error> {
     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
+    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params,"asynchronous":asynchronous}))?;
     line.push(b'\n');
     let (sender, receiver) = mpsc::channel();
     {
@@ -266,6 +308,10 @@ impl Electron {
       self.shutdown();
       return Err(error.context(format!("write Electron RPC `{method}`")));
     }
+    Ok((id, receiver))
+  }
+
+  fn receive_response(&self, id: u64, receiver: Receiver<RpcResult>, method: &str, timeout: Duration) -> RpcResult {
     match receiver.recv_timeout(timeout) {
       Ok(result) => result,
       Err(error) => {
@@ -291,7 +337,7 @@ impl Electron {
   /// event behind it. The reply is dropped even if Electron sends one.
   pub fn post(&self, method: &str, params: Value, timeout: Duration) -> Result<(), Error> {
     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
+    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params,"notification":true}))?;
     line.push(b'\n');
     if self.closed.load(Ordering::SeqCst) {
       return Err(format!("Electron is gone ({method})").into());
@@ -531,7 +577,23 @@ fn staged_identity(binary: &Path, script: &Path) -> Result<crate::Metadata, Erro
   Ok(identity)
 }
 
-fn read_handshake(reader: &mut BufReader<TcpStream>, deadline: Instant) -> Result<String, Error> {
+fn handshake_token() -> Result<String, Error> {
+  let mut bytes = [0u8; 32];
+  #[cfg(unix)]
+  {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+  }
+  #[cfg(windows)]
+  unsafe {
+    use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+      .ok().map_err(|error| Error::with_source("generate Electron IPC credential", error))?;
+  }
+  Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn read_handshake(reader: &mut BufReader<TcpStream>, deadline: Instant, token: &str) -> Result<String, Error> {
   let mut line = Vec::new();
   loop {
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -558,8 +620,11 @@ fn read_handshake(reader: &mut BufReader<TcpStream>, deadline: Instant) -> Resul
   }
   let handshake: Value = serde_json::from_slice(&line)
     .map_err(|error| Error::with_source("invalid Electron handshake", error))?;
-  if handshake["event"].as_str() != Some("ready") {
-    return Err(format!("unexpected Electron handshake: {handshake}").into());
+  let supplied = handshake.pointer("/params/token").and_then(Value::as_str).unwrap_or("");
+  // Fixed-size comparison: neither prefix matching nor an early mismatch exit.
+  let authenticated = supplied.len() == token.len() && supplied.bytes().zip(token.bytes()).fold(0, |diff, (a, b)| diff | (a ^ b)) == 0;
+  if !authenticated || handshake["event"].as_str() != Some("ready") {
+    return Err("unauthenticated Electron handshake".into());
   }
   reader.get_ref().set_read_timeout(None)?;
   Ok(
@@ -577,7 +642,8 @@ mod tests {
   use std::error::Error as _;
 
   const WAIT: Duration = Duration::from_secs(5);
-  const READY: &[u8] = b"{\"event\":\"ready\",\"params\":{\"electron\":\"test\"}}\n";
+  const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  const READY: &[u8] = b"{\"event\":\"ready\",\"params\":{\"electron\":\"test\",\"token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}}\n";
 
   fn loopback(handshake: &[u8]) -> (Arc<Electron>, TcpStream, BufReader<TcpStream>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -587,7 +653,7 @@ mod tests {
     let stream = listener.accept().unwrap().0;
     peer.write_all(handshake).unwrap();
     let mut reader = BufReader::new(stream);
-    let version = read_handshake(&mut reader, Instant::now() + WAIT).unwrap();
+    let version = read_handshake(&mut reader, Instant::now() + WAIT, TOKEN).unwrap();
     let (sender, receiver) = mpsc::sync_channel(EVENT_CAPACITY);
     let electron = Arc::new(Electron {
       binary: PathBuf::new(),
@@ -609,7 +675,7 @@ mod tests {
   #[test]
   fn pipelined_handshake_preserves_events_and_cleans_up_rpc_waiters() {
     let (electron, peer, reader) = loopback(
-      b"{\"event\":\"ready\",\"params\":{\"electron\":\"test\"}}\n{\"event\":\"early\"}\n",
+      &[READY, b"{\"event\":\"early\"}\n"].concat(),
     );
     let early = electron.subscribe();
     electron.start_reader(reader).unwrap();
@@ -635,6 +701,7 @@ mod tests {
         assert!(reader.read_line(&mut line).unwrap() > 0);
         let request: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["method"], method);
+        assert_eq!(request["notification"].as_bool().unwrap_or(false), method == "notify");
         if method == "notify" {
           // A reply to a posted call has no waiter and must be dropped.
           writeln!(
@@ -930,10 +997,25 @@ mod tests {
   }
 
   #[test]
+  fn handshake_rejects_unauthenticated_clients_and_keeps_the_credential_private() {
+    for params in [json!({"electron":"spoof"}), json!({"electron":"spoof","token":"wrong"}), json!({"electron":"spoof","token":format!("{TOKEN}extra")})] {
+      let (_electron, mut peer, mut reader) = loopback(READY);
+      writeln!(peer, "{}", json!({"event":"ready","params":params})).unwrap();
+      let error = read_handshake(&mut reader, Instant::now() + WAIT, TOKEN).unwrap_err();
+      assert_eq!(error.to_string(), "unauthenticated Electron handshake");
+      assert!(!error.to_string().contains(TOKEN));
+    }
+    let token = handshake_token().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(token, handshake_token().unwrap());
+  }
+
+  #[test]
   fn invalid_handshake_preserves_the_json_source() {
     let (_electron, mut peer, mut reader) = loopback(READY);
     peer.write_all(b"invalid JSON\n").unwrap();
-    let error = read_handshake(&mut reader, Instant::now() + WAIT).unwrap_err();
+    let error = read_handshake(&mut reader, Instant::now() + WAIT, TOKEN).unwrap_err();
     assert!(error.to_string().contains("invalid Electron handshake"));
     assert!(error
       .source()

@@ -98,7 +98,14 @@ fn main() -> ExitCode {
     }
   });
   match checks.join() {
-    Ok(status) if code == 0 => status,
+    Ok(status) if code == 0 => {
+      if status == ExitCode::SUCCESS {
+        evidence(&["Runtime::new", "Runtime::run_return"], "smoke::main",
+          "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+          0, &[]);
+      }
+      status
+    }
     Ok(_) => {
       eprintln!("[smoke] runtime exited with code {code}");
       ExitCode::FAILURE
@@ -126,7 +133,7 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
     visible: true,
     decorations: true,
     always_on_top: true,
-    // Creation-time only: nothing can set the minimum size afterwards.
+    // No minimum-size setter is called, so the later clamp checks this config.
     min_width: Some(250.0),
     min_height: Some(180.0),
     ..Default::default()
@@ -247,10 +254,20 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
 
   // The initial document can replace the window title while it loads. Wait
   // for its existing lifecycle check before exercising the title setter.
+  let before = failures.len();
   expect_named(&mut failures, "page load finished", "Finished", || {
     LOADS.lock().unwrap().clone()
   });
+  if let Some(webview) = webview.as_ref() {
+    expect_eval(&mut failures, "created window document", "smoke-page", webview, "document.title");
+  } else {
+    failures.push("create_window returned no webview for the requested page".into());
+  }
+  evidence(&["RuntimeHandle::create_window"], "smoke::run_checks",
+    "create_window returned a webview whose real custom-protocol document title is smoke-page and emitted page-load Finished",
+    before, &failures);
   native_access_checks(&window, &mut failures);
+  new_window_rejection_checks(&window, handle, &mut failures);
   window_checks(&window, &handle, &mut failures);
   if let Some(webview) = webview.as_ref() {
     session_checks(&window, webview, &session_a, &session_b, &mut failures);
@@ -263,11 +280,18 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
   // An idle app must stay connected: the handshake read used to leave a timeout
   // on the socket, and a minute of quiet then looked like a dead Electron.
   thread::sleep(Duration::from_secs(61));
+  let before = failures.len();
   set(&mut failures, "still connected after a minute", || {
     WindowDispatch::<()>::set_title(&window, "smoke-idle")
   });
+  expect(&mut failures, "title after idle", "smoke-idle".to_string(), || {
+    WindowDispatch::<()>::title(&window)
+  });
+  evidence(&["WindowDispatch::set_title", "WindowDispatch::title"], "smoke::run_checks",
+    "title() == smoke-idle after set_title following 61 seconds of idle IPC", before, &failures);
 
   // Closing has to reach the event loop, otherwise the process outlives the test.
+  let before = failures.len();
   set(&mut failures, "close", || WindowDispatch::<()>::close(&window));
   expect_named(&mut failures, "closed event", "destroyed", || {
     REPORT.lock().unwrap().clone()
@@ -275,6 +299,8 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
   if exit_rx.recv_timeout(Duration::from_secs(20)).is_err() {
     failures.push("the event loop did not exit after the last window closed".into());
   }
+  evidence(&["WindowDispatch::close"], "smoke::run_checks",
+    "close emitted Destroyed and the last window caused the event loop to request exit", before, &failures);
 
   if failures.is_empty() {
     println!("\n[smoke] {} checks passed", CHECKS.load(Ordering::Relaxed));
@@ -285,6 +311,45 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
       eprintln!("  - {failure}");
     }
     ExitCode::FAILURE
+  }
+}
+
+// This is an unsupported-contract regression, not popup support: both public
+// creation paths must return the reason without calling a fabricated opener.
+fn new_window_rejection_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
+  use std::sync::{Arc, atomic::AtomicBool};
+  use tauri_runtime::webview::NewWindowResponse;
+
+  let called = Arc::new(AtomicBool::new(false));
+  for child in [false, true] {
+    let mut webview = PendingWebview::<(), ElectronRuntime>::new(
+      WebviewAttributes::new(WebviewUrl::default()), "unsupported-popup",
+    ).unwrap();
+    let invoked = called.clone();
+    webview.new_window_handler = Some(Box::new(move |_, _| {
+      invoked.store(true, Ordering::SeqCst);
+      NewWindowResponse::Deny
+    }));
+    let result = if child {
+      WindowDispatch::<()>::create_webview(&mut window.clone(), webview).map(|_| ())
+    } else {
+      let mut pending = PendingWindow::<(), ElectronRuntime>::new(
+        <ElectronWindowBuilder as tauri_runtime::window::WindowBuilder>::new(),
+        "unsupported-popup-window",
+      ).unwrap();
+      pending.set_webview(webview);
+      let after: Option<fn(RawWindow<'_>)> = None;
+      <ElectronRuntimeHandle as RuntimeHandle<()>>::create_window(handle, pending, after).map(|_| ())
+    };
+    CHECKS.fetch_add(1, Ordering::Relaxed);
+    match result {
+      Err(error) if error.to_string().contains("new-window callbacks require a native opener")
+        && !called.load(Ordering::SeqCst) => {
+          println!("ok   new-window handler rejects {} creation explicitly (unsupported, not implemented)",
+            if child { "child webview" } else { "window" });
+        }
+      other => failures.push(format!("new-window handler creation (child={child}): {other:?}")),
+    }
   }
 }
 
@@ -333,10 +398,12 @@ fn session_checks(
       NAVIGATIONS.lock().unwrap().push(format!("{label}:{}", url));
       true
     }));
+    let before = failures.len();
     match WindowDispatch::<()>::create_webview(&mut window.clone(), pending) {
       Ok(extra) => {
         expect_eval(failures, label, want, &extra.dispatcher,
           "localStorage.getItem('smoke-session') ?? 'empty'");
+        expect_eval(failures, "created child document", "smoke-page", &extra.dispatcher, "document.title");
         set(failures, "navigate session webview", || {
           WebviewDispatch::<()>::navigate(&extra.dispatcher, SECOND_PAGE.parse().unwrap())
         });
@@ -345,11 +412,19 @@ fn session_checks(
         expect_named(failures, "session navigation callback", &format!("{label}:{SECOND_PAGE}"), || {
           NAVIGATIONS.lock().unwrap().clone()
         });
+        evidence(&["WindowDispatch::create_webview", "WebviewDispatch::navigate"], "smoke::session_checks",
+          &format!("{label} child loads smoke-page, reads localStorage={want}, then loads smoke-second and emits its own navigation callback"),
+          before, failures);
         set(failures, "close session webview", || {
           WebviewDispatch::<()>::close(&extra.dispatcher)
         });
       }
-      Err(error) => failures.push(format!("{label}: {error}")),
+      Err(error) => {
+        failures.push(format!("{label}: {error}"));
+        evidence(&["WindowDispatch::create_webview"], "smoke::session_checks",
+          &format!("{label} child loads smoke-page, reads localStorage={want}, then loads smoke-second and emits its own navigation callback"),
+          before, failures);
+      }
     }
   }
 }
@@ -363,35 +438,49 @@ fn window_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
 }
 
 fn title_checks(window: &Window, failures: &mut Vec<String>) {
+  let before = failures.len();
   set(failures, "set_title", || {
     WindowDispatch::<()>::set_title(window, "smoke-1")
   });
   expect(failures, "title", "smoke-1".to_string(), || {
     WindowDispatch::<()>::title(window)
   });
+  evidence(&["WindowDispatch::set_title", "WindowDispatch::title"], "smoke::title_checks",
+    "live window title() == smoke-1 after set_title", before, failures);
 }
 
 fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
   // A scale factor of zero would make every physical conversion divide by zero.
+  let before = failures.len();
   match WindowDispatch::<()>::scale_factor(window) {
     Ok(scale) if scale > 0.0 && scale.is_finite() => println!("ok   scale_factor {scale}"),
     Ok(scale) => failures.push(format!("scale_factor is not usable: {scale}")),
     Err(error) => failures.push(format!("scale_factor: {error}")),
   }
+  evidence(&["WindowDispatch::scale_factor"], "smoke::geometry_checks",
+    "live Electron geometry reports a finite scale factor greater than zero", before, failures);
+  let before = failures.len();
   match WindowDispatch::<()>::current_monitor(window) {
     Ok(Some(monitor)) => println!("ok   current_monitor {:?}", monitor.name),
     Ok(None) => failures.push("current_monitor: the window sits on no monitor".into()),
     Err(error) => failures.push(format!("current_monitor: {error}")),
   }
+  evidence(&["WindowDispatch::current_monitor"], "smoke::geometry_checks",
+    "Electron screen.getDisplayMatching for the live window returns a monitor", before, failures);
+  let before = failures.len();
   match WindowDispatch::<()>::available_monitors(window) {
     Ok(monitors) if !monitors.is_empty() => println!("ok   available_monitors {}", monitors.len()),
     Ok(_) => failures.push("available_monitors is empty".into()),
     Err(error) => failures.push(format!("available_monitors: {error}")),
   }
 
+  evidence(&["WindowDispatch::available_monitors"], "smoke::geometry_checks",
+    "Electron screen.getAllDisplays returns a nonempty monitor list", before, failures);
+
   // The creation size travelled through a builder setter, the way Tauri's own
   // `inner_size` does; a runtime that drops it comes up at Electron's default.
   let scale = WindowDispatch::<()>::scale_factor(window).unwrap_or(1.0);
+  let before = failures.len();
   expect_size(
     failures,
     "inner_size from the builder",
@@ -403,12 +492,22 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::inner_size(window),
   );
 
+  evidence(&["WindowBuilder::inner_size", "WindowDispatch::inner_size"], "smoke::geometry_checks",
+    "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+    before, failures);
+
   // Stay above the 250x180 DIP minimum on high-DPI screens while exercising
   // the physical-size conversion rather than asking the OS to clamp our target.
   let resized = PhysicalSize::new((420.0 * scale).round() as u32, (320.0 * scale).round() as u32);
+  let before = failures.len();
   set(failures, "set_size", || {
     WindowDispatch::<()>::set_size(window, Size::Physical(resized))
   });
+  expect_size(failures, "inner_size", resized, 8, || {
+    WindowDispatch::<()>::inner_size(window)
+  });
+  evidence(&["WindowDispatch::set_size", "WindowDispatch::inner_size"], "smoke::geometry_checks",
+    "live content size matches set_size(420x320 logical pixels in physical units) within 8px", before, failures);
 
   set(failures, "set_position", || {
     WindowDispatch::<()>::set_position(
@@ -428,9 +527,7 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
 
   // `set_size` sets the content size, so the content is what has to arrive;
   // the frame around it makes `outer_size` larger by an OS-specific amount.
-  expect_size(failures, "inner_size", resized, 8, || {
-    WindowDispatch::<()>::inner_size(window)
-  });
+  let before = failures.len();
   match (
     WindowDispatch::<()>::inner_size(window),
     WindowDispatch::<()>::outer_size(window),
@@ -443,21 +540,29 @@ fn geometry_checks(window: &Window, failures: &mut Vec<String>) {
     (Err(error), _) => failures.push(format!("inner_size: {error}")),
   }
 
+  evidence(&["WindowDispatch::outer_size"], "smoke::geometry_checks",
+    "live outer frame size contains the live content size in both dimensions", before, failures);
+
   // The minimum size came from the creation config; a window smaller than it
   // means the runtime dropped that field on the way to Electron. Electron
   // applies it to the frame, so `outer_size` is what has to hold. Last, because
   // it leaves the window at the minimum.
   let scale = WindowDispatch::<()>::scale_factor(window).unwrap_or(1.0);
   let floor = PhysicalSize::new((250.0 * scale) as u32, (180.0 * scale) as u32);
+  let before = failures.len();
   set(failures, "set_size below the minimum", || {
     WindowDispatch::<()>::set_size(window, Size::Physical(PhysicalSize::new(120, 100)))
   });
   expect_floor(failures, "minimum size holds", floor, || {
     WindowDispatch::<()>::outer_size(window)
   });
+  evidence(&["WindowBuilder::with_config"], "smoke::geometry_checks",
+    "with_config min_width=250/min_height=180 keeps the live outer frame above the scaled minimum after requesting 120x100 physical pixels",
+    before, failures);
 }
 
 fn state_checks(window: &Window, failures: &mut Vec<String>) {
+  let before = failures.len();
   set(failures, "set_resizable", || {
     WindowDispatch::<()>::set_resizable(window, false)
   });
@@ -470,7 +575,10 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
   expect(failures, "is_resizable back", true, || {
     WindowDispatch::<()>::is_resizable(window)
   });
+  evidence(&["WindowDispatch::set_resizable", "WindowDispatch::is_resizable"], "smoke::state_checks",
+    "live isResizable reads false then true after set_resizable(false) then set_resizable(true)", before, failures);
 
+  let before = failures.len();
   expect_applied(
     failures,
     "is_enabled",
@@ -485,7 +593,10 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::set_enabled(window, true),
     || WindowDispatch::<()>::is_enabled(window),
   );
-  // Focus and minimization both animate, so they are polled like the rest.
+  evidence(&["WindowDispatch::set_enabled", "WindowDispatch::is_enabled"], "smoke::state_checks",
+    "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)", before, failures);
+  // Already-focused windows cannot prove that set_focus changed anything.
+  let before = failures.len();
   expect_applied(
     failures,
     "is_focused",
@@ -493,19 +604,17 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::set_focus(window),
     || WindowDispatch::<()>::is_focused(window),
   );
+  evidence(&["WindowDispatch::is_focused"], "smoke::state_checks",
+    "live Electron isFocused reports true", before, failures);
 
-  // The window asks for always-on-top while it is created, which is how an app
-  // usually does it; the setter then has to turn it off and back on.
+  // Creation config must survive before the setter changes the native state.
+  let before = failures.len();
   expect(failures, "is_always_on_top at creation", true, || {
     WindowDispatch::<()>::is_always_on_top(window)
   });
-  expect_applied(
-    failures,
-    "is_always_on_top",
-    true,
-    || WindowDispatch::<()>::set_always_on_top(window, true),
-    || WindowDispatch::<()>::is_always_on_top(window),
-  );
+  evidence(&["WindowBuilder::with_config", "WindowDispatch::is_always_on_top"], "smoke::state_checks",
+    "live always-on-top state is true from creation config before the setter is called", before, failures);
+  let before = failures.len();
   expect_applied(
     failures,
     "is_always_on_top off",
@@ -513,9 +622,18 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::set_always_on_top(window, false),
     || WindowDispatch::<()>::is_always_on_top(window),
   );
+  expect_applied(
+    failures,
+    "is_always_on_top",
+    true,
+    || WindowDispatch::<()>::set_always_on_top(window, true),
+    || WindowDispatch::<()>::is_always_on_top(window),
+  );
+  evidence(&["WindowDispatch::set_always_on_top", "WindowDispatch::is_always_on_top"], "smoke::state_checks",
+    "live always-on-top state changes false then true after set_always_on_top(false) then true", before, failures);
 
-  // Electron can only change the frame through Win32, and it documents the
-  // three "izable" getters for macOS and Windows only.
+  // These getters mirror requested values, not native frame/button state.
+  // Retain their regressions, but do not emit behavior-pass evidence for them.
   if cfg!(windows) {
     set(failures, "set_decorations", || {
       WindowDispatch::<()>::set_decorations(window, false)
@@ -533,6 +651,7 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     println!("skip decorations: Electron cannot change the frame after creation");
   }
 
+  let before = failures.len();
   expect_applied(
     failures,
     "is_maximized",
@@ -547,11 +666,10 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::unmaximize(window),
     || WindowDispatch::<()>::is_maximized(window),
   );
+  evidence(&["WindowDispatch::maximize", "WindowDispatch::unmaximize", "WindowDispatch::is_maximized"], "smoke::state_checks",
+    "live maximized state reads true after maximize and false after unmaximize", before, failures);
 
   if cfg!(any(windows, target_os = "macos")) {
-    // Electron's macOS zoom button is enabled from the window style, not from
-    // what set_maximizable asked for (native_window_mac.mm: UpdateZoomButton
-    // only looks at the resizable mask), so only Windows can report it back.
     if cfg!(windows) {
       set(failures, "set_maximizable", || {
         WindowDispatch::<()>::set_maximizable(window, false)
@@ -582,15 +700,24 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     println!("skip maximizable/minimizable/closable: macOS and Windows only");
   }
 
+  let before = failures.len();
+  set(failures, "set_theme light", || {
+    WindowDispatch::<()>::set_theme(window, Some(Theme::Light))
+  });
+  expect(failures, "theme light", Theme::Light, || {
+    WindowDispatch::<()>::theme(window)
+  });
   set(failures, "set_theme", || {
     WindowDispatch::<()>::set_theme(window, Some(Theme::Dark))
   });
   expect(failures, "theme", Theme::Dark, || {
     WindowDispatch::<()>::theme(window)
   });
+  evidence(&["WindowDispatch::set_theme", "WindowDispatch::theme"], "smoke::state_checks",
+    "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))", before, failures);
 
-  // Minimization runs last: on macOS it re-derives the window style, and the
-  // getters above read that style.
+  // Minimization runs last because macOS re-derives its window style.
+  let before = failures.len();
   expect_applied(
     failures,
     "is_minimized",
@@ -605,9 +732,12 @@ fn state_checks(window: &Window, failures: &mut Vec<String>) {
     || WindowDispatch::<()>::unminimize(window),
     || WindowDispatch::<()>::is_minimized(window),
   );
+  evidence(&["WindowDispatch::minimize", "WindowDispatch::unminimize", "WindowDispatch::is_minimized"], "smoke::state_checks",
+    "live minimized state reads true after minimize and false after unminimize", before, failures);
 }
 
 fn visibility_checks(window: &Window, failures: &mut Vec<String>) {
+  let before = failures.len();
   set(failures, "hide", || WindowDispatch::<()>::hide(window));
   expect(failures, "is_visible", false, || {
     WindowDispatch::<()>::is_visible(window)
@@ -616,6 +746,8 @@ fn visibility_checks(window: &Window, failures: &mut Vec<String>) {
   expect(failures, "is_visible again", true, || {
     WindowDispatch::<()>::is_visible(window)
   });
+  evidence(&["WindowDispatch::hide", "WindowDispatch::show", "WindowDispatch::is_visible"], "smoke::visibility_checks",
+    "live isVisible reads false after hide and true after show", before, failures);
 }
 
 fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
@@ -629,58 +761,140 @@ fn cursor_checks(window: &Window, handle: &Handle, failures: &mut Vec<String>) {
     failures.push("cursor_position: cannot read the starting position".into());
     return;
   };
-  let monitor = match WindowDispatch::<()>::current_monitor(window) {
-    Ok(Some(monitor)) => monitor,
-    other => {
-      failures.push(format!("cursor_position: cannot locate the window's monitor: {other:?}"));
-      return;
-    }
-  };
-  // A relative move can leave the monitor or land in a multi-display gap, where
-  // the OS clamps it. Pick an interior point on the window's actual monitor.
-  let area = monitor.work_area;
-  let mut target = PhysicalPosition::new(
-    f64::from(area.position.x) + f64::from(area.size.width) / 2.0,
-    f64::from(area.position.y) + f64::from(area.size.height) / 2.0,
-  );
-  if (target.x - start.x).abs() <= 2.0 && (target.y - start.y).abs() <= 2.0 {
-    target.x = f64::from(area.position.x) + f64::from(area.size.width) / 4.0;
-  }
-  let request = Position::Physical(PhysicalPosition::new(
-    target.x.round() as i32,
-    target.y.round() as i32,
-  ));
-  let started = Instant::now();
-  loop {
-    if let Err(error) = WindowDispatch::<()>::set_cursor_position(window, request) {
-      failures.push(format!("set_cursor_position: {error}"));
-      return;
-    }
-    // A resting mouse keeps resending its position, so the warp has to be
-    // repeated until a read catches it instead of being applied once.
-    match <ElectronRuntimeHandle as RuntimeHandle<()>>::cursor_position(handle) {
-      Ok(got) => {
-        if (got.x - target.x).abs() <= 2.0 && (got.y - target.y).abs() <= 2.0 {
-          CHECKS.fetch_add(1, Ordering::Relaxed);
-          println!("ok   cursor_position {got:?} from {start:?} in {:?}", started.elapsed());
-          return;
+  #[cfg(windows)]
+  use windows::{core::PCWSTR, Win32::{
+    Foundation::{POINT, RECT}, Graphics::Gdi::ClientToScreen,
+    UI::WindowsAndMessaging::{FindWindowExW, GetClassNameW, GetPhysicalCursorPos, GetWindowRect,
+      GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetPhysicalCursorPos},
+  }};
+  #[cfg(windows)]
+  let mut restore_title = None;
+  #[cfg(windows)]
+  let mut restore_pointer = None;
+  let before = failures.len();
+  let result = (|| -> tauri_runtime::Result<()> {
+    #[cfg(windows)]
+    let win32_error = |error| tauri_runtime::Error::CreateWebview(Box::new(error));
+    #[cfg(windows)]
+    let hwnd = {
+      restore_title = Some(WindowDispatch::<()>::title(window)?);
+      let mut point = POINT::default();
+      unsafe { GetPhysicalCursorPos(&mut point) }.map_err(win32_error)?;
+      restore_pointer = Some(point);
+      let title = format!("smoke-cursor-{}", std::process::id());
+      WindowDispatch::<()>::set_title(window, title.clone())?;
+      let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+      let started = Instant::now();
+      loop {
+        let mut after = None;
+        let mut found = Vec::new();
+        // Enumerate matching top-level windows, not the first unqualified title
+        // match. The hidden menu proxy belongs to Rust, not to Electron.
+        while let Ok(hwnd) = unsafe { FindWindowExW(None, after, None, PCWSTR(title.as_ptr())) } {
+          after = Some(hwnd);
+          let mut pid = 0;
+          unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
+          if pid != 0 && pid != std::process::id()
+            && unsafe { IsWindowVisible(hwnd) }.as_bool() && !unsafe { IsIconic(hwnd) }.as_bool() {
+            found.push(hwnd);
+          }
+        }
+        if found.len() == 1 {
+          let hwnd = found[0];
+          let mut class = [0; 256];
+          let length = unsafe { GetClassNameW(hwnd, &mut class) };
+          println!("ok   cursor test HWND {hwnd:?} class {}", String::from_utf16_lossy(&class[..length.max(0) as usize]));
+          break hwnd;
         }
         if started.elapsed() > SETTLE {
-          failures.push(format!("cursor_position: got {got:?}, want {target:?}"));
-          return;
+          failures.push(format!("cursor window lookup: expected one visible foreign-process window with unique title, found {found:?}"));
+          return Ok(());
         }
+        thread::sleep(Duration::from_millis(25));
       }
-      Err(error) => {
-        failures.push(format!("cursor_position: {error}"));
-        return;
+    };
+    #[cfg(not(windows))]
+    let origin = WindowDispatch::<()>::inner_position(window)?;
+    let scale = WindowDispatch::<()>::scale_factor(window)?;
+    let size = WindowDispatch::<()>::inner_size(window)?;
+    // Two different interior points catch both a no-op and treating these
+    // window-relative coordinates as desktop coordinates.
+    for (divisor, logical) in [(3, false), (2, true)] {
+      let offset = PhysicalPosition::new((size.width / divisor) as i32, (size.height / divisor) as i32);
+      let request = if logical { Position::Logical(offset.to_logical::<f64>(scale)) }
+        else { Position::Physical(offset) };
+      let started = Instant::now();
+      loop {
+        #[cfg(windows)]
+        let (target, bounds) = {
+          let mut bounds = RECT::default();
+          let mut point = POINT { x: offset.x, y: offset.y };
+          // Show/restore can still move the window. Sample the native client
+          // mapping on every retry instead of freezing a transient origin.
+          unsafe { GetWindowRect(hwnd, &mut bounds) }.map_err(win32_error)?;
+          unsafe { ClientToScreen(hwnd, &mut point) }.ok().map_err(win32_error)?;
+          (PhysicalPosition::new(f64::from(point.x), f64::from(point.y)), bounds)
+        };
+        #[cfg(not(windows))]
+        let target = PhysicalPosition::new(f64::from(origin.x + offset.x), f64::from(origin.y + offset.y));
+        WindowDispatch::<()>::set_cursor_position(window, request)?;
+        let got = <ElectronRuntimeHandle as RuntimeHandle<()>>::cursor_position(handle)?;
+        #[cfg(windows)]
+        let native = {
+          let mut point = POINT::default();
+          unsafe { GetPhysicalCursorPos(&mut point) }.map_err(win32_error)?;
+          PhysicalPosition::new(f64::from(point.x), f64::from(point.y))
+        };
+        #[cfg(not(windows))]
+        let native = got;
+        if (got.x - target.x).abs() <= 2.0 && (got.y - target.y).abs() <= 2.0
+          && (native.x - target.x).abs() <= 2.0 && (native.y - target.y).abs() <= 2.0 {
+          CHECKS.fetch_add(1, Ordering::Relaxed);
+          println!("ok   window-relative cursor_position {got:?} native={native:?} from {start:?} (logical={logical})");
+          break;
+        }
+        if started.elapsed() > SETTLE {
+          #[cfg(windows)]
+          eprintln!("cursor test HWND {hwnd:?} window bounds {bounds:?}, offset {offset:?}");
+          failures.push(format!("cursor_position (logical={logical}): runtime {got:?}, native {native:?}, want {target:?}"));
+          break;
+        }
+        // A resting physical mouse may resend its position between warp/read.
+        thread::sleep(Duration::from_millis(25));
       }
     }
-    thread::sleep(Duration::from_millis(25));
+    CHECKS.fetch_add(1, Ordering::Relaxed);
+    if WindowDispatch::<()>::set_cursor_position(window,
+      tauri_runtime::dpi::LogicalPosition::new(f64::NAN, 0.0)).is_ok() {
+      failures.push("cursor position accepted NaN".into());
+    }
+    #[cfg(not(windows))]
+    WindowDispatch::<()>::set_cursor_position(window, PhysicalPosition::new(
+      (start.x.round() as i32).saturating_sub(origin.x),
+      (start.y.round() as i32).saturating_sub(origin.y),
+    ))?;
+    Ok(())
+  })();
+  if let Err(error) = result { failures.push(format!("cursor_position: {error}")); }
+  #[cfg(windows)]
+  {
+    if let Some(point) = restore_pointer {
+      if let Err(error) = unsafe { SetPhysicalCursorPos(point.x, point.y) } {
+        failures.push(format!("restore cursor: {error}"));
+      }
+    }
+    if let Some(title) = restore_title {
+      set(failures, "restore cursor test title", || WindowDispatch::<()>::set_title(window, title));
+    }
   }
+  evidence(&["WindowDispatch::set_cursor_position", "RuntimeHandle::cursor_position"], "smoke::cursor_checks",
+    "physical and logical client offsets reach two distinct screen points and NaN is rejected; on Windows a unique visible Electron HWND supplies ClientToScreen targets and GetPhysicalCursorPos independently agrees with the runtime getter",
+    before, failures);
 }
 
 /// The cursor icon and visibility show up on the page, so the page reports them.
 fn cursor_style_checks(window: &Window, webview: &Webview, failures: &mut Vec<String>) {
+  let before = failures.len();
   set(failures, "set_cursor_icon", || {
     WindowDispatch::<()>::set_cursor_icon(window, CursorIcon::Hand)
   });
@@ -691,6 +905,9 @@ fn cursor_style_checks(window: &Window, webview: &Webview, failures: &mut Vec<St
     webview,
     "getComputedStyle(document.documentElement).cursor",
   );
+  evidence(&["WindowDispatch::set_cursor_icon"], "smoke::cursor_style_checks",
+    "page computed root cursor is pointer after set_cursor_icon(Hand)", before, failures);
+  let before = failures.len();
   set(failures, "set_cursor_visible", || {
     WindowDispatch::<()>::set_cursor_visible(window, false)
   });
@@ -711,6 +928,8 @@ fn cursor_style_checks(window: &Window, webview: &Webview, failures: &mut Vec<St
     webview,
     "getComputedStyle(document.documentElement).cursor",
   );
+  evidence(&["WindowDispatch::set_cursor_visible"], "smoke::cursor_style_checks",
+    "page computed cursor changes to none when hidden and returns to pointer when shown", before, failures);
 }
 fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   let Some(webview) = webview else {
@@ -741,7 +960,17 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     NAVIGATIONS.lock().unwrap().clone()
   });
 
-  expect_eval(failures, "eval_script", "2", webview, "1 + 1");
+  let before = failures.len();
+  expect_eval(failures, "eval_script_with_callback", "2", webview, "1 + 1");
+  evidence(&["WebviewDispatch::eval_script_with_callback"], "smoke::webview_checks",
+    "the real page evaluates 1 + 1 and invokes the callback with JSON 2", before, failures);
+  let before = failures.len();
+  set(failures, "eval_script", || {
+    WebviewDispatch::<()>::eval_script(webview, "window.__smokeEval = 'executed'")
+  });
+  expect_eval(failures, "eval_script page effect", "executed", webview, "window.__smokeEval");
+  evidence(&["WebviewDispatch::eval_script"], "smoke::webview_checks",
+    "callback evaluation reads executed from the page global written by fire-and-forget eval_script", before, failures);
   expect_eval(
     failures,
     "loaded page",
@@ -750,9 +979,13 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     "document.title",
   );
 
+  let before = failures.len();
   expect(failures, "url", PAGE.to_string(), || {
     WebviewDispatch::<()>::url(webview)
   });
+  expect_eval(failures, "live initial URL", PAGE, webview, "location.href");
+  evidence(&["WebviewDispatch::url"], "smoke::webview_checks",
+    "url() and the real page location.href both equal the initial custom-protocol URL", before, failures);
   let _ = eval_once(webview,
     "(() => { const sibling = document.createElement('iframe'); sibling.id = 'smoke-sibling'; sibling.src = 'tauri://localhost/sibling.html'; document.body.append(sibling); return 'requested' })()");
   expect_named(failures, "sibling navigation callback", "tauri://localhost/sibling.html", || {
@@ -778,6 +1011,7 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   });
   expect_eval(failures, "veto keeps current document", "tauri://localhost/index.html/smoke-page", webview,
     "location.href + '/' + document.title");
+  let before = failures.len();
   set(failures, "navigate", || {
     WebviewDispatch::<()>::navigate(webview, SECOND_PAGE.parse().unwrap())
   });
@@ -789,7 +1023,11 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   expect_named(failures, "main navigation callback", SECOND_PAGE, || {
     NAVIGATIONS.lock().unwrap().clone()
   });
+  expect_eval(failures, "live navigated URL", SECOND_PAGE, webview, "location.href");
+  evidence(&["WebviewDispatch::navigate", "WebviewDispatch::url"], "smoke::webview_checks",
+    "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href", before, failures);
 
+  let before = failures.len();
   expect_applied(
     failures,
     "devtools open",
@@ -804,12 +1042,15 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
   expect(failures, "devtools closed", false, || {
     WebviewDispatch::<()>::is_devtools_open(webview)
   });
+  evidence(&["WebviewDispatch::open_devtools", "WebviewDispatch::close_devtools", "WebviewDispatch::is_devtools_open"], "smoke::webview_checks",
+    "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools", before, failures);
 
   // A zoom factor is a style/paint decision, invisible to every getter of this
   // trait, so the page itself reports it, relative to the display scale.
   let scale = eval_once(webview, "window.devicePixelRatio")
     .and_then(|value| value.trim_matches('"').parse::<f64>().ok())
     .unwrap_or(1.0);
+  let before = failures.len();
   set(failures, "set_zoom", || {
     WebviewDispatch::<()>::set_zoom(webview, 2.0)
   });
@@ -830,6 +1071,8 @@ fn webview_checks(webview: Option<&Webview>, failures: &mut Vec<String>) {
     webview,
     "String(window.devicePixelRatio)",
   );
+  evidence(&["WebviewDispatch::set_zoom"], "smoke::webview_checks",
+    "page devicePixelRatio doubles after set_zoom(2) and returns to its initial value after set_zoom(1)", before, failures);
 
   // The runtime reports document titles to the handler an app registers.
   expect_named(failures, "document title", "smoke-page", || {
@@ -925,6 +1168,20 @@ fn expect_applied<T: PartialEq + Debug>(
       return;
     }
     thread::sleep(Duration::from_millis(25));
+  }
+}
+
+/// Call only after the named behavior assertion, never after a setter alone.
+fn evidence(members: &[&str], test: &str, assertion: &str, before: usize, failures: &[String]) {
+  let status = if failures.len() == before { "pass" } else { "fail" };
+  for member in members {
+    println!("[runtime-evidence] {}", serde_json::json!({
+      "member": member,
+      "test": test,
+      "assertion": assertion,
+      "kind": "behavior",
+      "status": status,
+    }));
   }
 }
 

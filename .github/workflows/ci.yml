@@ -84,7 +84,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf openbox
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf openbox x11-utils xdotool
 
       - name: Cache cargo and Electron
         uses: actions/cache@v6
@@ -139,20 +139,28 @@ jobs:
           chmod +x "$RUNNER_TEMP/electron-runner"
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$RUNNER_TEMP/electron-runner" >> "$GITHUB_ENV"
 
-      - name: Test runtime and adapter
-        if: runner.os != 'Linux'
+      # Explicit assertion markers only; old "ok" lines never imply member coverage.
+      - name: Test runtime and collect member evidence
+        shell: bash
         env:
           TAURI_RUNTIME_ELECTRON_TRACE: '1'
-        run: pnpm run test:runtime
+        run: |
+          # One process per suite, no parallel GUI; failed commands remain failed.
+          output="target/runtime-evidence/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
+              sh -c 'openbox & sleep 1; node tests/checks/runtime-suites.mjs "$1"' sh "$output"
+          else
+            node tests/checks/runtime-suites.mjs "$output"
+          fi
 
-      # Maximizing and resizing need a window manager as well as an X server.
-      - name: Test runtime and adapter under a virtual display
-        if: runner.os == 'Linux'
-        env:
-          TAURI_RUNTIME_ELECTRON_TRACE: '1'
-        run: >
-          xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
-          sh -c 'openbox & sleep 1; pnpm run test:runtime'
+      - name: Upload runtime member evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: runtime-evidence-${{ matrix.os }}-${{ github.run_attempt }}
+          path: target/runtime-evidence/${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
 
       - name: Build
         run: cargo build --locked --lib
@@ -202,12 +210,45 @@ jobs:
       - name: Check docs/coverage.md is current
         run: pnpm run test:coverage
 
-      - name: Summarize coverage
-        if: always()
+  member-evidence:
+    name: Real desktop member acceptance
+    needs: build
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Download this run's runtime assertions
+        uses: actions/download-artifact@v5
+        with:
+          pattern: runtime-evidence-*-${{ github.run_attempt }}
+          path: target/member-evidence
+
+      - name: Report available exact-commit evidence (missing platforms stay unknown)
         run: |
-          {
-            echo '### tauri-runtime coverage'
-            echo '```'
-            node tests/checks/coverage.mjs
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          node tests/checks/coverage.mjs --md \
+            --evidence target/member-evidence --commit "$GITHUB_SHA" \
+            --run "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+            > target/member-coverage.md
+          cat target/member-coverage.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload member acceptance report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: desktop-member-acceptance-${{ github.run_attempt }}
+          path: target/member-coverage.md
+          if-no-files-found: warn
+
+      # Do not silently promote the subset to production acceptance.
+      - name: Require 80 percent of complete desktop members
+        run: |
+          node tests/checks/coverage.mjs \
+            --evidence target/member-evidence --commit "$GITHUB_SHA" \
+            --run "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" --require-platforms --require-suites --min-percent 80

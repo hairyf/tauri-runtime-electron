@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 
-const require = createRequire(import.meta.url)
+const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const handlers = new Map()
 const registrations = []
 const requests = []
@@ -43,8 +43,7 @@ const context = vm.createContext({
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {} },
   Buffer, URL, Request, Response, Headers, Uint8Array, console,
   testSocket: {
-    write(line) {
-      const message = JSON.parse(line)
+    send(message) {
       if (message.event === 'ipc.message') messages.push(message.params)
       else {
         requests.push(message)

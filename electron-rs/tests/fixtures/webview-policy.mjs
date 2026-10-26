@@ -6,7 +6,7 @@ import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
 
-const require = createRequire(import.meta.url)
+const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const electronDirectory = fileURLToPath(new URL('../../assets/', import.meta.url))
 const root = path.join(electronDirectory, 'virtual-webview-policy')
 const generatedPreloads = new Map()
@@ -81,13 +81,14 @@ const session = {
   },
 }
 class Contents extends EventEmitter {
-  constructor() {
+  constructor(options = {}) {
     super()
+    this.session = options.webPreferences?.session ?? defaultSession
     this.id = ++nextContents
     this.loads = []
     this.stops = 0
     this.destroyed = false
-    this.mainFrame = { url: 'https://page.invalid/', origin: 'https://page.invalid' }
+    this.mainFrame = { url: 'https://page.invalid/', origin: 'https://page.invalid', executeJavaScript: async () => false }
     this.debugger = new EventEmitter()
     contentsById.set(this.id, this)
   }
@@ -102,10 +103,16 @@ class Window extends EventEmitter {
   constructor(options) {
     super()
     this.options = options
-    this.webContents = new Contents()
     this.bounds = { x: 0, y: 0, width: options.width, height: options.height }
-    this.contentView = { addChildView() {}, removeChildView() {} }
+    const views = []
+    this.contentView = {
+      children: views,
+      addChildView(view) { views.push(view) },
+      removeChildView(view) { const index = views.indexOf(view); if (index >= 0) views.splice(index, 1) },
+    }
   }
+  get webContents() { return this.contentView.children[0]?.webContents }
+  show() {}
   isDestroyed() { return false }
   loadURL(url) { return this.webContents.loadURL(url) }
   getBounds() { return { ...this.bounds } }
@@ -115,14 +122,14 @@ class Window extends EventEmitter {
   setMaximumSize() {}
 }
 class ChildView {
-  constructor(options) { this.options = options; this.webContents = new Contents() }
+  constructor(options) { this.options = options; this.webContents = new Contents(options) }
   setBounds(bounds) { this.bounds = bounds }
   getBounds() { return this.bounds }
 }
 const app = new EventEmitter()
 app.whenReady = () => new Promise(() => {})
 const electron = {
-  app, session, BrowserWindow: Window, WebContentsView: ChildView,
+  app, session, BrowserWindow: Window, BaseWindow: Window, WebContentsView: ChildView,
   screen: Object.assign(new EventEmitter(), { getDisplayMatching: () => ({ scaleFactor: 1 }) }),
   nativeTheme: Object.assign(new EventEmitter(), { shouldUseDarkColors: false }),
   protocol: defaultSession.protocol,
@@ -147,8 +154,7 @@ const context = vm.createContext({
     return timer
   },
   clearTimeout: (timer) => timers.delete(timer),
-  testSocket: { write(line) {
-    const message = JSON.parse(line)
+  testSocket: { request: () => ({ action: 'deny' }), send(message) {
     messages.push(message)
     if (message.event === 'protocol.request') {
       context.handle('protocol.respond', { id: message.params.id, status: 200, body: '' })
@@ -322,7 +328,7 @@ async function preload() {
   ipc({ sender: { id: 999, mainFrame: sender.mainFrame }, senderFrame: sender.mainFrame }, 'unknown')
   ipc({ sender: { id: sender.id, mainFrame: opaque }, senderFrame: opaque }, 'opaque')
   return {
-    frames, fetchErrors, messages: messages.slice(before),
+    frames, fetchErrors, messages: messages.slice(before).filter(message => message.event === 'ipc.message'),
     plainPreload: noHandler.options.webPreferences.preload === path.join(electronDirectory, 'preload.cjs'),
     trafficLightPosition: window.options.trafficLightPosition, tabbingIdentifier: window.options.tabbingIdentifier,
   }
@@ -386,11 +392,13 @@ async function sessions() {
   const targets = []
   for (const target of [defaultSession, shared, separate, privateOne, privateTwo, future]) {
     runtime.installPolicyHandlers(target)
+    let before = messages.length
     await target.protocol.handlers.get('tauri')(new Request('tauri://localhost/first'))
-    const tauri = messages.at(-1)
+    const tauri = messages.slice(before).find(message => message.event === 'protocol.request')
+    before = messages.length
     await target.protocol.handlers.get('http')(new Request('http://asset.localhost/second'))
-    const asset = messages.at(-1)
-    const before = messages.length
+    const asset = messages.slice(before).find(message => message.event === 'protocol.request')
+    before = messages.length
     const fallback = []
     for (const url of ['https://remote.invalid/', 'http://tauri.localhost:1420/', 'http://unregistered.localhost/']) {
       const request = new Request(url)

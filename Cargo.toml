@@ -22,6 +22,11 @@ tauri-utils = { version = "2.10", features = ["config-json5", "config-toml"] }
 [dev-dependencies]
 json-patch = { version = "4", default-features = false }
 
+[[bin]]
+name = "tauri_new_window_smoke"
+path = "src/bin/tauri_new_window_smoke.rs"
+required-features = ["tauri"]
+
 [[test]]
 name = "build_config"
 path = "build_support.rs"

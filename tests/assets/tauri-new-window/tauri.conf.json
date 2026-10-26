@@ -1,0 +1,12 @@
+{
+  "productName": "Tauri Popup Regression",
+  "identifier": "com.tauri.runtime-electron.popup-regression",
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost",
+      "capabilities": []
+    }
+  },
+  "bundle": { "active": false, "icon": ["icon.png"] }
+}

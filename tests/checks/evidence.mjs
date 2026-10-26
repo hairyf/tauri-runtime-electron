@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
 import { win32 as path } from 'node:path'
 import vm from 'node:vm'
+import './runtime-evidence.test.mjs'
 
 const source = readFileSync(new URL('./examples.mjs', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
 const nativeStart = source.indexOf('function nativeBlocked(')
@@ -102,4 +103,18 @@ assert.equal(report.streamingDiagnostics[0].video.src, 'stream://localhost/video
 assert.equal(report.streamingDiagnostics[0].video.network, 2)
 assert.deepEqual(report.streamingDiagnostics[0].events, events.slice(0, 2))
 assert.equal(report.streamingDiagnostics[1].video.diagnosticError, 'target closed')
-console.log('native timeout diagnostics, scoped evidence cleanup, and streaming failure evidence passed')
+// The example adapter may select a runtime or wrap its Context, never delete
+// unsupported callbacks from setup to make the example appear compatible.
+const runner = readFileSync(new URL('../../scripts/example.mjs', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
+const guardStart = runner.indexOf('    const setup = (text) => {')
+const guardEnd = runner.indexOf('\n  }\n  await ensureFrontend(config)', guardStart)
+assert.ok(guardStart > 0 && guardEnd > guardStart)
+const upstream = 'original entry\n    .setup(move |app| {\n      .on_new_window(callback);\n    })\n    .on_page_load(callback)\noriginal Context'
+const guarded = (adapted) => vm.runInNewContext(runner.slice(guardStart, guardEnd), {
+  assert, path, source: 'source', app: 'app', entry: 'entry',
+  readFileSync: file => file === 'entry' ? adapted : upstream,
+})
+guarded(upstream.replace('original entry', 'Electron entry').replace('original Context', 'isolation Context wrapper').replaceAll('\n', '\r\n'))
+assert.throws(() => guarded(upstream.replace('.on_new_window(callback);', '')), /preserve upstream setup\/callbacks/)
+assert.throws(() => guarded('missing setup'), /missing upstream setup boundaries/)
+console.log('native diagnostics, evidence cleanup, streaming failures, and upstream callback preservation passed')

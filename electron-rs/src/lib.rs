@@ -275,8 +275,9 @@ fn validate_version(version: &str) -> Result<(), Error> {
   Ok(())
 }
 
-const ASSETS: [(&str, &[u8]); 2] = [
+const ASSETS: [(&str, &[u8]); 3] = [
   ("main.cjs", include_bytes!("../assets/main.cjs")),
+  ("ipc.cjs", include_bytes!("../assets/ipc.cjs")),
   ("preload.cjs", include_bytes!("../assets/preload.cjs")),
 ];
 

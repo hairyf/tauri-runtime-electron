@@ -34,6 +34,7 @@ pub struct ElectronWindowBuilder {
   pub(crate) config: WindowConfig,
   pub(crate) size_constraints: Option<WindowSizeConstraints>,
   pub(crate) icon: Option<IconData>,
+  pub(crate) new_window_opener: Option<crate::new_window::NewWindowOpener>,
   #[cfg(windows)]
   pub(crate) owner: Option<isize>,
   #[cfg(windows)]
@@ -46,12 +47,13 @@ impl WindowBuilderBase for ElectronWindowBuilder {}
 
 impl WindowBuilder for ElectronWindowBuilder {
   fn new() -> Self {
-    Self::default()
+    Self { new_window_opener: crate::new_window::take_opener(), ..Self::default() }
   }
 
   fn with_config(config: &WindowConfig) -> Self {
     Self {
       config: config.clone(),
+      new_window_opener: crate::new_window::take_opener(),
       ..Self::default()
     }
   }

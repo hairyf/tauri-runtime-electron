@@ -1,7 +1,9 @@
 // Observe the real main-process code with native objects replaced by doubles.
+import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
+import { MessageChannel, receiveMessageOnPort } from 'node:worker_threads'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
@@ -14,11 +16,46 @@ const tasks = []
 const transport = new EventEmitter()
 transport.setEncoding = () => {}
 transport.write = () => {}
+transport.destroy = () => { transport.destroyed = true; transport.emit('close') }
+// Run both production IPC branches, with only the native Worker/socket replaced.
+// Message framing and main-thread queueing still come from ipc.cjs itself.
+const ipcSource = readFileSync(new URL('../../assets/ipc.cjs', import.meta.url), 'utf8')
+class SocketWorker extends EventEmitter {
+  constructor(_filename, { workerData }) {
+    super()
+    this.channel = workerData.channel
+    vm.runInNewContext(ipcSource, {
+      require: (name) => name === 'node:worker_threads' ? { isMainThread: false, workerData }
+        : name === 'node:net' ? { connect: () => transport } : require(name),
+      process: new EventEmitter(),
+    })
+  }
+  terminate() { this.channel.close(); return Promise.resolve(0) }
+}
+const ipcModule = { exports: {} }
+vm.runInNewContext(ipcSource, {
+  require: (name) => name === 'node:worker_threads'
+    ? { Worker: SocketWorker, MessageChannel, receiveMessageOnPort, isMainThread: true } : require(name),
+  module: ipcModule, __filename: fileURLToPath(new URL('../../assets/ipc.cjs', import.meta.url)),
+  setImmediate: (callback) => tasks.push(callback), performance,
+})
 const allContents = []
+const allWindows = []
+const faults = { viewConstructor: false, applyWebviewConfig: false, attach: false, show: false, windowConfig: false }
 const nativeTheme = Object.assign(new EventEmitter(), {
   themeSource: 'system', shouldUseDarkColors: false, shouldUseHighContrastColors: false,
 })
+const displays = [
+  { id: 1, label: 'primary', scaleFactor: 1,
+    bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+    workArea: { x: 0, y: 0, width: 1920, height: 1040 } },
+  { id: 2, label: 'secondary', scaleFactor: 2,
+    bounds: { x: 1920, y: 0, width: 1280, height: 720 },
+    workArea: { x: 1920, y: 0, width: 1280, height: 680 } },
+]
 const screen = Object.assign(new EventEmitter(), {
+  getAllDisplays: () => displays,
+  getPrimaryDisplay: () => displays[0],
   getDisplayMatching: (bounds) => ({ scaleFactor: bounds.scale }),
   // A secondary display's physical origin differs from DIP-origin * scale.
   getCursorScreenPoint: () => ({ x: 2100, y: 40 }),
@@ -56,9 +93,13 @@ class Contents extends EventEmitter {
   })
   isDestroyed() { return this.destroyed }
   setWindowOpenHandler(handler) { this.openHandler = handler }
-  setUserAgent(value) { this.calls.push({ method: 'setUserAgent', value }); this.userAgent = value }
+  setUserAgent(value) {
+    if (faults.applyWebviewConfig) throw new Error('webview config failed')
+    this.calls.push({ method: 'setUserAgent', value }); this.userAgent = value
+  }
   loadURL(url) { this.calls.push({ method: 'loadURL', value: url }); this.url = url; return Promise.resolve() }
   getURL() { return this.url ?? '' }
+  getLastWebPreferences() { return {} }
   executeJavaScript(script) {
     this.script = script
     // Electron waits for did-stop-loading when a webContents has never loaded.
@@ -90,9 +131,13 @@ class Contents extends EventEmitter {
   constructor() { super(); allContents.push(this) }
 }
 class View {
-  webContents = new Contents()
   visible = true
-  constructor(options) { this.options = options }
+  constructor(options = {}) {
+    if (faults.viewConstructor) throw new Error('view constructor failed')
+    this.options = options
+    this.webContents = options.webContents ?? new Contents()
+    this.bounds = { x: 0, y: 0, width: 0, height: 0 }
+  }
   setBounds(bounds) { this.bounds = { ...bounds } }
   getBounds() { return { ...this.bounds } }
   setVisible(value) { this.visible = value }
@@ -100,29 +145,43 @@ class View {
   setBackgroundColor(value) { this.color = value }
 }
 class Window extends EventEmitter {
-  webContents = new Contents()
   children = []
   visible = true
   destroyed = false
   scale = 2
   frame = { width: 0, height: 0 }
   parentCalls = []
+  nativeCalls = []
   contentView = {
-    addChildView: (view) => this.children.push(view),
+    addChildView: (view) => {
+      if (faults.attach) throw new Error('attach failed')
+      this.children.push(view)
+    },
     removeChildView: (view) => { this.children = this.children.filter((item) => item !== view) },
   }
   constructor(options) {
     super()
+    allWindows.push(this)
     this.options = options
-    this.content = { x: -200, y: 100, width: options.width, height: options.height }
+    this.content = { x: -200, y: 100, width: options.width ?? 800, height: options.height ?? 600 }
+    this.maximizable = options.maximizable ?? true
+    this.minimizable = options.minimizable ?? true
+    this.closable = options.closable ?? true
   }
   getBackgroundColor() { return this.color ?? this.options.backgroundColor ?? '#ffffff' }
   setBackgroundColor(color) { this.color = color }
   setBackgroundMaterial(material) { this.material = material; this.color = material === 'none' ? '#ffffff' : '#00000000' }
+  getNormalBounds() { return this.getBounds() }
   getContentBounds() { return { ...this.content } }
   getContentSize() { return [this.content.width, this.content.height] }
   getBounds() { return { ...this.content, width: this.content.width + this.frame.width,
     height: this.content.height + this.frame.height, scale: this.scale } }
+  setBounds(bounds) {
+    if (bounds.x !== undefined) this.content.x = bounds.x
+    if (bounds.y !== undefined) this.content.y = bounds.y
+    if (bounds.width !== undefined) this.content.width = bounds.width - this.frame.width
+    if (bounds.height !== undefined) this.content.height = bounds.height - this.frame.height
+  }
   setContentSize(width, height) { this.content.width = width; this.content.height = height }
   setMinimumSize(width, height) { this.minimum = [width, height] }
   setMaximumSize(width, height) { this.maximum = [width, height] }
@@ -139,31 +198,42 @@ class Window extends EventEmitter {
   isFullScreen() { return false }
   isSimpleFullScreen() { return false }
   isResizable() { return true }
+  isMaximizable() { return this.maximizable }
+  isMinimizable() { return this.minimizable }
+  isClosable() { return this.closable }
+  setMaximizable(value) { this.nativeCalls.push({ method: 'setMaximizable', value }); this.maximizable = value }
+  setMinimizable(value) { this.nativeCalls.push({ method: 'setMinimizable', value }); this.minimizable = value }
+  setClosable(value) { this.nativeCalls.push({ method: 'setClosable', value }); this.closable = value }
   isAlwaysOnTop() { return false }
   getTitle() { return this.options.title ?? '' }
-  loadURL(url) { return this.webContents.loadURL(url) }
   focus() { this.focused = true }
-  show() { this.visible = true }
+  show() {
+    if (faults.show) throw new Error('window show failed')
+    this.visible = true
+  }
+  showInactive() { this.visible = true; this.focused = false }
   hide() { this.visible = false }
   close() {
     this.closeRequested = true
     this.lastClosePrevented = false
     this.emit('close', { preventDefault: () => { this.lastClosePrevented = true } })
+    if (!this.lastClosePrevented) this.destroy()
   }
-  destroy() { this.destroyed = true; this.emit('closed'); this.webContents.close() }
+  destroy() { this.destroyed = true; this.emit('closed') }
   resize(width, height) { this.content.width = width; this.content.height = height; this.emit('resize') }
 }
 const context = vm.createContext({
   require: (name) => name === 'electron' ? {
-    app: { on() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
+    app: { on() {}, quit() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
     Menu: { setApplicationMenu() {}, buildFromTemplate: (template) => ({ template }) },
     nativeTheme, screen,
     session: { defaultSession: { on() {}, setPermissionRequestHandler() {}, webRequest: { onCompleted() {}, onErrorOccurred() {}, onBeforeRequest() {} } } },
-    BrowserWindow: Window, WebContentsView: View,
+    BaseWindow: Window, WebContentsView: View,
     ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} },
   } : name === 'node:net' ? { connect: () => transport }
-    : name === 'node:fs' ? { appendFileSync() {} }
-    : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' } : require(name),
+    : name === 'node:fs' ? { appendFileSync() {}, readFileSync(fd) { assert.equal(fd, 0); return '0123456789abcdef'.repeat(4) + '\n' } }
+    : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' }
+      : name === './ipc.cjs' ? ipcModule.exports : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
   Buffer, URL, console,
   setTimeout(callback, delay) { const timer = { callback, delay }; timers.add(timer); return timer },
@@ -180,11 +250,13 @@ const settle = async () => {
   while (tasks.length) await tasks.shift()()
   await new Promise(setImmediate)
 }
-const cursorStyles = (contents) => [...contents.styles.values()]
+const mainViewOf = (window) => inspect('mainViews').get(window)?.view
+const mainContentsOf = (window) => context.mainContents(window)
+const cursorStyles = (contents) => [...(contents?.styles.values() ?? [])]
 const constraintsOf = (window) => ({ min: window.minimum, max: window.maximum })
 const preferencesOf = (options) => {
-  const { javascript, devTools, backgroundThrottling, userAgent } = options.webPreferences
-  return { javascript, devTools, backgroundThrottling, userAgent: userAgent ?? null }
+  const { javascript, devTools, backgroundThrottling, userAgent, webviewTag } = options.webPreferences
+  return { javascript, devTools, backgroundThrottling, userAgent: userAgent ?? null, webviewTag }
 }
 const createHost = async (main = false) => {
   await call('window.create', main
@@ -221,6 +293,62 @@ switch (process.argv[2]) {
     }
     break
   }
+  case 'monitors': {
+    // Containment and DIP conversions are unit checks with injected displays,
+    // never runtime-evidence for a real monitor/API implementation.
+    screen.dipToScreenRect = (_window, rect) => rect.x < 1920 ? { ...rect }
+      : { x: 1920 + (rect.x - 1920) * 2, y: rect.y * 2, width: rect.width * 2, height: rect.height * 2 }
+    const query = async (points) => Promise.all(points.map(async ([x, y]) =>
+      (await call('window.displayForPoint', { x, y }))?.name ?? null))
+    const physical = await query([[0, 0], [1919, 1079], [1920, 0], [4479, 1439],
+      [4480, 0], [1920, 1440], [-1, 0], [900, 1080]])
+    const secondary = await call('window.displayForPoint', { x: 4000, y: 1000 })
+    const invalid = await errorFrom(() => call('window.displayForPoint', { x: NaN, y: 0 }))
+    const logical = {}
+    for (const platform of ['darwin', 'linux']) {
+      context.process.platform = platform
+      logical[platform] = await query([[0, 0], [1919, 1079], [1920, 0], [3199, 719],
+        [3200, 0], [2000, 720], [-1, 0], [900, 1080]])
+    }
+    result = { physical, secondary, logical, invalid }
+    const contained = ['primary', 'primary', 'secondary', 'secondary', null, null, null, null]
+    assert.deepEqual(physical, contained)
+    for (const platform of ['darwin', 'linux']) assert.deepEqual(logical[platform], contained)
+    assert.equal(secondary.name, 'secondary')
+    assert.equal(secondary.position.x, 1920)
+    assert.equal(secondary.size.width, 2560)
+    assert.equal(invalid, 'invalid monitor point')
+    break
+  }
+  case 'native-state': {
+    const host = await createHost()
+    // Force disagreement with requested/default WeakMap flags. Queries must
+    // inspect native getters, not echo the last request.
+    host.maximizable = host.minimizable = host.closable = false
+    const flags = async () => {
+      const { maximizable, minimizable, closable } = await call('window.geometry', { windowId: 1 })
+      return { maximizable, minimizable, closable }
+    }
+    const contrary = await flags()
+    const states = []
+    const requests = [false, true, false, true]
+    for (const wanted of requests) {
+      await call('window.closable', { windowId: 1, closable: wanted })
+      await call('window.maximizable', { windowId: 1, maximizable: wanted })
+      await call('window.minimizable', { windowId: 1, minimizable: wanted })
+      states.push(await flags())
+    }
+    host.maximizable = host.minimizable = host.closable = false
+    result = { contrary, states, afterNativeChange: await flags(), calls: host.nativeCalls }
+    const disabled = { maximizable: false, minimizable: false, closable: false }
+    assert.deepEqual(contrary, disabled)
+    assert.deepEqual(result.afterNativeChange, disabled)
+    assert.deepEqual(states, requests.map((value) => ({ maximizable: value, minimizable: value, closable: value })))
+    assert.deepEqual(host.nativeCalls, requests.flatMap((value) => [
+      { method: 'setClosable', value }, { method: 'setMaximizable', value }, { method: 'setMinimizable', value },
+    ]))
+    break
+  }
   case 'layout': {
     const host = await createChildren()
     const children = []
@@ -233,7 +361,8 @@ switch (process.argv[2]) {
     host.resize(1001, 701)
     const oddBounds = host.children.map((view) => view.getBounds())
     host.resize(800, 600)
-    result = { hostUrl: host.webContents.url ?? null, children, oddBounds,
+    result = { hostUrl: mainContentsOf(host)?.getURL() ?? null, hostHasWebContents: 'webContents' in host,
+      contentsCount: allContents.length, children, oddBounds,
       resetBounds: host.children.map((view) => view.getBounds()) }
     break
   }
@@ -269,11 +398,11 @@ switch (process.argv[2]) {
     const host = await createChildren()
     const first = host.children[0]
     await call('webview.eval', { webviewId: 10, script: 'child-script' })
-    const evalScripts = { child: first.webContents.script, host: host.webContents.script ?? null }
+    const evalScripts = { child: first.webContents.script, host: mainContentsOf(host)?.script ?? null }
     const cursors = []
     for (const cursor of ['pointer', 'none', 'default']) {
       await call('window.cursor', { windowId: 1, cursor })
-      cursors.push({ host: cursorStyles(host.webContents),
+      cursors.push({ host: cursorStyles(mainContentsOf(host)),
         children: host.children.map((view) => cursorStyles(view.webContents)) })
     }
     await call('webview.reload', { webviewId: 10 })
@@ -329,22 +458,23 @@ switch (process.argv[2]) {
     contents.openDevTools()
     const replies = []
     context.send = (message) => replies.push(message)
-    const close = context.onLine(JSON.stringify({ id: 1, method: 'webview.closeDevtools', params: { webviewId: 10 } }))
+    const message = (id, method) => ({ id, method, params: { webviewId: 10 } })
+    context.onRequest(message(1, 'webview.closeDevtools'))
     const closedSynchronously = contents.devtools
-    await close
-    await context.onLine(JSON.stringify({ id: 2, method: 'webview.isDevtoolsOpen', params: { webviewId: 10 } }))
-    await context.onLine(JSON.stringify({ id: 3, method: 'missing' }))
+    context.onRequest(message(2, 'webview.isDevtoolsOpen'))
+    context.onRequest({ id: 3, method: 'missing' })
     const execute = contents.executeJavaScript
     contents.executeJavaScript = () => Promise.reject(new Error('eval rejected'))
-    await context.onLine(JSON.stringify({ id: 4, method: 'webview.eval', params: { webviewId: 10, script: '' } }))
+    context.onRequest({ id: 4, method: 'webview.eval', params: { webviewId: 10, script: '' } })
+    await settle()
     contents.executeJavaScript = execute
-    await context.onLine(JSON.stringify({ id: 5, method: 'webview.eval', params: { webviewId: 10, script: 'rpc-script' } }))
+    context.onRequest({ id: 5, method: 'webview.eval', params: { webviewId: 10, script: 'rpc-script' } })
+    await settle()
     const directReplies = replies.splice(0)
-    await context.onLine('invalid JSON')
-    await context.onLine(JSON.stringify({ method: 'webview.closeDevtools' }))
+    context.onRequest({ method: 'webview.closeDevtools' })
     const invalidReplies = replies.splice(0)
     ready()
-    await Promise.resolve()
+    await settle()
     let closeCalls = 0
     let reading = false
     const closeDuringRead = []
@@ -359,7 +489,9 @@ switch (process.argv[2]) {
     transport.emit('data', '\n')
     reading = false
     const beforeTasks = { closeCalls, replies: replies.length }
-    while (tasks.length) await tasks.shift()()
+    await settle()
+    await settle()
+    inspect('socket').close()
     result = { closedSynchronously, directReplies, invalidReplies, contentsId: contents.id,
       beforeTasks, closeCalls, closeDuringRead, framedReplies: replies }
     break
@@ -372,6 +504,8 @@ switch (process.argv[2]) {
     await call('webview.close', { webviewId: 10 })
     host.destroy()
     const main = await createHost(true)
+    const view = mainViewOf(main)
+    const contents = mainContentsOf(main)
     const addChildView = main.contentView.addChildView
     main.contentView.addChildView = () => { throw new Error('attach failed') }
     const attachError = await errorFrom(() => call('webview.create', { windowId: 2, webviewId: 21, url: 'tauri://localhost/' }))
@@ -379,13 +513,16 @@ switch (process.argv[2]) {
     const evalResult = await call('webview.eval', { webviewId: 20, script: 'main-script' })
     await call('window.cursor', { windowId: 2, cursor: 'crosshair' })
     await call('webview.visibility', { webviewId: 20, visible: false })
-    const visible = main.visible
+    const visible = view.visible
+    const hostVisible = main.visible
     await call('webview.close', { webviewId: 20 })
     result = { attachError, failedContentsDestroyed: allContents.at(-1).isDestroyed(),
       failedChildMapped: inspect('childWebviews.has(21) || webviews.has(21)'), children: main.children.length,
-      url: main.webContents.url, evalResult, contentsId: main.webContents.id,
-      script: main.webContents.script, cursor: cursorStyles(main.webContents), unrelatedCursor,
-      visible, closeRequested: main.closeRequested }
+      url: contents.url, evalResult, contentsId: contents.id,
+      script: contents.script, cursor: cursorStyles(contents), unrelatedCursor,
+      visible, hostVisible, closeRequested: main.closeRequested ?? false,
+      contentsDestroyed: contents.isDestroyed(), mainMapped: inspect('childWebviews.has(20) || webviews.has(20)'),
+      hostAlive: !main.isDestroyed(), hostHasWebContents: 'webContents' in main }
     break
   }
   case 'effects': {
@@ -420,7 +557,7 @@ switch (process.argv[2]) {
     const main = inspect('windows.get(30)')
     await call('webview.create', { windowId: 30, webviewId: 301, url: 'tauri://localhost/child',
       userAgent: 'child-agent', javascriptDisabled: true, devtools: false, backgroundThrottling: 'disabled' })
-    const child = main.children[0]
+    const child = inspect('childWebviews.get(301).view')
     await call('webview.create', { windowId: 30, webviewId: 302, url: 'tauri://localhost/defaults' })
     await call('window.create', { windowId: 31,
       window: { userAgent: 'fallback-agent', javascriptDisabled: true, devtools: false, backgroundThrottling: 'disabled' },
@@ -439,10 +576,10 @@ switch (process.argv[2]) {
       nested: { title: main.options.title, width: main.options.width, height: main.options.height,
         useContentSize: main.options.useContentSize, acceptFirstMouse: main.options.acceptFirstMouse,
         backgroundColor: main.options.backgroundColor, titleBarStyle: main.options.titleBarStyle },
-      main: { preferences: preferencesOf(main.options), calls: main.webContents.calls },
+      main: { preferences: preferencesOf(mainViewOf(main).options), calls: mainContentsOf(main).calls },
       child: { preferences: preferencesOf(child.options), calls: child.webContents.calls },
-      defaults: preferencesOf(main.children[1].options),
-      fallback: { preferences: preferencesOf(fallback.options), calls: fallback.webContents.calls },
+      defaults: preferencesOf(inspect('childWebviews.get(302).view.options')),
+      fallback: { preferences: preferencesOf(mainViewOf(fallback).options), calls: mainContentsOf(fallback).calls },
       flat: { title: flat.options.title, width: flat.options.width, height: flat.options.height,
         acceptFirstMouse: flat.options.acceptFirstMouse, backgroundColor: flat.options.backgroundColor,
         titleBarStyle: flat.options.titleBarStyle }, titleStyles,
@@ -532,7 +669,7 @@ switch (process.argv[2]) {
     await call('window.cursor', { windowId: 1, cursor: 'wait' })
     const legacy = host.children.map((view) => cursorStyles(view.webContents))
     result = { chosen, hidden, chosenWhileHidden, inheritedHidden, visible, restored, inheritedVisible, legacy,
-      host: host.webContents.inserted, other: other.webContents.inserted, removed: first.removed.length }
+      host: mainContentsOf(host)?.inserted ?? [], other: mainContentsOf(other).inserted, removed: first.removed.length }
     break
   }
   case 'parent-menu': {
@@ -583,11 +720,11 @@ switch (process.argv[2]) {
     await call('window.theme', { windowId: 2, theme: 'light' })
     const light = await call('window.themeQuery', { windowId: 2 })
     const children = host.children.map((view) => view.webContents.debugger.commands.at(-1))
-    const mainCommand = main.webContents.debugger.commands.at(-1)
-    main.webContents.pageDark = true
+    const mainCommand = mainContentsOf(main).debugger.commands.at(-1)
+    mainContentsOf(main).pageDark = true
     const pageQuery = await call('window.themeQuery', { windowId: 2 })
-    const pageQueries = main.webContents.mediaQueries
-    delete main.webContents.pageDark
+    const pageQueries = mainContentsOf(main).mediaQueries
+    delete mainContentsOf(main).pageDark
     await call('webview.create', { windowId: 1, webviewId: 14, url: 'tauri://localhost/themed' })
     await settle()
     const inherited = host.children[4].webContents.debugger.commands.at(-1)
@@ -617,8 +754,123 @@ switch (process.argv[2]) {
       afterFirstClose, afterClose, afterCloseEvents: events }
     break
   }
+  case 'native-policy': {
+    inspect('socket = {closed:false}')
+    const events = []
+    context.send = (message) => {
+      if (inspect('socket && !socket.closed')) events.push(JSON.parse(JSON.stringify(message)))
+    }
+    const main = await createHost(true)
+    const mainView = mainViewOf(main)
+    await call('webview.create', { windowId: 2, webviewId: 21, url: 'about:blank' })
+    const child = inspect('childWebviews.get(21).view')
+    const roots = {
+      mainOptions: main.options.webPreferences.webviewTag,
+      mainView: mainView.options.webPreferences.webviewTag,
+      child: child.options.webPreferences.webviewTag,
+    }
+
+    inspect('activePopupRequest = 7')
+    inspect('activePopupContents = {session:undefined}')
+    await call('window.create', {
+      windowId: 3, newWindowRequest: 7,
+      webview: { webviewId: 30, url: 'about:blank' },
+    })
+    const staged = inspect('pendingPopups.get(7)')
+    inspect('pendingPopups.delete(7)')
+    staged.attach(new Contents())
+    const popup = staged.window
+    const view = mainViewOf(popup)
+    const guest = view.webContents
+    Object.assign(roots, {
+      popupOptions: popup.options.webPreferences.webviewTag,
+      popupView: view.options.webPreferences.webviewTag,
+    })
+    Object.defineProperty(view, 'webContents', {
+      get: () => guest.isDestroyed() ? undefined : guest,
+    })
+    assert.deepEqual(roots, {
+      mainOptions: false, mainView: false, child: false,
+      popupOptions: false, popupView: false,
+    })
+    events.length = 0
+    assert.doesNotThrow(() => guest.close())
+    const nativeDestroy = {
+      guestDestroyed: guest.isDestroyed(),
+      viewContentsCleared: view.webContents === undefined,
+      shellDestroyed: popup.isDestroyed(),
+      windowMapped: inspect('windows.has(3)'),
+      childMapped: inspect('childWebviews.has(30)'),
+      webviewMapped: inspect('webviews.has(30)'),
+      mainMapped: inspect('mainViews').has(popup),
+      events: events.splice(0),
+    }
+    assert.deepEqual(nativeDestroy, {
+      guestDestroyed: true, viewContentsCleared: true, shellDestroyed: true,
+      windowMapped: false, childMapped: false, webviewMapped: false, mainMapped: false,
+      events: [
+        { event: 'webview.closed', params: { webviewId: 30 } },
+        { event: 'window.closed', params: { windowId: 3 } },
+      ],
+    })
+
+    inspect('activePopupRequest = 8')
+    inspect('activePopupContents = {session:undefined}')
+    await call('window.create', {
+      windowId: 4, newWindowRequest: 8,
+      webview: { webviewId: 31, url: 'about:blank' },
+    })
+    const stagedExplicit = inspect('pendingPopups.get(8)')
+    inspect('pendingPopups.delete(8)')
+    stagedExplicit.attach(new Contents())
+    const popupExplicit = stagedExplicit.window
+    const explicitView = mainViewOf(popupExplicit)
+    const explicitGuest = explicitView.webContents
+    Object.defineProperty(explicitView, 'webContents', {
+      get: () => explicitGuest.isDestroyed() ? undefined : explicitGuest,
+    })
+    events.length = 0
+    await call('webview.close', { webviewId: 31 })
+    const explicitClose = {
+      guestDestroyed: explicitGuest.isDestroyed(),
+      viewContentsCleared: explicitView.webContents === undefined,
+      shellDestroyed: popupExplicit.isDestroyed(),
+      windowMapped: inspect('windows.has(4)'),
+      childMapped: inspect('childWebviews.has(31)'),
+      webviewMapped: inspect('webviews.has(31)'),
+      mainMapped: inspect('mainViews').has(popupExplicit),
+      events: events.splice(0),
+    }
+    assert.deepEqual(explicitClose, {
+      guestDestroyed: true, viewContentsCleared: true, shellDestroyed: false,
+      windowMapped: true, childMapped: false, webviewMapped: false, mainMapped: false,
+      events: [{ event: 'webview.closed', params: { webviewId: 31 } }],
+    })
+
+    await call('window.create', { windowId: 5, window: { closable: false } })
+    const noSocket = inspect('windows.get(5)')
+    inspect('socket = undefined')
+    events.length = 0
+    noSocket.close()
+    const noSocketClose = {
+      prevented: noSocket.lastClosePrevented, destroyed: noSocket.isDestroyed(), events: events.splice(0),
+    }
+    inspect('socket = {closed:true}')
+    await call('window.create', { windowId: 6, window: { closable: false } })
+    const closedSocket = inspect('windows.get(6)')
+    events.length = 0
+    closedSocket.close()
+    const closedSocketClose = {
+      prevented: closedSocket.lastClosePrevented, destroyed: closedSocket.isDestroyed(), events: events.splice(0),
+    }
+    assert.deepEqual(noSocketClose, { prevented: false, destroyed: true, events: [] })
+    assert.deepEqual(closedSocketClose, { prevented: false, destroyed: true, events: [] })
+    result = { roots, nativeDestroy, explicitClose, noSocketClose, closedSocketClose }
+    break
+  }
   case 'linux-state': {
     context.process.platform = 'linux'
+    inspect('socket = {closed:false}')
     await call('window.create', { windowId: 60,
       window: { maximizable: false, minimizable: false, closable: false } })
     const host = inspect('windows.get(60)')
@@ -644,8 +896,14 @@ switch (process.argv[2]) {
     await call('window.close', { windowId: 60 })
     const vetoedAgain = { prevented: host.lastClosePrevented, events: events.splice(0) }
     await call('window.destroy', { windowId: 60 })
+    const closedEvents = events.splice(0)
+    await call('window.create', { windowId: 61, window: { closable: false } })
+    const disconnected = inspect('windows.get(61)')
+    inspect('socket.closed = true')
+    disconnected.close()
     result = { initial, vetoed, enabled, requested, disabled, vetoedAgain,
-      destroyed: host.isDestroyed(), closedEvents: events }
+      destroyed: host.isDestroyed(), closedEvents,
+      disconnected: { prevented: disconnected.lastClosePrevented, destroyed: disconnected.isDestroyed() } }
     break
   }
   case 'lifecycle': {
@@ -663,41 +921,52 @@ switch (process.argv[2]) {
     }
     const navigating = call('webview.navigate', { webviewId: 16, url: 'tauri://localhost/next' })
     const navigation = { acknowledged: navigating === null, loaded,
-      url: child.webContents.getURL(), hostUrl: host.webContents.getURL() }
+      url: child.webContents.getURL(), hostUrl: mainContentsOf(host)?.getURL() ?? null }
     finishLoad()
     await navigating
     context.process.platform = 'darwin'
+    const initialFullscreenListeners = ['enter-full-screen', 'leave-full-screen'].map((event) => host.listenerCount(event))
     const nativeCalls = []
     const simpleCalls = []
-    let simple = false
+    let native = false
     host.setFullScreen = (value) => nativeCalls.push(value)
-    host.setSimpleFullScreen = (value) => { simpleCalls.push(value); simple = value }
-    host.isSimpleFullScreen = () => simple
-    const fireFallback = () => {
-      const timer = [...timers].find((item) => item.delay === 600)
-      timers.delete(timer)
-      timer.callback()
-      return timer.delay
-    }
-    const delays = []
-    await call('window.fullscreen', { windowId: 1, fullscreen: true })
-    const beforeFallback = { fullscreen: (await call('window.geometry', { windowId: 1 })).fullscreen,
+    host.setSimpleFullScreen = (value) => simpleCalls.push(value)
+    host.isFullScreen = () => native
+    let acknowledged = false
+    const entering = call('window.fullscreen', { windowId: 1, fullscreen: true }).then(() => { acknowledged = true })
+    await settle()
+    const beforeEnter = { acknowledged, fullscreen: (await call('window.geometry', { windowId: 1 })).fullscreen,
       simpleCalls: [...simpleCalls] }
-    delays.push(fireFallback())
+    native = true
+    host.emit('enter-full-screen')
+    await entering
     const entered = (await call('window.geometry', { windowId: 1 })).fullscreen
-    await call('window.fullscreen', { windowId: 1, fullscreen: false })
-    delays.push(fireFallback())
+    acknowledged = false
+    const leaving = call('window.fullscreen', { windowId: 1, fullscreen: false }).then(() => { acknowledged = true })
+    await settle()
+    const beforeLeave = { acknowledged, fullscreen: (await call('window.geometry', { windowId: 1 })).fullscreen }
+    native = false
+    host.emit('leave-full-screen')
+    await leaving
     const exited = (await call('window.geometry', { windowId: 1 })).fullscreen
-    host.isFullScreen = () => true
+    const reentering = call('window.fullscreen', { windowId: 1, fullscreen: true })
+    native = true
+    host.emit('enter-full-screen')
+    await reentering
     await call('window.fullscreen', { windowId: 1, fullscreen: true })
-    delays.push(fireFallback())
     const nativeFullscreen = (await call('window.geometry', { windowId: 1 })).fullscreen
-    await call('window.fullscreen', { windowId: 1, fullscreen: true })
+    native = false
+    const timeout = errorFrom(() => call('window.fullscreen', { windowId: 1, fullscreen: true }))
+    const timer = [...timers].find((item) => item.delay === 10_000)
+    timer.callback()
+    const timeoutError = await timeout
+    const closing = errorFrom(() => call('window.fullscreen', { windowId: 1, fullscreen: true }))
     host.destroy()
     host.isFullScreen = host.isSimpleFullScreen = host.setSimpleFullScreen = () => { throw new Error('closed window accessed') }
-    const closedError = await errorFrom(() => delays.push(fireFallback()))
-    result = { initialBounds, resizedBounds, navigation, beforeFallback, entered, exited, nativeFullscreen,
-      nativeCalls, simpleCalls, delays, closedError, timers: timers.size }
+    const closedError = await closing
+    result = { initialBounds, resizedBounds, navigation, beforeEnter, beforeLeave, entered, exited, nativeFullscreen,
+      nativeCalls, simpleCalls, timeoutDelay: timer.delay, timeoutError, closedError, timers: timers.size,
+      transitionListeners: ['enter-full-screen', 'leave-full-screen'].map((event, index) => host.listenerCount(event) - initialFullscreenListeners[index]) }
     break
   }
   case 'restore': {
@@ -723,5 +992,8 @@ switch (process.argv[2]) {
     break
   }
   default: throw new Error(`unknown scenario ${process.argv[2]}`)
+}
+for (const view of inspect('childWebviews').values()) {
+  assert.equal(view.view.options.webPreferences.webviewTag, false, 'native views must not enable DOM webview popups')
 }
 console.log(JSON.stringify(result))

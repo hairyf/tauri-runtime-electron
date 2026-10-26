@@ -25,6 +25,7 @@ mod app_icon;
 mod devtools;
 mod environment;
 mod locale;
+pub mod new_window;
 mod platform;
 
 mod runtime;
@@ -35,6 +36,9 @@ mod window_builder;
 mod window_handle;
 
 pub use environment::DebugEnvironment;
+pub use new_window::{with_opener, NewWindowFeatures, NewWindowOpener, NewWindowResponse};
+#[cfg(feature = "tauri")]
+pub use new_window::on_new_window;
 pub use runtime::{Electron, ElectronRuntime, EventProxy, RuntimeContext, register_custom_protocol_scheme};
 pub use webview::ElectronWebviewDispatcher;
 pub use window::ElectronWindowDispatcher;

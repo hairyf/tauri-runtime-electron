@@ -1,18 +1,13 @@
-// Reports how much of `tauri-runtime` this crate actually implements, and how it
-// compares with `tauri-runtime-wry`.
-//
-//   node tests/checks/coverage.mjs          human summary
-//   node tests/checks/coverage.mjs --md     markdown to stdout
-//   node tests/checks/coverage.mjs --write  rewrite docs/coverage.md
-//   node tests/checks/coverage.mjs --check  exit 1 when docs/coverage.md is stale
-//
-// Both the traits and the wry reference are read from the checked-out submodule.
-// This scan does not verify that its revision matches the gitlink or Cargo.lock.
-// `git submodule update --init` populates a missing submodule.
+// Callable desktop API inventory. Only exact-commit real CI assertions count.
+//   node tests/checks/coverage.mjs --write|--check  deterministic documentation
+//   node tests/checks/coverage.mjs --md --evidence DIR --commit SHA --run ID/ATTEMPT
+//   node tests/checks/coverage.mjs --evidence DIR --commit SHA --run ID/ATTEMPT --require-platforms --min-percent 80
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PLATFORMS, aggregateEvidence, cfgApplies, readArtifacts, traitMembers } from './runtime-evidence.mjs'
+import { requireSuites } from './runtime-suites.mjs'
 
 const repo = (path) => fileURLToPath(new URL(`../../${path}`, import.meta.url))
 const TAURI = 'source/tauri/crates'
@@ -25,6 +20,8 @@ const targets = [
   { trait: 'WebviewDispatch', file: 'src/webview.rs' },
   { trait: 'Runtime', file: 'src/runtime.rs' },
   { trait: 'RuntimeHandle', file: 'src/window_handle.rs' },
+  { trait: 'EventLoopProxy', file: 'src/runtime.rs' },
+  { trait: 'WindowBuilder', file: 'src/window_builder.rs', declaration: `${TAURI}/tauri-runtime/src/window.rs` },
 ]
 
 const read = (path) => {
@@ -36,327 +33,377 @@ const read = (path) => {
   }
 }
 
-/** Trait member names, in declaration order. Defaults live after `{}` bodies. */
-function members(src, trait) {
+/** Source links only: never infer verification from an implementation body. */
+export function definitions(src, trait) {
   const lines = src.split('\n')
-  const start = lines.findIndex((line) => line.includes(`pub trait ${trait}<T: UserEvent>`))
-  if (start < 0) throw new Error(`trait ${trait} not found`)
-  const names = []
-  for (let i = start + 1; i < lines.length; i += 1) {
-    if (/^}/.test(lines[i])) break
-    const match = lines[i].match(/^ {2}(?:unsafe )?fn ([a-z_0-9]+)/)
-    if (match) names.push(match[1])
-  }
-  return names
-}
-
-/** Every `fn` defined in the file, with its cfg gate, line and source body. */
-function definitions(src) {
-  const lines = src.split('\n')
+  const start = lines.findIndex(line => new RegExp(`^impl.*\\b${trait}(?:<T>)? for `).test(line))
+  assert.ok(start >= 0, `impl ${trait} not found`)
   const result = new Map()
-  for (let i = 0; i < lines.length; i += 1) {
+  for (let i = start + 1; i < lines.length && !/^}/.test(lines[i]); i += 1) {
     const match = lines[i].match(/^ {2}(?:unsafe )?fn ([a-z_0-9]+)/)
-    if (!match) continue
-    const name = match[1]
-    if (result.has(name)) continue
-    // A platform gate directly above the fn decides whether it exists at all.
-    let cfg = null
-    for (let j = i - 1; j >= 0 && /^\s*(#\[|$|\/\/)/.test(lines[j]); j -= 1) {
-      const gate = lines[j].match(/^\s*#\[cfg\((.*)\)\]$/)
-      if (gate) cfg = gate[1]
-    }
-    let depth = 0
-    let started = false
-    const body = []
-    for (let j = i; j < lines.length; j += 1) {
-      for (const ch of lines[j]) {
-        if (ch === '{') {
-          depth += 1
-          started = true
-        } else if (ch === '}') depth -= 1
-      }
-      body.push(lines[j])
-      if (started && depth === 0) break
-    }
-    // `statements` drops attributes, so look for the Windows branch first.
-    const raw = body.join('\n')
-    result.set(name, {
-      body: statements(raw),
-      windows: /#\[cfg\(\s*windows\s*\)\]/.test(raw),
-      cfg,
-      line: i + 1,
-    })
+    if (match && !result.has(match[1])) result.set(match[1], { line: i + 1 })
   }
   return result
 }
 
-/** Body without the signature, comments, attributes and braces. */
-function statements(text) {
-  return text
-    .split('\n')
-    .filter((line) => !/^\s*(\/\/|#\[|\/\/\/|\/\*)/.test(line))
-    .join('\n')
-    .replace(/^[^{]*\{/, '')
-    .replace(/\}\s*$/, '')
+// N/A is an upstream contract restriction, never an implementation's missing path.
+const platformLimits = {
+  'WindowDispatch::is_maximizable': { linux: '官方契约：Linux 不支持最大化按钮查询' },
+  'WindowDispatch::is_minimizable': { linux: '官方契约：Linux 不支持最小化按钮查询' },
+  'WindowDispatch::set_maximizable': { linux: '官方契约：Linux 不支持设置最大化按钮' },
+  'WindowDispatch::set_minimizable': { linux: '官方契约：Linux 不支持设置最小化按钮' },
+  'WindowDispatch::set_badge_count': { windows: '官方契约：Windows 不支持数字角标' },
+  'WindowDispatch::set_badge_label': { windows: '官方契约：仅 macOS', linux: '官方契约：仅 macOS' },
+  'WindowDispatch::set_overlay_icon': { macos: '官方契约：仅 Windows', linux: '官方契约：仅 Windows' },
+  'WindowDispatch::set_title_bar_style': { windows: '官方契约：仅 macOS', linux: '官方契约：仅 macOS' },
+  'WindowDispatch::set_traffic_light_position': { windows: '官方契约：仅 macOS', linux: '官方契约：仅 macOS' },
+  'WindowBuilder::maximizable': { linux: '官方契约：Linux 不支持设置最大化按钮' },
+  'WindowBuilder::minimizable': { linux: '官方契约：Linux 不支持设置最小化按钮' },
+  'WindowBuilder::shadow': { linux: '官方契约：Linux 不支持窗口阴影' },
+  'WindowBuilder::window_classname': { macos: '官方契约：仅 Windows', linux: '官方契约：仅 Windows' },
+  'WindowBuilder::no_redirection_bitmap': { macos: '官方契约：仅 Windows', linux: '官方契约：仅 Windows' },
+  ...Object.fromEntries(['Runtime', 'RuntimeHandle'].map(trait => [`${trait}::set_device_event_filter`, {
+    macos: '官方契约：macOS 不支持设备事件过滤', linux: '官方契约：Linux 不支持设备事件过滤',
+  }])),
+}
+const referenceSource = read(WRY_LIB)
+const excluded = []
+const rows = targets.map(target => {
+  const mine = definitions(read(target.file), target.trait)
+  const wry = definitions(referenceSource, target.trait)
+  const declaration = target.declaration ?? RUNTIME_LIB
+  return {
+    ...target,
+    members: traitMembers(read(declaration), target.trait).flatMap(member => {
+      const id = `${target.trait}::${member.name}`
+      const na = Object.fromEntries(PLATFORMS.flatMap(platform => {
+        const applicable = member.declarations.some(item => item.cfg.every(cfg => cfgApplies(cfg, platform)))
+        const reason = applicable ? platformLimits[id]?.[platform] : '上游 cfg 不在此平台提供'
+        return reason ? [[platform, reason]] : []
+      }))
+      if (PLATFORMS.every(platform => na[platform])) {
+        excluded.push(id)
+        return []
+      }
+      return [{ ...member, id, na, scope: 'runtime',
+        line: mine.get(member.name)?.line ?? null,
+        declaration, declarationLine: member.declarations[0].line,
+        wryLine: wry.get(member.name)?.line ?? null,
+      }]
+    }),
+  }
+})
+const extensions = [
+  ['ElectronWebviewDispatcher::on_new_window', '注册 Chromium 新窗口的 Allow/Create/Deny 回调', 'src/new_window.rs', '  pub fn on_new_window<F>'],
+  ['tauri_runtime_electron::with_opener', '在原生弹窗请求上下文中构建目标窗口', 'src/new_window.rs', 'pub fn with_opener<R>'],
+  ['tauri_runtime_electron::on_new_window', '在普通 Tauri webview 上注册 Electron 新窗口回调', 'src/new_window.rs', 'pub fn on_new_window<F>'],
+  ['NewWindowFeatures::opener', '取得当前 Chromium 弹窗请求的一次性 opener', 'src/new_window.rs', '  pub fn opener(&self)'],
+  ['NewWindowResponse::create', '将普通 Tauri 新窗口选作原生弹窗目标', 'src/new_window.rs', '  pub fn create(window:'],
+].map(([id, purpose, file, anchor]) => ({ id, purpose, file, anchor, na: {}, scope: 'extension' }))
+export const inventory = [...rows.flatMap(row => row.members), ...extensions]
+
+const DESCRIPTION = {
+  send_event: '将自定义用户事件送入运行时事件循环',
+  with_config: '按窗口配置初始化构建器',
+  min_inner_size: '设置窗口创建时的最小内容区尺寸',
+  max_inner_size: '设置窗口创建时的最大内容区尺寸',
+  inner_size_constraints: '设置窗口创建时各轴的尺寸约束',
+  prevent_overflow: '创建时将窗口限制在显示器工作区内',
+  prevent_overflow_with_margin: '创建时保留指定边距并防止窗口越出工作区',
+  resizable: '设置窗口创建时是否允许调整大小',
+  maximizable: '设置窗口创建时原生最大化按钮是否可用',
+  minimizable: '设置窗口创建时原生最小化按钮是否可用',
+  closable: '设置窗口创建时原生关闭按钮是否可用',
+  fullscreen: '设置窗口创建时是否全屏',
+  focused: '设置窗口创建时是否获取焦点',
+  focusable: '设置窗口创建时是否允许获取焦点',
+  maximized: '设置窗口创建时是否最大化',
+  visible: '设置窗口创建时是否立即可见',
+  transparent: '设置窗口创建时是否支持透明内容',
+  decorations: '设置窗口创建时是否显示系统标题栏和边框',
+  always_on_bottom: '设置窗口创建时是否始终置底',
+  always_on_top: '设置窗口创建时是否始终置顶',
+  visible_on_all_workspaces: '设置窗口创建时是否出现在所有虚拟桌面',
+  content_protected: '设置窗口创建时是否阻止外部截图',
+  icon: '设置窗口创建时的图标',
+  skip_taskbar: '设置窗口创建时是否隐藏任务栏图标',
+  background_color: '设置窗口创建时的背景色',
+  shadow: '设置窗口创建时是否启用阴影',
+  owner: '设置 Windows 新窗口的所有者窗口',
+  parent: '设置新窗口关联的原生父窗口',
+  transient_for: '设置 Linux 新窗口的临时父 GTK 窗口',
+  drag_and_drop: '启用或禁用 Windows 文件拖放支持',
+  title_bar_style: '设置 macOS 新窗口的标题栏样式',
+  traffic_light_position: '设置 macOS 新窗口红黄绿按钮的位置',
+  hidden_title: '设置 macOS 新窗口是否隐藏标题文字',
+  tabbing_identifier: '设置 macOS 新窗口的标签分组标识',
+  has_icon: '查询构建器是否已设置窗口图标',
+  get_theme: '查询构建器保存的窗口主题',
+  window_classname: '设置 Windows 新窗口的原生类名',
+  no_redirection_bitmap: '设置 Windows 新窗口的无重定向位图样式',
+  created_by_activity_name: '设置 Android 新窗口的创建来源 Activity',
+  requested_by_scene_identifier: '设置 iOS 新窗口的来源场景标识',
+  run_on_main_thread: '将任务交给运行时主线程执行',
+  on_window_event: '注册窗口移动、缩放、关闭等事件回调',
+  scale_factor: '获取逻辑像素与物理像素的缩放比例',
+  inner_position: '获取内容区左上角的桌面坐标',
+  outer_position: '获取含边框窗口左上角的桌面坐标',
+  inner_size: '获取内容区尺寸，不含标题栏和边框',
+  outer_size: '获取整个窗口尺寸，包含标题栏和边框',
+  is_fullscreen: '查询窗口是否处于全屏状态',
+  is_minimized: '查询窗口是否已最小化',
+  is_maximized: '查询窗口是否已最大化',
+  is_focused: '查询窗口是否拥有输入焦点',
+  is_decorated: '查询是否启用系统标题栏和边框',
+  is_resizable: '查询是否允许用户调整窗口大小',
+  is_maximizable: '查询原生最大化按钮是否可用',
+  is_minimizable: '查询原生最小化按钮是否可用',
+  is_closable: '查询原生关闭按钮是否可用',
+  is_visible: '查询窗口当前是否可见',
+  is_enabled: '查询窗口是否允许用户交互',
+  is_always_on_top: '查询窗口是否置顶',
+  title: '获取窗口标题',
+  current_monitor: '获取窗口当前所在显示器',
+  primary_monitor: '获取系统主显示器',
+  monitor_from_point: '查找包含指定桌面坐标的显示器',
+  available_monitors: '列出系统所有可用显示器',
+  gtk_window: '获取 Linux/BSD 的本地 GTK 窗口对象',
+  default_vbox: '获取 GTK 窗口默认的垂直布局容器',
+  activity_name: '获取 Android 窗口关联的 Activity 名称',
+  scene_identifier: '获取 iOS 窗口关联的 UIScene 标识',
+  window_handle: '获取用于原生互操作的窗口句柄',
+  theme: '获取当前窗口的明暗主题',
+  center: '将窗口居中',
+  request_user_attention: '请求或取消窗口闪烁等用户提醒',
+  create_window: '创建原生窗口，可附带初始 webview',
+  create_webview: '在指定窗口中创建 webview',
+  set_resizable: '设置是否允许用户调整窗口大小',
+  set_enabled: '启用或禁用窗口交互',
+  set_maximizable: '启用或禁用原生最大化按钮',
+  set_minimizable: '启用或禁用原生最小化按钮',
+  set_closable: '启用或禁用原生关闭按钮',
+  set_title: '修改窗口标题',
+  maximize: '将窗口最大化',
+  unmaximize: '将窗口从最大化恢复',
+  minimize: '将窗口最小化',
+  unminimize: '将窗口从最小化恢复',
+  show: '显示窗口',
+  hide: '隐藏窗口',
+  close: '请求正常关闭，可由关闭事件否决',
+  destroy: '直接销毁窗口，不走关闭请求确认',
+  set_decorations: '显示或隐藏系统标题栏和边框',
+  set_shadow: '启用或禁用窗口阴影',
+  set_always_on_bottom: '设置窗口是否始终位于其他窗口下方',
+  set_always_on_top: '设置窗口是否始终位于其他窗口上方',
+  set_visible_on_all_workspaces: '设置窗口是否显示在所有虚拟桌面',
+  set_background_color: '设置窗口或 webview 的背景色',
+  set_content_protected: '请求阻止其他应用截取窗口内容',
+  set_size: '调整窗口内容区或 webview 的尺寸',
+  set_min_size: '设置或清除窗口内容区最小尺寸',
+  set_max_size: '设置或清除窗口内容区最大尺寸',
+  set_size_constraints: '设置各轴的最小和最大尺寸约束',
+  set_position: '移动窗口或窗口内的 webview',
+  set_fullscreen: '进入或退出全屏',
+  set_fullscreen_on_monitor: '在指定桌面坐标所在的显示器全屏',
+  set_simple_fullscreen: '切换 macOS 不创建独立空间的简单全屏',
+  set_focus: '将窗口置前并获取输入焦点',
+  set_focusable: '设置窗口是否可以获取输入焦点',
+  set_icon: '修改窗口图标',
+  set_skip_taskbar: '设置是否隐藏任务栏中的窗口图标',
+  set_cursor_grab: '将鼠标指针限制在窗口范围内',
+  set_cursor_visible: '显示或隐藏窗口中的鼠标指针',
+  set_cursor_icon: '修改窗口中的鼠标指针样式',
+  set_cursor_position: '以窗口坐标设置鼠标指针位置',
+  set_ignore_cursor_events: '设置鼠标事件是否穿透窗口',
+  start_dragging: '启动由系统管理的窗口拖动',
+  start_resize_dragging: '从指定边缘或角启动窗口缩放拖动',
+  set_badge_count: '设置或清除应用图标上的数字角标',
+  set_badge_label: '设置或清除 macOS Dock 图标角标文字',
+  set_overlay_icon: '设置或清除 Windows 任务栏叠加图标',
+  set_progress_bar: '设置任务栏或 Dock 的进度与状态',
+  set_title_bar_style: '修改 macOS 标题栏样式',
+  set_traffic_light_position: '移动 macOS 标题栏红黄绿按钮',
+  set_theme: '设置明暗主题，或跟随系统',
+  on_webview_event: '注册 webview 事件回调',
+  with_webview: '在回调中访问平台原生 webview 对象',
+  open_devtools: '打开 webview 开发者工具',
+  close_devtools: '关闭 webview 开发者工具',
+  is_devtools_open: '查询开发者工具是否已打开',
+  url: '获取 webview 当前页面 URL',
+  bounds: '获取 webview 在窗口内的位置和尺寸',
+  position: '获取 webview 相对窗口内容区的位置',
+  size: '获取 webview 内容区的物理像素尺寸',
+  navigate: '让 webview 导航到指定 URL',
+  reload: '重新加载 webview 当前页面',
+  print: '打开当前网页的打印对话框',
+  set_bounds: '同时设置 webview 的位置和尺寸',
+  eval_script: '执行 JavaScript，不接收返回值',
+  eval_script_with_callback: '执行 JavaScript，并回调 JSON 序列化结果',
+  reparent: '将 webview 移到另一个窗口',
+  cookies_for_url: '读取适用于指定 URL 的 Cookie',
+  cookies: '读取当前会话的全部 Cookie',
+  set_cookie: '向当前会话写入 Cookie',
+  delete_cookie: '从当前会话删除指定 Cookie',
+  set_auto_resize: '设置 webview 是否随父窗口自动调整布局',
+  set_zoom: '设置网页缩放倍数',
+  clear_all_browsing_data: '清除 webview 会话的浏览数据',
+  new: '在主线程创建并初始化运行时',
+  new_any_thread: '在允许的平台上从任意线程创建运行时',
+  create_proxy: '创建向事件循环发送用户事件的代理',
+  handle: '获取可跨线程调用的运行时句柄',
+  cursor_position: '获取鼠标指针相对桌面的物理坐标',
+  set_activation_policy: '设置 macOS 应用激活策略',
+  set_activate_ignoring_other_apps: '设置 macOS 启动时是否抢占应用焦点',
+  set_dock_visibility: '显示或隐藏 macOS Dock 应用图标',
+  set_device_event_filter: '设置未聚焦窗口的底层设备事件过滤策略',
+  run_iteration: '处理一轮事件，然后将控制权交回调用方',
+  run_return: '运行事件循环，退出时返回退出码',
+  run: '运行事件循环，结束时退出进程',
+  request_exit: '携带退出码请求结束事件循环',
+  display_handle: '获取窗口系统的原生显示连接句柄',
+  find_class: '在 Android 项目作用域查找 Java 类',
+  run_on_android_context: '在 Android JNI、Activity 和 webview 上执行回调',
+  fetch_data_store_identifiers: '枚举 Apple webview 数据存储的标识',
+  remove_data_store: '按标识删除 Apple webview 数据存储',
+}
+function description(trait, name) {
+  if (trait === 'WindowBuilder') {
+    const purpose = { new: '初始化窗口属性构建器', center: '设置新窗口居中', position: '设置新窗口的逻辑像素位置',
+      inner_size: '设置新窗口的逻辑像素内容区尺寸', title: '设置新窗口标题', theme: '设置新窗口主题或跟随系统' }[name]
+    if (purpose) return purpose
+  }
+  if (['Runtime', 'RuntimeHandle'].includes(trait) && ['show', 'hide'].includes(name)) {
+    return name === 'show' ? '显示 macOS 应用，不自动聚焦' : '隐藏整个 macOS 应用'
+  }
+  if (trait === 'WebviewDispatch') {
+    if (name === 'close') return '关闭 webview 原生视图，保留所属宿主窗口'
+    if (name === 'set_focus') return '将所属窗口置前并聚焦 webview'
+    if (name === 'show') return '显示 webview 内容'
+    if (name === 'hide') return '隐藏 webview 内容'
+  }
+  assert.ok(DESCRIPTION[name], `${trait}::${name}: missing Chinese description`)
+  return DESCRIPTION[name]
 }
 
-const LITERAL = /^\s*(return\s+)?Ok\((true|false|None|\(\))\)\s*;?\s*$/
-
-/** wired | error | stub | noop | warned | panic. */
-function classify({ body }) {
-  const code = body.trim()
-  if (/\b(todo|unimplemented)!/.test(code)) return 'panic'
-  if (/unsupported\(/.test(code)) return 'warned'
-  if (/^(?:return\s+)?Err\(/.test(code)) return 'error'
-  if (LITERAL.test(code)) return 'stub'
-  if (!/\bself\b/.test(code) && !/\b(Self::|json!|ipc|context|dispatch)/.test(code)) return 'noop'
-  return 'wired'
+const link = (file, line, label = file) => `[${label}](<../${file}${line ? `#L${line}` : ''}>)`
+const at = (file, needle, label = file) => {
+  const index = read(file).split('\n').findIndex(line => line.includes(needle))
+  assert.ok(index >= 0, `${file}: missing source anchor ${needle}`)
+  return link(file, index + 1, label)
 }
-
-assert.equal(classify({ body: 'Err(crate::runtime::create_webview_err("unavailable".into()))' }), 'error')
-assert.equal(classify({ body: 'self.dispatch("window.show", json!({}))' }), 'wired')
-assert.equal(classify({ body: 'Ok(true)' }), 'stub')
-
-const ours = Object.fromEntries(targets.map((t) => [t.file, definitions(read(t.file))]))
-const wry = definitions(read(WRY_LIB))
-const lib = read(RUNTIME_LIB)
-
-const rows = targets.map((target) => ({
-  ...target,
-  members: members(lib, target.trait).map((name) => {
-    const mine = ours[target.file].get(name)
-    const reference = wry.get(name)
-    return {
-      name,
-      kind: mine ? classify(mine) : 'missing',
-      cfg: mine?.cfg ?? null,
-      line: mine?.line ?? null,
-      body: mine?.body ?? '',
-      windows: mine?.windows ?? false,
-      wry: reference ? classify(reference) : 'missing',
-      wryCfg: reference?.cfg ?? null,
-    }
-  }),
-}))
-
-const KINDS = ['wired', 'error', 'stub', 'noop', 'warned', 'panic', 'missing']
-const ICON = { wired: 'wired', error: 'error', stub: 'stub', noop: 'no-op', warned: 'warned', panic: 'panic', missing: 'missing' }
-const counts = (members) =>
-  Object.fromEntries(KINDS.map((kind) => [kind, members.filter((m) => m.kind === kind).length]))
-
-const summaryTable = [
-  '| trait | members | wired | error | stub | no-op | warned | panic | missing |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
-  ...rows.map((r) => {
-    const c = counts(r.members)
-    return `| \`${r.trait}\` | ${r.members.length} | ${c.wired} | ${c.error} | ${c.stub} | ${c.noop} | ${c.warned} | ${c.panic} | ${c.missing} |`
-  }),
-]
-
-const gaps = rows.flatMap((r) =>
-  r.members
-    .filter((m) => m.kind !== 'wired')
-    .map(
-      (m) =>
-        `| \`${r.trait}::${m.name}\` | \`${ICON[m.kind]}\`${windowsPath(m)} | ${m.line ? `[${r.file}:${m.line}](${r.file}#L${m.line})` : '—'} | ${m.wry === 'wired' ? 'implemented' : `\`${m.wry}\``} |`,
-    ),
-)
-
-/** A `warned` member with a `#[cfg(windows)]` branch still works on Windows. */
-function windowsPath(member) {
-  return member.windows ? ' — Windows path wired' : ''
+const limitations = {
+  create_window: '官方 new_window_handler 仍需进程内原生 opener；扩展回调另表',
+  create_webview: '官方 new_window_handler 不能以 Electron 扩展通过替代',
+  window_handle: 'Windows 为菜单代理 HWND；macOS 不可用；Linux 为 X11 ID',
+  display_handle: 'Linux 为 Xlib(None)，不等于可用原生显示连接',
+  set_always_on_bottom: '非 Windows 无操作；Windows 仅 true 单次置底',
+  url: '查询 Electron 当前已提交 URL，页面自行导航后也需一致',
+  gtk_window: '无本地 GTK 窗口；返回错误不算功能通过',
+  default_vbox: '无本地 GTK 控件树；返回错误不算功能通过',
+  with_webview: '报错且不调用回调，不算功能通过',
+  set_title_bar_style: '不支持运行时变更',
+  set_device_event_filter: '本库仅警告；Windows 仍留在分母',
+  set_cursor_position: 'Linux 仅警告，不得改为平台 N/A',
+  reparent: '迁移原生视图及 Rust 所属关系；需保留页面状态、IPC 和父窗销毁语义',
+  fetch_data_store_identifiers: '本库报错且不回调',
+  remove_data_store: '本库报错且不回调',
+  new_any_thread: '必须在非主线程实际创建，new 的成功不能代替',
 }
+const rate = ({ passed, total }) => `${passed}/${total}（${total ? (passed * 100 / total).toFixed(1) : '0.0'}%）`
+const escape = text => String(text).replaceAll('|', '&#124;').replaceAll('\n', ' ')
+function resultCell(cell) {
+  if (cell.status === 'na') return `N/A：${escape(cell.reason)}`
+  const labels = { pass: '✅ 通过', fail: '❌ 失败', skip: '跳过（不计）', unknown: '未验证' }
+  if (!cell.evidence.length) return labels[cell.status]
+  const evidence = cell.evidence.find(item => item.status === cell.status) ?? cell.evidence[0]
+  const title = escape(`${evidence.testRun.id} / ${evidence.test}：${evidence.assertion}`)
+  return `[${labels[cell.status]}](<${evidence.run.url}> "${title.replaceAll('"', '&quot;')}")`
+}
+export function renderCoverage(evidence = aggregateEvidence(inventory, [])) {
+  const table = ['| 成员 | 一句用途 | Windows | macOS | Linux | 差异 / 条件 |', '| --- | --- | --- | --- | --- | --- |']
+  const detail = rows.map(row => [
+    `## ${row.trait}（${row.members.length}）`, '', ...table,
+    ...row.members.map(member => {
+      const cells = PLATFORMS.map(platform => resultCell(evidence.cells.get(member.id)[platform])).join(' | ')
+      const sources = `${link(member.declaration, member.declarationLine, '契约')} / ${link(WRY_LIB, member.wryLine, 'wry')}`
+      return `| ${link(row.file, member.line, `\`${member.name}\``)} | ${description(row.trait, member.name)} | ${cells} | ${limitations[member.name] ?? ''} ${sources} |`
+    }), '',
+  ].join('\n'))
+  const total = evidence.runtime.all.total
+  const ext = [
+    '## Electron 扩展（独立分母，不补官方 API 的缺口）', '', ...table,
+    ...extensions.map(member => `| ${at(member.file, member.anchor, `\`${member.id}\``)} | ${member.purpose} | ${PLATFORMS.map(platform => resultCell(evidence.cells.get(member.id)[platform])).join(' | ')} | Electron 专有契约 |`),
+    '', `扩展完整三平台通过：${rate(evidence.extensions.all)}。`, '',
+  ].join('\n')
+  return `# 桌面运行时逐成员验收
 
-const detail = rows.map((r) => [
-  `### ${r.trait}`,
-  '',
-  `\`${r.file}\` — ${r.members.length} members.`,
-  '',
-  '| member | electron | tauri-runtime-wry | note |',
-  '| --- | --- | --- | --- |',
-  ...r.members.map((m) => {
-    const notes = []
-    if (m.cfg) notes.push(`\`#[cfg(${m.cfg})]\``)
-    if (m.kind === 'error') notes.push('returns an explicit unsupported error')
-    if (r.trait === 'WindowDispatch' && m.name === 'window_handle') notes.push('Windows returns a UI-thread menu proxy; macOS returns HandleError::Unavailable; X11 IDs do not provide local GTK objects')
-    if (m.kind === 'stub') notes.push('returns a literal')
-    if (m.kind === 'noop') notes.push('never reaches Electron')
-    if (m.kind === 'warned') notes.push(`logs once when the platform refuses${windowsPath(m)}`)
-    if (m.kind === 'panic') notes.push('panics if called')
-    if (m.wryCfg) notes.push(`wry is \`#[cfg(${m.wryCfg})]\``)
-    return `| \`${m.name}\` | \`${ICON[m.kind]}\` | \`${m.wry}\` | ${notes.join('; ')} |`
-  }),
-  '',
-].join('\n'))
+由 \`node tests/checks/coverage.mjs --write\` 生成。用途说明官方契约；**源码连线、编译、负测和 setter 返回 Ok 均不算功能通过。**
 
-const markdown = `# Runtime coverage
+## 口径与当前结果
 
-Generated by \`node tests/checks/coverage.mjs --write\` — do not edit by hand.
-Traits come from \`${RUNTIME_LIB}\` and the reference column from \`${WRY_LIB}\`, both from the
-checked-out \`source/tauri\` tree (Tauri 2.12). This scan does not verify that its
-revision matches the parent gitlink or the registry packages selected by \`Cargo.lock\`.
+- 分母：上游六个公开 trait 的桌面可调用成员，共 **${total}** 项；关联类型、空标记 trait、纯移动端 ${excluded.length} 项不计。Windows/macOS 同名重载按一个成员、各自平台验证。
+- 平台 N/A 只依据上游 cfg 或明确官方平台限制；本库不支持、跳过、失败、无证据都不得移出分母。devtools 特性计入。
+- 逐平台通过只接收同一提交、同次 CI attempt、真实 Electron suite 成功后的显式行为断言；所有适用平台均通过才算完整成员。扩展另计，不冒充官方 API。
+- ${evidence.runUrl ? `本报告证据：[CI ${evidence.runId}](<${evidence.runUrl}>)，提交 \`${evidence.commit}\`。` : '未导入可追溯的逐成员运行证据，因此各平台保持未验证；旧 CI 总检查数不能反推逐成员通过。'}
 
-This source scan lists implementation paths, not verified capability coverage.
-\`cargo test\` includes a real-window smoke test through \`src/bin/smoke.rs\`; CI is
-configured for Windows, macOS and Linux. Platform skips are printed. Configuration
-is not evidence that a particular CI run passed. The tests do not verify every
-method, native effect or official example. The separate \`pnpm check\` runner records
-official-example assertions and screenshots; those screenshots still require visual
-review. The official generic runtime traits have no window-effects delegation hook.
-On Windows a Rust UI-thread HWND owns Tauri's \`muda\` menu; the event pump mirrors
-attached menus into Electron and routes commands and accelerators back to that owner.
-Native menu integration on macOS/Linux and popup placement remain unverified.
-This crate's own window API delegates supported native effects through its Tauri
-plugin; that extension is outside the trait-method counts below.
-Upstream sources and copied framework files remain unchanged; no framework patch or
-ACL bypass is required. Official generic \`setEffects\`/\`clearEffects\` calls are not
-redirected to this extension or the inherent
-\`ElectronWindowDispatcher::set_window_effects\` helper. CI runs the shared package
-commands: \`pnpm run test:bridge:regressions\`, \`pnpm run test:checks\`,
-\`pnpm run test:bridge:prepare\`, \`pnpm run test:bridge\`, \`pnpm run test:runtime\`,
-\`pnpm run test:examples\` and \`pnpm run test:coverage\`, plus
-\`cargo check --locked --all-targets --all-features\`. These configured checks are not
-remote pass results. Bridge-owned protocol, layout, download and policy regressions
-stay in \`electron-rs/tests\`; root \`tests/checks\` owns adapter/window API and example
-checks. Rust assertions over Node VM observations and the example effects queue check
-use native doubles. The separately invoked real bridge tests in
-\`electron-rs/tests/bridge.rs\` exercise ElectronBuilder, loaded-page preload/protocol
-IPC, events, selected native window/webview RPCs and shutdown. They are ignored by
-default and require preparation plus a desktop; Linux sandbox permissions are set
-after staging. None of these checks establishes every RPC, native effect or
-three-platform desktop behavior.
-
-| kind | meaning |
+| 范围 | 真实行为通过 / 分母 |
 | --- | --- |
-| wired | the body reaches Electron over IPC or a native ID; platform branches may still be unavailable |
-| error | the body immediately returns an explicit unsupported error; callbacks are not invoked |
-| stub | the body is a literal: \`Ok(())\`, \`Ok(true)\`, \`Ok(None)\` — it silently does nothing |
-| no-op | the body never touches Electron or \`self\` — it silently does nothing |
-| warned | the body calls \`runtime::unsupported\`: it does what the platform allows and logs once when it does not |
-| panic | \`todo!()\`/\`unimplemented!()\` — loud, but only on the platform that compiles it |
-| missing | no override, so the trait default applies |
+${PLATFORMS.map(platform => `| ${platform} | ${rate(evidence.runtime[platform])} |`).join('\n')}
+| 全部适用平台 | ${rate(evidence.runtime.all)} |
 
-## Support matrix
+80% 完整成员门槛至少 ${Math.ceil(total * 0.8)} 项，90% 至少 ${Math.ceil(total * 0.9)} 项；未知或跳过仍留在分母。完整 marker 协议与校验器见 ${link('tests/checks/runtime-evidence.mjs')}。
 
-| target | CI configured | window-smoke configuration | notes |
-| --- | --- | --- | --- |
-| Windows | yes | desktop smoke and transparent-window check | library window effects support Acrylic/Mica/Tabbed on build 22621+; Win32 decoration/drag/cursor and attached menu mirror paths exist; WebView2 interop is unavailable |
-| macOS | yes | desktop smoke | \`window_handle\` returns \`HandleError::Unavailable\`; WKWebView data-store enumeration and removal error without callbacks; cursor warp via CoreGraphics |
-| Linux | yes | desktop smoke under xvfb | missing local GTK windows/widgets return errors; \`display_handle\` reports \`Xlib(None)\`, so wgpu/GL interop cannot work; cursor warp logs a gap |
-| Android / iOS | no | none | not supported desktop targets; mobile branches remain incomplete |
+## 已知边界（不由单个成员通过自动消除）
 
-This table records intended CI jobs, not successful remote run results. Win32/X11
-IDs do not grant local WebView2, GTK or AppKit/WKWebView access; native objects and
-process-local pointers cannot be fabricated across the process boundary.
-\`with_webview\` errors without invoking its callback on every platform; no local native
-webview object is available. Configured \`new_window_handler\` fails creation rather
-than fabricating its required native opener. Default page popups are denied without
-automatic external launch. Navigation pauses/resumes the original request, preserving
-POST data and redirects. Subframe veto cancels only that request, not parent/sibling
-loads; Chromium may commit an iframe error document instead of retaining its previous
-one. Windows screen coordinates use native DIP/physical conversions for mixed-DPI
-origins. Initialization scripts retain frame scope through sandboxed
-subframe preload, while IPC remains main-frame-only. \`data_directory\` uses resolved
-\`Session.fromPath\` directories shared by path; incognito uses unique in-memory sessions.
-Exit veto/code handling distinguishes \`run_return\` from process-exiting \`run\`; macOS
-reopen and supported process-termination events respect trait platform gates.
-
-Configured hidden titles and transparent title bars map to Electron's \`hidden\`
-style; Overlay maps to \`hiddenInset\`. Logical traffic-light positions and tabbing
-identifiers are forwarded. Runtime title-bar-style changes remain unsupported.
-
-## Library window API (outside trait counts)
-
-With the optional \`tauri\` feature, \`tauri_runtime_electron::window::Window\` wraps
-an official \`tauri::Window<ElectronRuntime>\`, converts from official Window and
-WebviewWindow handles and retains official methods through \`Deref\`. The module
-re-exports official \`Color\`, \`Effect\`, \`EffectState\`, \`WindowEffectsConfig\` and
-\`EffectsBuilder\`. Its \`set_effects<E: Into<Option<WindowEffectsConfig>>>\` and
-\`clear_effects\` methods, or the free functions accepting an official Window, route
-through the selected dispatcher's \`run_on_main_thread\` task with a window serial
-and weak Electron connection scoped to that task, without a global current runtime
-or an upstream downcast.
-
-The TypeScript entry \`tauri-runtime-electron/api/window\` extends official Window,
-exports \`Effect\`/\`EffectState\` and returns library handles from its factories.
-The package is private and unpublished; consume a checkout with the official v2
-\`@tauri-apps/api\` peer. Its \`setEffects\`/\`clearEffects\` invoke the async
-\`plugin:electron-window|set_effects\` command. Applications register \`window::init()\`,
-declare the \`electron-window\` inlined plugin and \`set_effects\` command through
-\`tauri_build::Attributes::new().plugin(...)\` and \`try_build\`, and explicitly grant
-\`electron-window:allow-set-effects\` in their capabilities. Both set and clear use
-normal Tauri IPC/ACL. [The README](../README.md#2-window-api-and-native-effects) has
-minimal Rust/TS and build/ACL examples.
-
-Only material selection through \`effects\` is supported. On Windows 11 22H2
-(build 22621)+, the first supported Acrylic, Mica or Tabbed entry maps to the real
-\`window.backgroundMaterial\` Electron RPC. A list with no supported effect or an
-unsupported platform returns an error. Official \`state\`, \`radius\` and
-\`interactive\` fields apply only on macOS, while \`color\` has no effect on
-Windows 11; this backend ignores them. Clearing restores the configured background
-color, including alpha, across repeated enable/clear calls.
-
-The transparent demo uses this library API, with generated \`window-api.js\` assets,
-the \`tauri\` feature, plugin registration, inlined command metadata and an explicit
-capability. Its page probes support, serializes effects changes and clears them on
-reset/reload; unsupported errors are shown and keep the blur control disabled.
-Zero-alpha window/page backgrounds, panel opacity and window controls are checked
-separately from desktop compositing review. CSS \`backdrop-filter\` only blurs page
-content and does not establish desktop blur. OS settings can limit the visible effect.
-
-Downloads stage privately until completion and the first host decision, then publish
-exclusively without overwriting destinations; failed publication retains the staged
-file, while denial, timeout and destruction clean it up.
-
-## Native code
-
-| file | why it cannot be Electron IPC |
-| --- | --- |
-| \`src/platform/cursor.rs\` | Electron has no cursor API; \`SetCursorPos\` on Windows and \`CGWarpMouseCursorPosition\` on macOS |
-| \`src/platform/dpi.rs\` | a host that is not DPI aware has its coordinates scaled, which puts \`SetCursorPos\` near the corner |
-| \`src/window.rs\` \`imp\` | Windows frame/z-order changes and real non-client move/resize use Win32, including asynchronous \`PostMessageW\` so modal drags do not block the IPC thread |
-
-## Summary
-
-${summaryTable.join('\n')}
-
-## Gaps
-
-Every member that is not \`wired\`, with the file to open and what wry does instead.
-
-| member | electron | location | wry |
-| --- | --- | --- | --- |
-${gaps.join('\n')}
-
-## Every member
+- **原生弹窗**：官方 PendingWebview::new_window_handler 需要同进程原生 opener；Electron 回调 Allow/Create/Deny 是独立扩展，必须分别验收。
+- **创建属性**：proxy_url、additional_browser_args、browser_extensions_enabled / extensions_path 尚需等价行为验证。
+- **原生互操作**：with_webview、GTK、AppKit、Windows 菜单代理 HWND 的限制保留；错误返回的负测不证明原生功能可用。
+- **测试范围**：菜单/托盘真实 OS 操作、安装态文件关联、截图视觉结论仍需专项证据，见 ${link('docs/acceptance.md')}；${link('scripts/example.mjs')} 不得删除官方 setup 回调绕过失败。
 
 ${detail.join('\n')}
-`
-
-if (process.argv.includes('--write')) {
-  mkdirSync(dirname(repo(DOC)), { recursive: true })
-  writeFileSync(repo(DOC), markdown)
-  console.log(`wrote ${DOC}`)
-} else if (process.argv.includes('--md')) process.stdout.write(markdown)
-else if (process.argv.includes('--check')) {
-  let current = ''
-  try {
-    current = readFileSync(repo(DOC), 'utf8').replace(/\r\n/g, '\n')
-  } catch {
-    console.error(`${DOC} is missing; run: node tests/checks/coverage.mjs --write`)
-    process.exit(1)
-  }
-  if (current !== markdown) {
-    console.error(`${DOC} is stale; run: node tests/checks/coverage.mjs --write`)
-    process.exit(1)
-  }
-} else {
-  for (const row of rows) {
-    const c = counts(row.members)
-    console.log(`\n== ${row.file} — ${row.trait} (${row.members.length} members)`)
-    for (const kind of KINDS.filter((k) => k !== 'wired')) {
-      const list = row.members.filter((m) => m.kind === kind).map((m) => `${m.name}${m.line ? `:${m.line}` : ''}`)
-      console.log(`  ${kind.padEnd(7)} ${c[kind] === 0 ? '-' : `${c[kind]}: ${list.join(', ')}`}`)
-    }
-  }
+${ext}`
 }
+
+export function main(args = process.argv.slice(2)) {
+  const options = {}
+  const flags = ['--write', '--check', '--md', '--require-platforms', '--require-suites']
+  const values = ['--evidence', '--commit', '--run', '--min-percent']
+  for (let i = 0; i < args.length; i += 1) {
+    const key = args[i]
+    assert.ok(!Object.hasOwn(options, key), `duplicate option ${key}`)
+    assert.ok(flags.includes(key) || values.includes(key), `unknown option ${key}`)
+    options[key] = flags.includes(key) ? true : args[++i]
+    assert.ok(options[key] && !String(options[key]).startsWith('--'), `missing value for ${key}`)
+  }
+  assert.ok(flags.slice(0, 3).filter(flag => options[flag]).length <= 1, 'choose write, check or md')
+  assert.ok(!options['--evidence'] || !(options['--write'] || options['--check']), 'CI evidence reports use --md; checked-in docs stay deterministic')
+  const artifacts = options['--evidence'] ? readArtifacts(options['--evidence']) : []
+  if (options['--evidence']) assert.ok(artifacts.length, 'evidence directory has no result artifacts')
+  const evidence = aggregateEvidence(inventory, artifacts, { commit: options['--commit'], runId: options['--run'] })
+  if (options['--require-suites']) requireSuites(artifacts)
+  if (options['--require-platforms']) {
+    assert.deepEqual([...evidence.platforms].sort(), [...PLATFORMS].sort(), 'missing Windows/macOS/Linux runtime artifacts')
+  }
+  const markdown = renderCoverage(evidence)
+  if (options['--write']) {
+    mkdirSync(dirname(repo(DOC)), { recursive: true })
+    writeFileSync(repo(DOC), markdown)
+    console.log(`wrote ${DOC}`)
+  } else if (options['--md']) process.stdout.write(markdown)
+  else if (options['--check']) {
+    assert.equal(read(DOC), markdown, `${DOC} is stale; run: node tests/checks/coverage.mjs --write`)
+  } else {
+    console.log('真实行为逐成员验收（不计编译、静态、负测、跳过或未知）')
+    for (const platform of PLATFORMS) console.log(`${platform}: ${rate(evidence.runtime[platform])}`)
+    console.log(`全部适用平台: ${rate(evidence.runtime.all)}`)
+    console.log(`Electron 扩展（独立）: ${rate(evidence.extensions.all)}`)
+  }
+  if (options['--min-percent']) {
+    const minimum = Number(options['--min-percent'])
+    assert.ok(Number.isFinite(minimum) && minimum >= 0 && minimum <= 100, 'min-percent must be 0..100')
+    const { passed, total } = evidence.runtime.all
+    assert.ok(passed * 100 >= total * minimum, `acceptance ${rate(evidence.runtime.all)} is below ${minimum}%`)
+  }
+  return evidence
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

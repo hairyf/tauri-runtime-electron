@@ -5,6 +5,7 @@
 const {
   app,
   BrowserWindow,
+  BaseWindow,
   WebContentsView,
   ipcMain,
   Menu,
@@ -16,7 +17,7 @@ const {
   session,
   webContents,
 } = require('electron')
-const net = require('node:net')
+const connectIpc = require('./ipc.cjs')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -236,12 +237,24 @@ const sizeConstraints = new WeakMap()
 const windowCursorState = new WeakMap()
 const cursorCssKey = new WeakMap()
 const windowConfigs = new WeakMap()
-/** webviewId -> BrowserWindow */
+// Selected-monitor fullscreen must not replace the window's normal geometry.
+const fullscreenBounds = new WeakMap()
+/** webviewId -> BaseWindow */
 const webviews = new Map()
 /** webContents id -> webviewId (for routing `tauri-ipc` messages) */
 const webviewByContents = new Map()
-/** webviewId -> native child view and its resize reference (main pages stay on BrowserWindow). */
+/** webviewId -> independently owned native view and its resize reference. */
 const childWebviews = new Map()
+/** Every page is a separately owned native view, so it can move without reloading. */
+const mainViews = new WeakMap()
+const pendingPopups = new Map()
+let activePopupRequest
+let activePopupContents
+let nextPopupRequest = 0
+
+function mainContents(window) {
+  return mainViews.get(window)?.view.webContents
+}
 /** webviewId -> the out-of-band callbacks the runtime registered */
 const handlerPolicy = new Map()
 /** request id -> staged download, joined with its first host decision and done state */
@@ -435,7 +448,7 @@ function readArg(name) {
 }
 
 function send(message) {
-  if (socket && !socket.destroyed) socket.write(`${JSON.stringify(message)}\n`)
+  if (socket && !socket.closed) socket.send(message)
 }
 
 function serializeError(error) {
@@ -482,6 +495,8 @@ function webPreferences(config, webview = {}) {
     contextIsolation: true,
     sandbox: true,
     nodeIntegration: false,
+    // All pages are native views; DOM guests would bypass the host's popup policy.
+    webviewTag: false,
     // Subframes receive the sandboxed script runner, never Node or Tauri IPC.
     nodeIntegrationInSubFrames: true,
     session: sessionFor(config),
@@ -534,7 +549,7 @@ function browserWindowOptions(config, params) {
     ...(config.trafficLightPosition ? { trafficLightPosition: config.trafficLightPosition } : {}),
     ...(config.tabbingIdentifier ? { tabbingIdentifier: config.tabbingIdentifier } : {}),
     ...(icon ? { icon } : {}),
-    webPreferences: { ...webPreferences(webviewConfig(config, params.webview), params.webview), webviewTag: true },
+    webPreferences: webPreferences(webviewConfig(config, params.webview), params.webview),
   }
   if (process.platform === 'win32') {
     const effects = config.windowEffects?.effects ?? []
@@ -571,12 +586,7 @@ function applyWebviewConfig(contents, config) {
   }
 }
 
-function applyWindowConfig(window, config, params) {
-  const constraints = {}
-  for (const key of ['minWidth', 'minHeight', 'maxWidth', 'maxHeight']) {
-    constraints[key] = constraintValue(params.sizeConstraints && Object.hasOwn(params.sizeConstraints, key)
-      ? params.sizeConstraints[key] : config[key])
-  }
+function applyWindowConfig(window, config, constraints) {
   sizeConstraints.set(window, constraints)
   applySizeConstraints(window)
   setWindowSize(window, { width: config.width ?? 800, height: config.height ?? 600 })
@@ -627,7 +637,8 @@ function applyWindowCursorCss(window, contents) {
 
 function watchWindowCursor(window, contents) {
   contents.on('dom-ready', () => {
-    applyWindowCursorCss(window, contents).catch((error) => log('window.cursor', serializeError(error)))
+    const owner = webviews.get(webviewByContents.get(contents.id))
+    if (owner) applyWindowCursorCss(owner, contents).catch((error) => log('window.cursor', serializeError(error)))
   })
 }
 
@@ -653,7 +664,7 @@ function windowThemeOverride(theme) {
 async function readWindowTheme(window) {
   // An unloaded native host has no document. Query one of its owned pages instead.
   const state = windowThemeState.get(window)
-  const contents = [...state.contents].find((item) => !item.isDestroyed() && item.getURL())
+  const contents = ownedContents(window).find((item) => !item.isDestroyed() && item.getURL())
   const dark = contents
     ? await contents.mainFrame.executeJavaScript("matchMedia('(prefers-color-scheme: dark)').matches")
     : state.theme === null ? nativeTheme.shouldUseDarkColors : state.theme === 'dark'
@@ -691,11 +702,11 @@ function setWindowTheme(window, theme) {
     const previous = state.theme
     state.theme = theme
     try {
-      await Promise.all([...state.contents].map((contents) => emulateContentsTheme(contents, theme)))
+      await Promise.all(ownedContents(window).map((contents) => emulateContentsTheme(contents, theme)))
       await notifyWindowTheme(window, state.windowId)
     } catch (error) {
       state.theme = previous
-      await Promise.all([...state.contents].map((contents) => emulateContentsTheme(contents, previous)
+      await Promise.all(ownedContents(window).map((contents) => emulateContentsTheme(contents, previous)
         .catch((rollbackError) => log('window.theme rollback failed', serializeError(rollbackError)))))
       throw error
     }
@@ -706,32 +717,34 @@ function setWindowTheme(window, theme) {
 }
 
 function watchThemeContents(window, contents) {
-  const state = windowThemeState.get(window)
-  if (state.contents.has(contents)) return
-  state.contents.add(contents)
-  contents.once('destroyed', () => state.contents.delete(contents))
+  // Resolve ownership at event time: a live view can move to another window.
+  const owner = () => webviews.get(webviewByContents.get(contents.id))
   contents.debugger.on('detach', () => {
     if (!themeDebuggers.delete(contents)) return
-    log('window.theme debugger detached', state.windowId)
-    notifyWindowTheme(window, state.windowId).catch((error) => log('window.theme', serializeError(error)))
+    const window = owner()
+    if (window) notifyWindowTheme(window, windowThemeState.get(window).windowId)
+      .catch((error) => log('window.theme', serializeError(error)))
   })
   contents.on('devtools-closed', () => {
-    if (state.theme !== null && !contents.debugger.isAttached()) {
+    const window = owner()
+    const state = window && windowThemeState.get(window)
+    if (state && state.theme !== null && !contents.debugger.isAttached()) {
       setWindowTheme(window, state.theme).catch((error) => log('window.theme', serializeError(error)))
     }
   })
   contents.on('dom-ready', () => {
-    notifyWindowTheme(window, state.windowId).catch((error) => log('window.theme', serializeError(error)))
+    const window = owner()
+    if (window) notifyWindowTheme(window, windowThemeState.get(window).windowId)
+      .catch((error) => log('window.theme', serializeError(error)))
   })
+  const state = windowThemeState.get(window)
   if (state.theme !== null) {
     emulateContentsTheme(contents, state.theme).catch((error) => log('window.theme child', serializeError(error)))
   }
 }
 
 function installWindowTheme(window, windowId, theme) {
-  windowThemeState.set(window, { windowId, theme: null, contents: new Set(), pending: Promise.resolve() })
-  watchThemeContents(window, window.webContents)
-  window.webContents.on('did-attach-webview', (_event, guest) => watchThemeContents(window, guest))
+  windowThemeState.set(window, { windowId, theme: null, pending: Promise.resolve() })
   const notify = () => notifyWindowTheme(window, windowId).catch((error) => log('window.theme', serializeError(error)))
   nativeTheme.on('updated', notify)
   window.once('closed', () => nativeTheme.off('updated', notify))
@@ -739,53 +752,78 @@ function installWindowTheme(window, windowId, theme) {
   setWindowTheme(window, theme).catch((error) => log('window.theme config', serializeError(error)))
 }
 
-async function createWindow(params) {
+function createWindow(params) {
   const { windowId } = params
+  if (!Number.isSafeInteger(windowId) || windows.has(windowId)) throw new Error('invalid or duplicate window ID')
   const config = params.window ?? params
+  for (const key of ['width', 'height', 'x', 'y']) {
+    if (config[key] != null && (!Number.isFinite(config[key]) || (['width', 'height'].includes(key) && config[key] <= 0))) {
+      throw new Error('invalid window geometry')
+    }
+  }
+  const constraints = {}
+  for (const key of ['minWidth', 'minHeight', 'maxWidth', 'maxHeight']) {
+    constraints[key] = constraintValue(params.sizeConstraints && Object.hasOwn(params.sizeConstraints, key)
+      ? params.sizeConstraints[key] : config[key])
+  }
+  const popup = params.newWindowRequest !== undefined
+  if (popup && (!Number.isSafeInteger(params.newWindowRequest) || params.newWindowRequest !== activePopupRequest || pendingPopups.has(activePopupRequest))) {
+    throw new Error('invalid or consumed native popup opener')
+  }
   log('window.create', JSON.stringify({ windowId, label: params.label }))
-  const window = new BrowserWindow(browserWindowOptions(config, params))
+  const options = browserWindowOptions(config, params)
+  if (popup) {
+    // Chromium's real opener relationship requires the same storage partition.
+    // Host initialization scripts are supplied before that guest is created.
+    const requestedSession = options.webPreferences.session
+    if (requestedSession && requestedSession !== activePopupContents.session) {
+      throw new Error('native popup target session must match its opener; incognito/dataDirectory cannot be changed')
+    }
+    options.webPreferences.session = activePopupContents.session
+    options.webPreferences.partition = undefined
+  }
+  // A BaseWindow never owns its page implicitly. Keep the view in the same
+  // ownership table as children, including native Chromium popup guests.
+  const window = new BaseWindow({ ...options, show: false })
   windows.set(windowId, window)
+  // Install rollback before any configuration, theme or renderer operation.
+  window.once('closed', () => {
+    if (popup && pendingPopups.get(params.newWindowRequest)?.window === window) {
+      pendingPopups.delete(params.newWindowRequest)
+    }
+    closeAllowed.delete(windowId)
+    windows.delete(windowId)
+    for (const [webviewId, owner] of webviews) {
+      if (owner === window) closeChildWebview(webviewId)
+    }
+    send({ event: 'window.closed', params: { windowId } })
+  })
+  try {
   windowConfigs.set(window, config)
   closableState.set(window, config.closable !== false)
   maximizableState.set(window, config.maximizable !== false)
   minimizableState.set(window, config.minimizable !== false)
   // Electron has no decorations getter; Rust updates this after native style changes.
   window.__tauriDecorations = config.decorations ?? true
-  applyWindowConfig(window, config, params)
+  applyWindowConfig(window, config, constraints)
   installWindowTheme(window, windowId, config.theme)
-  // Read this now: by the time `closed` fires the window and its webContents are
-  // destroyed, and `window.webContents.id` throws "Object has been destroyed".
-  const contentsId = window.webContents.id
 
   // Electron destroys the window on `close`; Tauri decides instead (an app may
   // `prevent_close` and keep the window around, e.g. hiding to the tray), so
   // hold the close and let the runtime answer with `window.destroy`.
   window.on('close', (event) => {
-    if (closeAllowed.has(windowId)) return
+    if (closeAllowed.has(windowId) || !socket || socket.closed) return
     event.preventDefault()
     if (!closableState.get(window)) return
     send({ event: 'window.closeRequested', params: { windowId } })
   })
 
-  window.on('closed', () => {
-    closeAllowed.delete(windowId)
-    windows.delete(windowId)
-    webviewByContents.delete(contentsId)
-    for (const [webviewId, owner] of webviews) {
-      if (owner !== window) continue
-      if (childWebviews.has(webviewId)) closeChildWebview(webviewId)
-      else {
-        handlerPolicy.delete(webviewId)
-        webviews.delete(webviewId)
-      }
-    }
-    send({ event: 'window.closed', params: { windowId } })
-  })
   const emit = (event, extra = {}) => {
     if (window.isDestroyed()) return
     const geometry = readGeometry(window)
     send({ event: 'window.event', params: { windowId, event, ...geometry, ...extra } })
   }
+  window.on('leave-full-screen', () => restoreFullscreenBounds(window))
   window.on('resize', () => resizeChildWebviews(window))
   const reapplyConstraints = () => applySizeConstraints(window)
   for (const event of ['resize', 'move', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) {
@@ -796,18 +834,64 @@ async function createWindow(params) {
   for (const event of ['resize', 'move', 'focus', 'blur', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) {
     window.on(event, () => emit(event))
   }
-  window.webContents.on('did-finish-load', () => {
-    log('loaded', window.webContents.getURL())
-  })
-
-  const webview = params.webview
-  if (webview) return loadWebview(window, webview)
+  if (popup) {
+    if (!params.webview) {
+      window.destroy()
+      throw new Error('native popup requires a main webview')
+    }
+    pendingPopups.set(activePopupRequest, {
+      window, params, options,
+      attach(guest) {
+        // Wrapping an existing guest resets its preferences; keep the preload
+        // and sandbox settings chosen before Chromium created it.
+        const view = new WebContentsView({ webContents: guest, webPreferences: options.webPreferences })
+        loadWebview(window, params.webview, view, false)
+        showWindow(window, config)
+      },
+    })
+  } else {
+    if (params.webview) loadWebview(window, params.webview, new WebContentsView({ webPreferences: options.webPreferences }))
+    showWindow(window, config)
+  }
   return { windowId }
+  } catch (error) {
+    window.destroy()
+    throw error
+  }
+}
+
+function showWindow(window, config) {
+  if (config.visible === false) return
+  if (config.focus === false || config.focusable === false) window.showInactive()
+  else window.show()
+}
+
+function popupGeometry(features) {
+  const values = Object.fromEntries(String(features ?? '').split(',').map((entry) => entry.trim().split('=')))
+  const number = (...keys) => {
+    const raw = keys.map((key) => values[key]).find((value) => value !== undefined)
+    const value = Number.parseInt(raw, 10)
+    return Number.isFinite(value) ? value : undefined
+  }
+  const x = number('left', 'x')
+  const y = number('top', 'y')
+  const width = number('width', 'innerWidth')
+  const height = number('height', 'innerHeight')
+  return {
+    position: x === undefined && y === undefined ? null : { x: x ?? 0, y: y ?? 0 },
+    size: width === undefined && height === undefined ? null : { width: width ?? 800, height: height ?? 600 },
+  }
 }
 
 /** Forwards the webview lifecycle events Tauri's runtime handlers expect. */
 function wireWebviewEvents(contents, webviewId) {
   if (!contents || contents.isDestroyed()) return
+  contents.on('did-navigate', (_event, url) => {
+    send({ event: 'webview.navigationCommitted', params: { webviewId, url } })
+  })
+  contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    if (isMainFrame) send({ event: 'webview.navigationCommitted', params: { webviewId, url } })
+  })
   contents.on('did-start-loading', () => {
     send({ event: 'webview.loadStarted', params: { webviewId, url: contents.getURL() } })
   })
@@ -823,10 +907,62 @@ function wireWebviewEvents(contents, webviewId) {
       params: { webviewId, reason: details.reason, exitCode: details.exitCode },
     })
   })
-  // Native opener callbacks remain rejected by Rust; keep its event diagnostic.
-  contents.setWindowOpenHandler(({ url, features }) => {
-    send({ event: 'webview.newWindow', params: { webviewId, url, features: features ?? '' } })
-    return { action: 'deny' }
+  contents.setWindowOpenHandler((details) => {
+    let request
+    let selected
+    let allowed = false
+    try {
+      // Rust always sees the request, even without an application handler, so
+      // default popups have managed identities, lifecycle and cleanup too.
+      const previous = activePopupRequest
+      const previousContents = activePopupContents
+      request = nextPopupRequest++
+      activePopupRequest = request
+      activePopupContents = contents
+      let response
+      try {
+        response = socket.request('webview.newWindow', {
+          request, webviewId, url: details.url,
+          frameName: details.frameName, features: details.features ?? '',
+          disposition: details.disposition,
+          ...popupGeometry(details.features),
+        })
+      } finally {
+        activePopupRequest = previous
+        activePopupContents = previousContents
+      }
+      if (response.action !== 'allow') return { action: 'deny' }
+      selected = pendingPopups.get(request)
+      if (!selected || selected.params.windowId !== response.windowId || selected.window.isDestroyed()) throw new Error('missing native popup destination')
+      allowed = true
+      return {
+        action: 'allow',
+        // A normal browser popup can outlive its opener. Do not inherit
+        // Electron's additional rule that tears it down on opener navigation.
+        outlivesOpener: true,
+        overrideBrowserWindowOptions: selected.options,
+        createWindow(options) {
+          trace('popup.preferences', JSON.stringify({ override: selected.options.webPreferences, guest: options.webContents.getLastWebPreferences() }, (key, value) => key === 'session' ? undefined : value))
+          pendingPopups.delete(request)
+          try { selected.attach(options.webContents) }
+          catch (error) {
+            selected.window.destroy()
+            if (!options.webContents.isDestroyed()) options.webContents.close()
+            throw error
+          }
+          return options.webContents
+        },
+      }
+    } catch (error) {
+      log('new window failed', serializeError(error))
+      return { action: 'deny' }
+    } finally {
+      const abandoned = pendingPopups.get(request)
+      if (abandoned && !allowed) {
+        pendingPopups.delete(request)
+        abandoned.window.destroy()
+      }
+    }
   })
 }
 
@@ -861,31 +997,29 @@ for (const entry of ${JSON.stringify(scripts)}) {
   return file
 }
 
-function loadWebview(window, webview) {
-  const { webviewId, url } = webview
-  webviews.set(webviewId, window)
-  webviewByContents.set(window.webContents.id, webviewId)
-  recordPolicy(webviewId, webview.policy)
-  applyWebviewConfig(window.webContents, webviewConfig(windowConfigs.get(window) ?? {}, webview))
-  watchWindowCursor(window, window.webContents)
-  wireWebviewEvents(window.webContents, webviewId)
-  // Do not await: the page may need a `protocol.request` round trip to the Rust
-  // runtime, which only starts pumping events after this call returns.
-  window.loadURL(url).catch((error) => log('loadURL failed', url, serializeError(error)))
-  return { windowId: webviewId }
+function loadWebview(window, webview, view, navigate = true) {
+  return createChildWebview(window, { ...webview, autoResize: true }, view, true, navigate)
 }
 
 /** Native children do not depend on a host page, its CSP, or its load finishing. */
-function createChildWebview(window, webview) {
+function createChildWebview(window, webview, view, main = false, navigate = true) {
   const { webviewId, url } = webview
   const config = webviewConfig(windowConfigs.get(window) ?? {}, webview)
-  const view = new WebContentsView({ webPreferences: webPreferences(config, webview) })
+  view ??= new WebContentsView({ webPreferences: webPreferences(config, webview) })
+  const child = { view, main, contentsId: view.webContents.id, autoResize: Boolean(webview.autoResize) }
+  try {
   applyWebviewConfig(view.webContents, config)
-  const child = { view, contentsId: view.webContents.id, autoResize: Boolean(webview.autoResize) }
   childWebviews.set(webviewId, child)
   webviews.set(webviewId, window)
-  view.webContents.once('destroyed', () => closeChildWebview(webviewId))
-  try {
+  if (main) mainViews.set(window, child)
+  view.webContents.once('destroyed', () => {
+    const owner = webviews.get(webviewId)
+    // A native popup is a top-level browser window. Explicit webview.close
+    // removes its ownership first and, like Wry, must leave the shell alive.
+    const closePopup = main && !navigate && owner && mainViews.get(owner) === child
+    closeChildWebview(webviewId)
+    if (closePopup && !owner.isDestroyed()) owner.destroy()
+  })
     window.contentView.addChildView(view)
     webviewByContents.set(view.webContents.id, webviewId)
     recordPolicy(webviewId, webview.policy)
@@ -901,10 +1035,11 @@ function createChildWebview(window, webview) {
     })
     // Never wait for navigation here: local protocols need the Rust loop that
     // is currently waiting for this creation call to return.
-    view.webContents.loadURL(url).catch((error) => log('loadURL failed', url, serializeError(error)))
+    if (navigate) view.webContents.loadURL(url).catch((error) => log('loadURL failed', url, serializeError(error)))
     return { webviewId }
   } catch (error) {
-    closeChildWebview(webviewId)
+    if (childWebviews.get(webviewId) === child) closeChildWebview(webviewId)
+    else if (view.webContents && !view.webContents.isDestroyed()) view.webContents.close()
     throw error
   }
 }
@@ -951,16 +1086,19 @@ function closeChildWebview(webviewId) {
   webviews.delete(webviewId)
   webviewByContents.delete(child.contentsId)
   handlerPolicy.delete(webviewId)
+  if (window && mainViews.get(window) === child) mainViews.delete(window)
   if (window && !window.isDestroyed()) window.contentView.removeChildView(child.view)
-  if (!child.view.webContents.isDestroyed()) child.view.webContents.close()
+  const contents = child.view.webContents
+  // WebContentsView clears its getter before the native destroyed event fires.
+  if (contents && !contents.isDestroyed()) contents.close()
   send({ event: 'webview.closed', params: { webviewId } })
 }
 
-/** Route every dispatch to its own native child or the BrowserWindow main page. */
+/** Route every dispatch to its independently retained native view. */
 function contentsFor(webviewId) {
   const window = findWebview(webviewId)
-  const contents = childWebviews.get(webviewId)?.view.webContents ?? window.webContents
-  if (contents.isDestroyed()) throw new Error(`destroyed webview ${webviewId}`)
+  const contents = childWebviews.get(webviewId)?.view.webContents ?? mainContents(window)
+  if (!contents || contents.isDestroyed()) throw new Error(`destroyed webview ${webviewId}`)
   return contents
 }
 
@@ -1003,6 +1141,15 @@ function physicalScreenRect(window, rect, scale) {
     x: Math.round(rect.x * scale), y: Math.round(rect.y * scale),
     width: Math.round(rect.width * scale), height: Math.round(rect.height * scale),
   }
+}
+
+/** Unlike Electron's nearest-display API, Tauri returns no monitor outside its bounds. */
+function displayForPoint(x, y, physical = true) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('invalid monitor point')
+  return screen.getAllDisplays().find((display) => {
+    const rect = physical ? physicalScreenRect(null, display.bounds, display.scaleFactor) : display.bounds
+    return x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+  })
 }
 
 /** Tauri monitors are physical pixels, Electron displays are DIPs. */
@@ -1062,10 +1209,10 @@ function readGeometry(window) {
     alwaysOnTop: window.isAlwaysOnTop(),
     decorated: window.__tauriDecorations ?? true,
     title: window.getTitle(),
-    // Electron does not implement all three native flags on every platform.
-    maximizable: maximizableState.get(window) ?? true,
-    minimizable: minimizableState.get(window) ?? true,
-    closable: closableState.get(window) ?? true,
+    maximizable: window.isMaximizable(),
+    minimizable: window.isMinimizable(),
+    // Linux has no native close-button getter; retain its close-request policy.
+    closable: process.platform === 'linux' ? closableState.get(window) ?? true : window.isClosable(),
   }
 }
 
@@ -1148,6 +1295,63 @@ function setWindowPosition(window, params) {
   window.setPosition(x, y)
 }
 
+function restoreFullscreenBounds(window) {
+  const normal = fullscreenBounds.get(window)
+  if (!normal || window.isDestroyed()) return
+  fullscreenBounds.delete(window)
+  window.setBounds(normal.bounds)
+  if (normal.maximized) window.maximize()
+}
+
+function transitionFullscreen(window, fullscreen) {
+  if (process.platform !== 'darwin') {
+    window.setFullScreen(fullscreen)
+    return Promise.resolve()
+  }
+  if (window.isFullScreen() === fullscreen) return Promise.resolve()
+  // AppKit transitions are asynchronous: wait for the real native event, never
+  // replace a failed Space transition with a different fullscreen mode.
+  return new Promise((resolve, reject) => {
+    const event = fullscreen ? 'enter-full-screen' : 'leave-full-screen'
+    const finish = (error) => {
+      clearTimeout(timer)
+      window.removeListener(event, completed)
+      window.removeListener('closed', closed)
+      if (error) reject(error)
+      else resolve()
+    }
+    const completed = () => finish()
+    const closed = () => finish(new Error('window closed during fullscreen transition'))
+    const timer = setTimeout(() => finish(new Error('native fullscreen transition timed out')), 10_000)
+    window.once(event, completed)
+    window.once('closed', closed)
+    try { window.setFullScreen(fullscreen) }
+    catch (error) { finish(error) }
+  })
+}
+
+async function setWindowFullscreen(window, params) {
+  if (typeof params.fullscreen !== 'boolean') throw new Error('invalid fullscreen state')
+  if (params.x !== undefined || params.y !== undefined) {
+    // Tauri passes physical screen coordinates, including on mixed-DPI systems.
+    const display = displayForPoint(params.x, params.y)
+    if (!display) return null
+    const normal = fullscreenBounds.get(window) ?? { bounds: window.getNormalBounds(), maximized: window.isMaximized() }
+    if (window.isFullScreen()) await transitionFullscreen(window, false)
+    fullscreenBounds.set(window, normal)
+    if (window.isMaximized()) window.unmaximize()
+    const { x, y, width, height } = display.bounds
+    window.setBounds({ x, y, width: Math.min(normal.bounds.width, width), height: Math.min(normal.bounds.height, height) })
+  }
+  try { await transitionFullscreen(window, params.fullscreen) }
+  catch (error) {
+    if (!window.isDestroyed() && !window.isFullScreen()) restoreFullscreenBounds(window)
+    throw error
+  }
+  if (!params.fullscreen) restoreFullscreenBounds(window)
+  return null
+}
+
 /** Mirror the host menu; its owner remains authoritative for commands. */
 function setWindowMenu(windowId, menu) {
   const window = findWindow(windowId)
@@ -1190,10 +1394,16 @@ function handle(method, params) {
       if (!window) throw new Error(`unknown window ${params.windowId}`)
       return createChildWebview(window, params)
     }
+    case 'webview.url':
+      return contentsFor(params.webviewId).getURL()
     case 'webview.eval': {
       const contents = contentsFor(params.webviewId)
       // The runtime posts eval without waiting, so a failure is only visible here.
-      return contents.executeJavaScript(params.script, true).catch((error) => {
+      trace('eval.start', contents.id, params.script.slice(0, 180))
+      return contents.executeJavaScript(params.script, true).then((result) => {
+        trace('eval.done', contents.id)
+        return result
+      }).catch((error) => {
         log('eval failed', contents.id, String(error), params.script.slice(0, 200))
         throw error
       })
@@ -1242,7 +1452,7 @@ function handle(method, params) {
     case 'window.closable': {
       const window = findWindow(params.windowId)
       closableState.set(window, params.closable !== false)
-      if (process.platform === 'darwin') window.setClosable(params.closable !== false)
+      if (process.platform !== 'linux') window.setClosable(params.closable !== false)
       return null
     }
     case 'window.maximize':
@@ -1279,19 +1489,8 @@ function handle(method, params) {
         catch (error) { finish(error) }
       })
     }
-    case 'window.fullscreen': {
-      const window = findWindow(params.windowId)
-      window.setFullScreen(params.fullscreen)
-      if (process.platform === 'darwin') {
-        // AppKit can refuse Space switches on CI or desktops without a usable Space.
-        setTimeout(() => {
-          if (window.isDestroyed()) return
-          if (params.fullscreen && !window.isFullScreen() && !window.isSimpleFullScreen()) window.setSimpleFullScreen(true)
-          else if (!params.fullscreen && window.isSimpleFullScreen()) window.setSimpleFullScreen(false)
-        }, 600)
-      }
-      return null
-    }
+    case 'window.fullscreen':
+      return setWindowFullscreen(findWindow(params.windowId), params)
     case 'window.alwaysOnTop':
       findWindow(params.windowId).setAlwaysOnTop(params.alwaysOnTop)
       return null
@@ -1323,6 +1522,9 @@ function handle(method, params) {
       return null
     case 'window.requestAttention':
       findWindow(params.windowId).flashFrame(Boolean(params.flash))
+      return null
+    case 'webview.newWindowResponse':
+      socket.respond(params.id, params.response)
       return null
     case 'webview.navigationResponse': {
       navigationRequests.get(params.id)?.finish(params.allow === true)
@@ -1356,16 +1558,6 @@ function handle(method, params) {
       // Navigation can request a custom protocol from the Rust loop awaiting us.
       contentsFor(params.webviewId).loadURL(params.url).catch((error) => log('navigate failed', params.url, serializeError(error)))
       return null
-    case 'webview.openUrl': {
-      // `NewWindowResponse::Allow`: the engine, not Tauri, owns this window.
-      const popup = new BrowserWindow({
-        width: params.width ?? 800,
-        height: params.height ?? 600,
-        webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false },
-      })
-      popup.loadURL(params.url).catch((error) => log('popup load failed', serializeError(error)))
-      return { windowId: popup.id }
-    }
     case 'webview.reload':
       contentsFor(params.webviewId).reload()
       return null
@@ -1553,13 +1745,43 @@ function handle(method, params) {
     }
     case 'window.currentDisplay':
       return readDisplay(screen.getDisplayMatching(findWindow(params.windowId).getBounds()))
-    case 'window.displayForPoint':
-      return readDisplay(screen.getDisplayNearestPoint({ x: params.x, y: params.y }))
+    case 'window.displayForPoint': {
+      // Tao uses physical points on Windows and logical points on Unix desktops.
+      const display = displayForPoint(params.x, params.y, process.platform === 'win32')
+      return display ? readDisplay(display) : null
+    }
     case 'window.trafficLight': {
       const window = findWindow(params.windowId)
       if (typeof window.setWindowButtonPosition === 'function') {
         window.setWindowButtonPosition({ x: params.x, y: params.y })
       }
+      return null
+    }
+    case 'webview.reparent': {
+      const source = findWebview(params.webviewId)
+      const destination = findWindow(params.windowId)
+      if (source === destination) return null
+      const child = childWebviews.get(params.webviewId)
+      const previous = child.view.getBounds()
+      const ratio = scaleOf(source) / scaleOf(destination)
+      const bounds = Object.fromEntries(Object.entries(previous).map(([key, value]) => [key, Math.round(value * ratio)]))
+      source.contentView.removeChildView(child.view)
+      try {
+        destination.contentView.addChildView(child.view)
+        setChildBounds(destination, child, bounds)
+      } catch (error) {
+        destination.contentView.removeChildView(child.view)
+        source.contentView.addChildView(child.view)
+        setChildBounds(source, child, previous)
+        throw error
+      }
+      if (mainViews.get(source) === child) mainViews.delete(source)
+      child.main = !mainViews.has(destination)
+      if (child.main) mainViews.set(destination, child)
+      webviews.set(params.webviewId, destination)
+      applyWindowCursorCss(destination, child.view.webContents).catch((error) => log('reparent.cursor', serializeError(error)))
+      emulateContentsTheme(child.view.webContents, windowThemeState.get(destination).theme)
+        .catch((error) => log('reparent.theme', serializeError(error)))
       return null
     }
     case 'webview.bounds':
@@ -1604,8 +1826,8 @@ function handle(method, params) {
       return null
     }
     case 'webview.close': {
-      if (childWebviews.has(params.webviewId)) closeChildWebview(params.webviewId)
-      else findWebview(params.webviewId).close()
+      findWebview(params.webviewId)
+      closeChildWebview(params.webviewId)
       return null
     }
     case 'webview.cookies':
@@ -1652,32 +1874,42 @@ function handle(method, params) {
   }
 }
 
-async function onLine(line) {
-  let message
-  try {
-    message = JSON.parse(line)
-  } catch {
-    log('bad line', line)
-    return
+function onRequest(message, synchronous = false) {
+  if (!Number.isSafeInteger(message.id)) return
+  const success = (result) => {
+    if (message.notification !== true) send({ id: message.id, result: result ?? null })
   }
-  if (typeof message.id !== 'number') {
-    log('non-request', line)
-    return
-  }
-
-  try {
-    // Start native lifecycle calls in the scheduled task, not a Promise microtask.
-    // Await only their result.
-    trace('rpc.enter', message.id, message.method)
-    const result = await handle(message.method, message.params ?? {})
-    trace('rpc.return', message.id, message.method)
-    send({ id: message.id, result: result ?? null })
-  } catch (error) {
-    trace('rpc.error', message.id, message.method, serializeError(error))
+  const failure = (error) => {
     log('error', message.method, serializeError(error))
-    send({ id: message.id, error: serializeError(error) })
+    if (message.notification !== true) send({ id: message.id, error: serializeError(error) })
   }
+  try {
+    // Native popup decisions can service nested synchronous Rust RPCs. Never
+    // pretend a renderer/CDP Promise can complete while Chromium is in callback.
+    if (synchronous && !synchronousMethods.has(message.method)) {
+      throw new Error(`${message.method} requires the native policy callback to return first`)
+    }
+    const result = handle(message.method, message.params ?? {})
+    if (result && typeof result.then === 'function') result.then(success, failure)
+    else success(result)
+  } catch (error) { failure(error) }
 }
+
+const synchronousMethods = new Set([
+  'window.create', 'protocol.register', 'protocol.respond', 'webview.url',
+  'webview.newWindowResponse', 'webview.navigationResponse', 'webview.downloadResponse', 'webview.permissionResponse',
+  'window.nativeHandle', 'window.setMenu', 'window.setTitle', 'window.geometry', 'window.icon',
+  'window.size', 'window.position', 'window.minSize', 'window.maxSize', 'window.sizeConstraints',
+  'window.resizable', 'window.maximizable', 'window.minimizable', 'window.closable',
+  'window.maximize', 'window.unmaximize', 'window.minimize', 'window.simpleFullscreen',
+  'window.alwaysOnTop', 'window.setParentWindow', 'window.skipTaskbar', 'window.focusable',
+  'window.contentProtected', 'window.center', 'window.requestAttention',
+  'window.show', 'window.hide', 'window.focus', 'window.close', 'window.destroy',
+  'window.visibleOnAllWorkspaces', 'window.enabled', 'window.enabledQuery',
+  'window.progressBar', 'window.shadow', 'window.decorations', 'window.badgeCount',
+  'window.overlayIcon', 'window.backgroundColor', 'window.backgroundMaterial', 'window.ignoreCursorEvents',
+  'window.displays', 'window.cursorPosition', 'window.currentDisplay', 'window.displayForPoint', 'window.trafficLight',
+])
 
 ipcMain.handle('tauri-ipc-fetch', async (event, data) => {
   const frame = event.senderFrame
@@ -1741,37 +1973,20 @@ app.whenReady().then(async () => {
     installContextMenu(contents)
   })
   installPolicyHandlers()
-  socket = net.connect(port, '127.0.0.1', () => {
-    send({ event: 'ready', params: { electron: process.versions.electron } })
-  })
-
-  let buffer = ''
-  socket.setEncoding('utf8')
-  socket.on('data', (chunk) => {
-    buffer += chunk
-    let index = buffer.indexOf('\n')
-    while (index !== -1) {
-      const line = buffer.slice(0, index)
-      // Drain input before entering native lifecycle code. Unlike a Promise
-      // microtask, Electron's setImmediate also wakes its embedded Node loop.
-      buffer = buffer.slice(index + 1)
-      setImmediate(() => onLine(line))
-      index = buffer.indexOf('\n')
-    }
-  })
-  socket.on('close', () => {
-    send({ event: 'ipc.closed' })
-    app.quit()
-  })
-  socket.on('error', () => {
-    app.quit()
-  })
+  // Rust sends a one-launch credential through the inherited stdin pipe, not
+  // argv/environment/files. No renderer receives this authentication material.
+  const token = fs.readFileSync(0, 'utf8').trim()
+  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('missing Electron IPC credential')
+  socket = connectIpc(port, onRequest,
+    () => send({ event: 'ready', params: { electron: process.versions.electron, token } }),
+    () => app.quit(),
+  )
 })
 
 // Native Quit (including the menu role) asks Rust first, just like close.
 // A disconnected host must still be able to tear Electron down.
 app.on('before-quit', (event) => {
-  if (!socket || socket.destroyed) return
+  if (!socket || socket.closed) return
   event.preventDefault()
   send({ event: 'app.exitRequested', params: {} })
 })

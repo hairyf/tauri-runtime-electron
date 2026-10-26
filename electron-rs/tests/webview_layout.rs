@@ -27,6 +27,48 @@ fn geometry_uses_native_mixed_dpi_screen_coordinates() {
 }
 
 #[test]
+fn display_containment_uses_physical_windows_points_and_logical_unix_points() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["monitors"],
+    ))
+    .unwrap();
+
+    let contained = json!(["primary", "primary", "secondary", "secondary", null, null, null, null]);
+    assert_eq!(observed["physical"], contained);
+    assert_eq!(observed["logical"]["darwin"], contained);
+    assert_eq!(observed["logical"]["linux"], contained);
+    assert_eq!(observed["secondary"]["name"], "secondary");
+    assert_eq!(observed["secondary"]["position"]["x"], 1920);
+    assert_eq!(observed["secondary"]["size"], json!({ "width": 2560, "height": 1440 }));
+    assert_eq!(observed["invalid"], "invalid monitor point");
+}
+
+#[test]
+fn native_button_getters_ignore_request_mirrors_and_each_setter_calls_native_once() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["native-state"],
+    ))
+    .unwrap();
+
+    let disabled = json!({ "maximizable": false, "minimizable": false, "closable": false });
+    assert_eq!(observed["contrary"], disabled);
+    assert_eq!(observed["afterNativeChange"], disabled);
+    let requests = [false, true, false, true];
+    let expected: Vec<_> = requests.iter().map(|value| json!({
+        "maximizable": value, "minimizable": value, "closable": value,
+    })).collect();
+    assert_eq!(observed["states"], json!(expected));
+    let calls: Vec<_> = requests.into_iter().flat_map(|value| [
+        json!({ "method": "setClosable", "value": value }),
+        json!({ "method": "setMaximizable", "value": value }),
+        json!({ "method": "setMinimizable", "value": value }),
+    ]).collect();
+    assert_eq!(observed["calls"], json!(calls));
+}
+
+#[test]
 fn four_native_children_keep_url_ownership_and_resize_without_gaps_or_drift() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
@@ -35,6 +77,8 @@ fn four_native_children_keep_url_ownership_and_resize_without_gaps_or_drift() {
     .unwrap();
 
     assert_eq!(observed["hostUrl"], Value::Null);
+    assert_eq!(observed["hostHasWebContents"], false);
+    assert_eq!(observed["contentsCount"], 4, "BaseWindow must not create an unused renderer");
     let children = observed["children"].as_array().unwrap();
     assert_eq!(children.len(), 4);
     let contents_ids: HashSet<_> = children
@@ -62,7 +106,7 @@ fn four_native_children_keep_url_ownership_and_resize_without_gaps_or_drift() {
             child["preferences"],
             json!({
                 "contextIsolation": true, "sandbox": true, "nodeIntegration": false,
-                "nodeIntegrationInSubFrames": true, "preload": "preload.cjs",
+                "nodeIntegrationInSubFrames": true, "webviewTag": false, "preload": "preload.cjs",
                 "javascript": true, "devTools": true, "backgroundThrottling": true
             })
         );
@@ -251,7 +295,12 @@ fn main_webview_dispatch_survives_failed_child_attach_and_stays_window_local() {
         json!([{ "css": "* { cursor: default !important }", "cssOrigin": "user" }])
     );
     assert_eq!(observed["visible"], false);
-    assert_eq!(observed["closeRequested"], true);
+    assert_eq!(observed["hostVisible"], true, "hiding the main view must not hide its BaseWindow");
+    assert_eq!(observed["closeRequested"], false, "closing a view must not close its host window");
+    assert_eq!(observed["contentsDestroyed"], true);
+    assert_eq!(observed["mainMapped"], false);
+    assert_eq!(observed["hostAlive"], true);
+    assert_eq!(observed["hostHasWebContents"], false);
 }
 
 #[test]
@@ -303,7 +352,7 @@ fn creation_uses_nested_config_and_applies_webview_preferences_before_navigation
     ] {
         assert_eq!(
             observed[target]["preferences"],
-            json!({ "javascript": false, "devTools": false, "backgroundThrottling": false, "userAgent": null }),
+            json!({ "javascript": false, "devTools": false, "backgroundThrottling": false, "userAgent": null, "webviewTag": false }),
             "preferences for {target}"
         );
         assert_eq!(
@@ -317,7 +366,7 @@ fn creation_uses_nested_config_and_applies_webview_preferences_before_navigation
     }
     assert_eq!(
         observed["defaults"],
-        json!({ "javascript": true, "devTools": true, "backgroundThrottling": true, "userAgent": null })
+        json!({ "javascript": true, "devTools": true, "backgroundThrottling": true, "userAgent": null, "webviewTag": false })
     );
     assert_eq!(
         observed["flat"],
@@ -507,7 +556,51 @@ fn per_window_theme_emulates_owned_pages_and_cleans_native_listeners() {
 }
 
 #[test]
-fn linux_window_state_retains_requested_flags_and_vetoes_unclosable_windows() {
+fn native_policy_covers_preferences_popup_cleanup_explicit_close_and_disconnect() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["native-policy"],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        observed["roots"],
+        json!({
+            "mainOptions": false, "mainView": false, "child": false,
+            "popupOptions": false, "popupView": false,
+        })
+    );
+    assert_eq!(
+        observed["nativeDestroy"],
+        json!({
+            "guestDestroyed": true, "viewContentsCleared": true, "shellDestroyed": true,
+            "windowMapped": false, "childMapped": false, "webviewMapped": false, "mainMapped": false,
+            "events": [
+                { "event": "webview.closed", "params": { "webviewId": 30 } },
+                { "event": "window.closed", "params": { "windowId": 3 } },
+            ],
+        })
+    );
+    assert_eq!(
+        observed["explicitClose"],
+        json!({
+            "guestDestroyed": true, "viewContentsCleared": true, "shellDestroyed": false,
+            "windowMapped": true, "childMapped": false, "webviewMapped": false, "mainMapped": false,
+            "events": [{ "event": "webview.closed", "params": { "webviewId": 31 } }],
+        })
+    );
+    assert_eq!(
+        observed["noSocketClose"],
+        json!({ "prevented": false, "destroyed": true, "events": [] })
+    );
+    assert_eq!(
+        observed["closedSocketClose"],
+        json!({ "prevented": false, "destroyed": true, "events": [] })
+    );
+}
+
+#[test]
+fn linux_native_button_state_is_not_a_requested_flag_mirror_and_close_policy_still_vetoes() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
         &["linux-state"],
@@ -522,7 +615,7 @@ fn linux_window_state_retains_requested_flags_and_vetoes_unclosable_windows() {
     );
     assert_eq!(
         observed["enabled"],
-        json!({ "maximizable": true, "minimizable": true, "closable": true })
+        json!({ "maximizable": false, "minimizable": false, "closable": true })
     );
     assert_eq!(
         observed["requested"],
@@ -533,6 +626,7 @@ fn linux_window_state_retains_requested_flags_and_vetoes_unclosable_windows() {
     assert_eq!(observed["disabled"], disabled);
     assert_eq!(observed["vetoedAgain"], observed["vetoed"]);
     assert_eq!(observed["destroyed"], true);
+    assert_eq!(observed["disconnected"], json!({ "prevented": false, "destroyed": true }));
     assert_eq!(
         observed["closedEvents"],
         json!([{ "event": "window.closed", "params": { "windowId": 60 } }])
@@ -540,7 +634,7 @@ fn linux_window_state_retains_requested_flags_and_vetoes_unclosable_windows() {
 }
 
 #[test]
-fn navigation_acknowledges_before_load_and_fixed_children_survive_fullscreen_fallback() {
+fn navigation_acknowledges_before_load_and_native_fullscreen_waits_for_real_events() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
         &["lifecycle"],
@@ -555,19 +649,22 @@ fn navigation_acknowledges_before_load_and_fixed_children_survive_fullscreen_fal
     assert_eq!(
         observed["navigation"],
         json!({ "acknowledged": true, "loaded": false,
-            "url": "tauri://localhost/next", "hostUrl": "" })
+            "url": "tauri://localhost/next", "hostUrl": null })
     );
     assert_eq!(
-        observed["beforeFallback"],
-        json!({ "fullscreen": false, "simpleCalls": [] })
+        observed["beforeEnter"],
+        json!({ "acknowledged": false, "fullscreen": false, "simpleCalls": [] })
     );
+    assert_eq!(observed["beforeLeave"], json!({ "acknowledged": false, "fullscreen": true }));
     assert_eq!(observed["entered"], true);
     assert_eq!(observed["exited"], false);
     assert_eq!(observed["nativeFullscreen"], true);
-    assert_eq!(observed["nativeCalls"], json!([true, false, true, true]));
-    assert_eq!(observed["simpleCalls"], json!([true, false]));
-    assert_eq!(observed["delays"], json!([600, 600, 600, 600]));
-    assert_eq!(observed["closedError"], Value::Null);
+    assert_eq!(observed["nativeCalls"], json!([true, false, true, true, true]));
+    assert_eq!(observed["simpleCalls"], json!([]), "failed native fullscreen must not change fullscreen modes");
+    assert_eq!(observed["timeoutDelay"], 10000);
+    assert_eq!(observed["timeoutError"], "native fullscreen transition timed out");
+    assert_eq!(observed["closedError"], "window closed during fullscreen transition");
+    assert_eq!(observed["transitionListeners"], json!([0, 0]));
     assert_eq!(observed["timers"], 0);
 }
 
