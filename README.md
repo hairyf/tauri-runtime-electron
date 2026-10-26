@@ -101,11 +101,11 @@ Calls use normal Tauri IPC/ACL. Only Acrylic, Mica and Tabbed on Windows 11 22H2
 
 See the [method coverage](docs/coverage.md) for platform details. It describes implementation paths, not verified capabilities.
 
-- Tauri native menus, callbacks, accelerators and popup attachment are unsupported. Cross-process IDs do not provide local WebView2, GTK or AppKit objects: `with_webview` errors without calling the callback; macOS native window handles and WKWebView data-store operations are unavailable.
+- Windows attached Tauri menus are mirrored to Electron; commands and accelerators dispatch through a Rust UI-thread menu owner. Menu changes synchronize during the event pump. Native menu integration on macOS/Linux and popup placement remain unverified. Cross-process IDs do not provide local WebView2, GTK or AppKit objects: `with_webview` errors without calling the callback; macOS native window handles and WKWebView data-store operations are unavailable.
 - A configured `new_window_handler` fails creation; page `window.open` is denied without opening an external browser. Accepted navigation resumes the original request, preserving POST data and redirects. A subframe veto affects only that frame; Chromium may show an error page there.
 - Initialization scripts keep their frame scope; IPC is main-frame-only. `convertFileSrc` still needs `protocol-asset` and an `assetProtocol` scope. Matching resolved `data_directory` paths share a session; incognito webviews have separate in-memory sessions.
 - Downloads stay private until complete and first approved by the host, then publish without overwriting. Publication failures retain the staged file and report its path; denial, timeout and destruction clean it up. Exit vetoes/codes are respected: `run_return` returns the code, while `run` exits the Rust process.
-- macOS transparent/hidden titles and runtime title-bar-style changes are unsupported. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
+- Configured title-bar styles and hidden titles map to Electron window options; runtime title-bar-style changes remain unsupported. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
 
 ## Examples and checks
 

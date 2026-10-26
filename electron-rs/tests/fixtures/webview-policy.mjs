@@ -26,6 +26,7 @@ const nativeFs = {
 const messages = []
 const timers = new Set()
 const contentsById = new Map()
+const lifecycleDestroyedListeners = new Set()
 const ipcListeners = new Map()
 const ipcHandlers = new Map()
 const external = []
@@ -87,12 +88,14 @@ class Contents extends EventEmitter {
     this.stops = 0
     this.destroyed = false
     this.mainFrame = { url: 'https://page.invalid/', origin: 'https://page.invalid' }
+    this.debugger = new EventEmitter()
     contentsById.set(this.id, this)
   }
   isDestroyed() { return this.destroyed }
   stop() { this.stops++ }
   setWindowOpenHandler(callback) { this.openWindow = callback }
-  loadURL(url) { this.loads.push(url); return Promise.resolve() }
+  loadURL(url) { this.url = url; this.loads.push(url); return Promise.resolve() }
+  getURL() { return this.url ?? '' }
   close() { this.destroyed = true; this.emit('destroyed') }
 }
 class Window extends EventEmitter {
@@ -100,11 +103,16 @@ class Window extends EventEmitter {
     super()
     this.options = options
     this.webContents = new Contents()
+    this.bounds = { x: 0, y: 0, width: options.width, height: options.height }
     this.contentView = { addChildView() {}, removeChildView() {} }
   }
   isDestroyed() { return false }
   loadURL(url) { return this.webContents.loadURL(url) }
-  getContentBounds() { return { x: 0, y: 0, width: 800, height: 600 } }
+  getBounds() { return { ...this.bounds } }
+  getContentBounds() { return { ...this.bounds } }
+  setContentSize(width, height) { Object.assign(this.bounds, { width, height }) }
+  setMinimumSize() {}
+  setMaximumSize() {}
 }
 class ChildView {
   constructor(options) { this.options = options; this.webContents = new Contents() }
@@ -115,6 +123,8 @@ const app = new EventEmitter()
 app.whenReady = () => new Promise(() => {})
 const electron = {
   app, session, BrowserWindow: Window, WebContentsView: ChildView,
+  screen: Object.assign(new EventEmitter(), { getDisplayMatching: () => ({ scaleFactor: 1 }) }),
+  nativeTheme: Object.assign(new EventEmitter(), { shouldUseDarkColors: false }),
   protocol: defaultSession.protocol,
   net: { fetch: (request, options) => defaultSession.fetch(request, options) },
   ipcMain: {
@@ -176,7 +186,8 @@ const navigationState = (navigation) => plain({
 const cleanup = () => ({
   pending: runtime.navigationRequests.size,
   timers: timers.size,
-  destroyedListeners: [window.webContents, child.webContents].map((contents) => contents.listenerCount('destroyed')),
+  destroyedListeners: [window.webContents, child.webContents].map((contents) =>
+    contents.listeners('destroyed').filter((listener) => !lifecycleDestroyedListeners.has(listener)).length),
 })
 function navigation() {
   const main = begin(window.webContents)
@@ -422,6 +433,10 @@ try {
   child = runtime.childWebviews.get(20).view
   await runtime.handle('window.create', { windowId: 2, webview: { webviewId: 30, url: 'https://no-handler.invalid/' } })
   noHandler = runtime.windows.get(2)
+  // Policy cleanup counts request listeners separately from theme/ownership lifecycle listeners.
+  for (const contents of [window.webContents, child.webContents]) {
+    for (const listener of contents.listeners('destroyed')) lifecycleDestroyedListeners.add(listener)
+  }
   const scenarios = { navigation, preload, permissions, sessions }
   const scenario = scenarios[process.argv[2]]
   if (typeof scenario !== 'function') throw new Error(`unknown webview scenario: ${process.argv[2]}`)

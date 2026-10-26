@@ -21,15 +21,25 @@ use tauri_utils::TitleBarStyle;
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 
-/// Collects the window a host app asked for.
-///
-/// Every setter writes into a [`WindowConfig`] because that is the only thing
-/// Electron reads when it creates the `BrowserWindow`: a setter that forgets to
-/// store its value is a window that silently comes up wrong, which is exactly
-/// what happened to `.inner_size()` before this was a plain config.
+#[derive(Debug, Clone)]
+pub(crate) struct IconData {
+  pub rgba: Vec<u8>,
+  pub width: u32,
+  pub height: u32,
+}
+
+/// Collects the window config and options that need the live Electron window.
 #[derive(Debug, Clone, Default)]
 pub struct ElectronWindowBuilder {
   pub(crate) config: WindowConfig,
+  pub(crate) size_constraints: Option<WindowSizeConstraints>,
+  pub(crate) icon: Option<IconData>,
+  #[cfg(windows)]
+  pub(crate) owner: Option<isize>,
+  #[cfg(windows)]
+  pub(crate) parent: Option<isize>,
+  #[cfg(target_os = "macos")]
+  pub(crate) macos_parent: Option<isize>,
 }
 
 impl WindowBuilderBase for ElectronWindowBuilder {}
@@ -42,17 +52,21 @@ impl WindowBuilder for ElectronWindowBuilder {
   fn with_config(config: &WindowConfig) -> Self {
     Self {
       config: config.clone(),
+      ..Self::default()
     }
   }
 
   fn center(mut self) -> Self {
     self.config.center = true;
+    self.config.x = None;
+    self.config.y = None;
     self
   }
 
   fn position(mut self, x: f64, y: f64) -> Self {
     self.config.x = Some(x);
     self.config.y = Some(y);
+    self.config.center = false;
     self
   }
 
@@ -65,29 +79,38 @@ impl WindowBuilder for ElectronWindowBuilder {
   fn min_inner_size(mut self, min_width: f64, min_height: f64) -> Self {
     self.config.min_width = Some(min_width);
     self.config.min_height = Some(min_height);
+    if let Some(constraints) = self.size_constraints.as_mut() {
+      constraints.min_width = Some(PixelUnit::Logical(min_width.into()));
+      constraints.min_height = Some(PixelUnit::Logical(min_height.into()));
+    }
     self
   }
 
   fn max_inner_size(mut self, max_width: f64, max_height: f64) -> Self {
     self.config.max_width = Some(max_width);
     self.config.max_height = Some(max_height);
+    if let Some(constraints) = self.size_constraints.as_mut() {
+      constraints.max_width = Some(PixelUnit::Logical(max_width.into()));
+      constraints.max_height = Some(PixelUnit::Logical(max_height.into()));
+    }
     self
   }
 
   fn inner_size_constraints(mut self, constraints: WindowSizeConstraints) -> Self {
-    let WindowSizeConstraints {
-      min_width,
-      min_height,
-      max_width,
-      max_height,
-    } = constraints;
-    // The config stores logical pixels, so a physical constraint is taken at
-    // scale 1: this builder runs before any window (and its scale) exists.
-    let to_logical = |unit: PixelUnit| unit.to_logical::<f64>(1.0).into();
-    self.config.min_width = min_width.map(to_logical).or(self.config.min_width);
-    self.config.min_height = min_height.map(to_logical).or(self.config.min_height);
-    self.config.max_width = max_width.map(to_logical).or(self.config.max_width);
-    self.config.max_height = max_height.map(to_logical).or(self.config.max_height);
+    // Physical units cannot become logical until Electron knows the display.
+    // As with the baseline builder, omitted axes keep earlier builder limits.
+    let previous = self.size_constraints.unwrap_or_else(|| WindowSizeConstraints {
+      min_width: self.config.min_width.map(|value| PixelUnit::Logical(value.into())),
+      min_height: self.config.min_height.map(|value| PixelUnit::Logical(value.into())),
+      max_width: self.config.max_width.map(|value| PixelUnit::Logical(value.into())),
+      max_height: self.config.max_height.map(|value| PixelUnit::Logical(value.into())),
+    });
+    self.size_constraints = Some(WindowSizeConstraints {
+      min_width: constraints.min_width.or(previous.min_width),
+      min_height: constraints.min_height.or(previous.min_height),
+      max_width: constraints.max_width.or(previous.max_width),
+      max_height: constraints.max_height.or(previous.max_height),
+    });
     self
   }
 
@@ -185,13 +208,19 @@ impl WindowBuilder for ElectronWindowBuilder {
     self
   }
 
-  fn icon(self, _icon: Icon<'_>) -> Result<Self> {
-    // Electron reads one window icon from the runtime, which already arrives
-    // through `RuntimeInitArgs`; a per-window icon has nowhere to go.
-    crate::runtime::unsupported(
-      "WindowBuilder::icon",
-      "Electron takes the window icon from the runtime, not from the window",
-    );
+  fn icon(mut self, icon: Icon<'_>) -> Result<Self> {
+    let expected = (icon.width as usize).checked_mul(icon.height as usize)
+      .and_then(|pixels| pixels.checked_mul(4));
+    if icon.width == 0 || icon.height == 0 || expected != Some(icon.rgba.len()) {
+      return Err(tauri_runtime::Error::InvalidIcon(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput, "window icon dimensions do not match its RGBA pixels",
+      ).into()));
+    }
+    self.icon = Some(IconData {
+      rgba: icon.rgba.into_owned(),
+      width: icon.width,
+      height: icon.height,
+    });
     Ok(self)
   }
 
@@ -216,29 +245,20 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   #[cfg(windows)]
-  fn owner(self, _owner: HWND) -> Self {
-    crate::runtime::unsupported(
-      "WindowBuilder::owner",
-      "Electron owns its own window, so it cannot be owned by a native handle",
-    );
+  fn owner(mut self, owner: HWND) -> Self {
+    self.owner = Some(owner.0 as isize);
     self
   }
 
   #[cfg(windows)]
-  fn parent(self, _parent: HWND) -> Self {
-    crate::runtime::unsupported(
-      "WindowBuilder::parent",
-      "Electron parents windows to windows, not to native handles",
-    );
+  fn parent(mut self, parent: HWND) -> Self {
+    self.parent = Some(parent.0 as isize);
     self
   }
 
   #[cfg(target_os = "macos")]
-  fn parent(self, _parent: *mut std::ffi::c_void) -> Self {
-    crate::runtime::unsupported(
-      "WindowBuilder::parent",
-      "Electron parents windows to windows, not to native handles",
-    );
+  fn parent(mut self, parent: *mut std::ffi::c_void) -> Self {
+    self.macos_parent = Some(parent as isize);
     self
   }
 
@@ -297,7 +317,7 @@ impl WindowBuilder for ElectronWindowBuilder {
   }
 
   fn has_icon(&self) -> bool {
-    false
+    self.icon.is_some()
   }
 
   fn get_theme(&self) -> Option<Theme> {
@@ -346,6 +366,36 @@ mod tests {
     assert_eq!(builder.config.title, "hello");
     assert!(!builder.config.resizable);
     assert!(builder.config.always_on_top);
+  }
+
+  #[test]
+  fn icon_rejects_mismatched_dimensions() {
+    let invalid = Icon { rgba: std::borrow::Cow::Borrowed(&[1, 2, 3]), width: 1, height: 1 };
+    assert!(ElectronWindowBuilder::new().icon(invalid).is_err());
+  }
+
+  #[test]
+  fn center_and_position_follow_the_last_setter() {
+    let centered = ElectronWindowBuilder::new().position(40.0, 60.0).center();
+    assert!(centered.config.center);
+    assert_eq!((centered.config.x, centered.config.y), (None, None));
+    let positioned = centered.position(-120.0, 90.0);
+    assert!(!positioned.config.center);
+    assert_eq!((positioned.config.x, positioned.config.y), (Some(-120.0), Some(90.0)));
+  }
+
+  #[test]
+  fn mixed_constraints_keep_units_and_later_size_setters() {
+    let constraints = WindowSizeConstraints {
+      min_width: Some(PixelUnit::Physical(300.into())),
+      max_height: Some(PixelUnit::Logical(600.0.into())),
+      ..Default::default()
+    };
+    let builder = ElectronWindowBuilder::new().inner_size_constraints(constraints)
+      .max_inner_size(900.0, 700.0);
+    let actual = builder.size_constraints.unwrap();
+    assert!(matches!(actual.min_width, Some(PixelUnit::Physical(value)) if value.0 == 300));
+    assert!(matches!(actual.max_height, Some(PixelUnit::Logical(value)) if value.0 == 700.0));
   }
 
   #[test]

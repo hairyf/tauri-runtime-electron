@@ -14,13 +14,15 @@ use windows::{
   },
 };
 
+use crate::Error;
+
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
 const RT_VERSION: u16 = 16;
 const APP_ICON: u16 = 32512;
 const FIRST_ICON_ID: u16 = 4096;
 
-pub(crate) fn apply(binary: &Path, app_name: Option<&str>, icon: Option<&Path>, host: Option<&Path>) -> Result<(), String> {
+pub(crate) fn apply(binary: &Path, app_name: Option<&str>, icon: Option<&Path>, host: Option<&Path>) -> Result<(), Error> {
   let icon = if let Some(path) = icon {
     Some(read_ico(path)?)
   } else if let Some(path) = host {
@@ -38,7 +40,7 @@ pub(crate) fn apply(binary: &Path, app_name: Option<&str>, icon: Option<&Path>, 
       versions.push((id, language, brand_version(&data, name, &filename)?));
     }
     if versions.is_empty() {
-      return Err(format!("Electron executable has no version resource: {}", binary.display()));
+      return Err(format!("Electron executable has no version resource: {}", binary.display()).into());
     }
   }
   drop(module);
@@ -52,8 +54,8 @@ pub(crate) fn apply(binary: &Path, app_name: Option<&str>, icon: Option<&Path>, 
   let wide = wide_path(binary)?;
   // SAFETY: all names and data buffers stay alive for the synchronous Win32 calls.
   let update = unsafe { BeginUpdateResourceW(PCWSTR(wide.as_ptr()), false) }
-    .map_err(|error| format!("begin resource update {}: {error}", binary.display()))?;
-  let result = (|| {
+    .map_err(|error| Error::with_source(format!("begin resource update {}", binary.display()), error))?;
+  let result: Result<(), Error> = (|| {
     if let Some(icon) = &icon {
       // All groups are replaced; use the same image IDs in each group's language.
       let group = rebase_group(&icon.group, FIRST_ICON_ID)?;
@@ -72,17 +74,17 @@ pub(crate) fn apply(binary: &Path, app_name: Option<&str>, icon: Option<&Path>, 
   if let Err(error) = result {
     return match unsafe { EndUpdateResourceW(update, true) } {
       Ok(()) => Err(error),
-      Err(discard) => Err(format!("{error}; discard resource update: {discard}")),
+      Err(discard) => Err(error.context(format!("discard resource update: {discard}"))),
     };
   }
-  unsafe { EndUpdateResourceW(update, false) }.map_err(|error| format!("commit resource update {}: {error}", binary.display()))
+  unsafe { EndUpdateResourceW(update, false) }.map_err(|error| Error::with_source(format!("commit resource update {}", binary.display()), error))
 }
 
-pub(crate) fn validate_icon(path: &Path) -> Result<(), String> {
+pub(crate) fn validate_icon(path: &Path) -> Result<(), Error> {
   read_ico(path).map(|_| ())
 }
 
-pub(crate) fn validate_host_icon(path: &Path) -> Result<(), String> {
+pub(crate) fn validate_host_icon(path: &Path) -> Result<(), Error> {
   read_host_icon(path).map(|_| ())
 }
 
@@ -91,12 +93,12 @@ struct Icon {
   images: Vec<Vec<u8>>,
 }
 
-fn read_ico(path: &Path) -> Result<Icon, String> {
-  let bytes = fs::read(path).map_err(|error| format!("icon {}: {error}", path.display()))?;
-  parse_ico(&bytes).map_err(|error| format!("invalid ICO {}: {error}", path.display()))
+fn read_ico(path: &Path) -> Result<Icon, Error> {
+  let bytes = fs::read(path).map_err(|error| Error::with_source(format!("icon {}", path.display()), error))?;
+  parse_ico(&bytes).map_err(|error| error.context(format!("invalid ICO {}", path.display())))
 }
 
-fn parse_ico(bytes: &[u8]) -> Result<Icon, String> {
+fn parse_ico(bytes: &[u8]) -> Result<Icon, Error> {
   let count = icon_count(bytes)?;
   let directory_end = 6 + count * 16;
   if directory_end > bytes.len() {
@@ -123,7 +125,7 @@ fn parse_ico(bytes: &[u8]) -> Result<Icon, String> {
   Ok(Icon { group, images })
 }
 
-fn rebase_group(group: &[u8], first_id: u16) -> Result<Vec<u8>, String> {
+fn rebase_group(group: &[u8], first_id: u16) -> Result<Vec<u8>, Error> {
   let count = icon_count(group)?;
   if group.len() != 6 + count * 14 || u32::from(first_id) + count as u32 > u16::MAX as u32 {
     return Err("icon group has an invalid size or too many images".into());
@@ -136,7 +138,7 @@ fn rebase_group(group: &[u8], first_id: u16) -> Result<Vec<u8>, String> {
   Ok(group)
 }
 
-fn icon_count(bytes: &[u8]) -> Result<usize, String> {
+fn icon_count(bytes: &[u8]) -> Result<usize, Error> {
   if le16(bytes, 0)? != 0 || le16(bytes, 2)? != 1 {
     return Err("expected an icon directory (not a cursor)".into());
   }
@@ -147,7 +149,7 @@ fn icon_count(bytes: &[u8]) -> Result<usize, String> {
   Ok(count)
 }
 
-fn validate_image(bytes: &[u8], width: u8, height: u8) -> Result<(), String> {
+fn validate_image(bytes: &[u8], width: u8, height: u8) -> Result<(), Error> {
   let width = if width == 0 { 256 } else { u32::from(width) };
   let height = if height == 0 { 256 } else { u32::from(height) };
   if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -193,7 +195,7 @@ fn validate_image(bytes: &[u8], width: u8, height: u8) -> Result<(), String> {
   Ok(())
 }
 
-fn read_host_icon(path: &Path) -> Result<Icon, String> {
+fn read_host_icon(path: &Path) -> Result<Icon, Error> {
   let module = Module::open(path)?;
   let mut groups = entries(module.0, RT_GROUP_ICON)?;
   groups.sort_by_key(|(id, _)| !matches!(id, ResourceName::Id(APP_ICON)));
@@ -201,7 +203,7 @@ fn read_host_icon(path: &Path) -> Result<Icon, String> {
   let mut group = resource(module.0, RT_GROUP_ICON, id, Some(*language))?;
   let count = icon_count(&group)?;
   if group.len() != 6 + count * 14 {
-    return Err(format!("invalid host icon group: {}", path.display()));
+    return Err(format!("invalid host icon group: {}", path.display()).into());
   }
   let mut images = Vec::with_capacity(count);
   for index in 0..count {
@@ -237,12 +239,12 @@ impl ResourceName {
 struct Module(HMODULE);
 
 impl Module {
-  fn open(path: &Path) -> Result<Self, String> {
-    let absolute = fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+  fn open(path: &Path) -> Result<Self, Error> {
+    let absolute = fs::canonicalize(path).map_err(|error| Error::with_source(path.display().to_string(), error))?;
     let wide = wide_path(&absolute)?;
     // LOAD_LIBRARY_AS_DATAFILE never executes the host's code.
     unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_AS_DATAFILE) }
-      .map(Self).map_err(|error| format!("load PE resources {}: {error}", path.display()))
+      .map(Self).map_err(|error| Error::with_source(format!("load PE resources {}", path.display()), error))
   }
 }
 
@@ -252,7 +254,7 @@ impl Drop for Module {
   }
 }
 
-fn resource(module: HMODULE, kind: u16, name: &ResourceName, language: Option<u16>) -> Result<Vec<u8>, String> {
+fn resource(module: HMODULE, kind: u16, name: &ResourceName, language: Option<u16>) -> Result<Vec<u8>, Error> {
   let handle = unsafe {
     match language {
       Some(language) => FindResourceExW(Some(module), ordinal(kind), name.pointer(), language),
@@ -260,22 +262,24 @@ fn resource(module: HMODULE, kind: u16, name: &ResourceName, language: Option<u1
     }
   };
   if handle.is_invalid() {
-    return Err(format!("find resource type {kind}: {}", windows::core::Error::from_thread()));
+    let error = windows::core::Error::from_thread();
+    return Err(Error::with_source(format!("find resource type {kind}"), error));
   }
   let size = unsafe { SizeofResource(Some(module), handle) };
   if size == 0 {
-    return Err(format!("empty resource type {kind}"));
+    return Err(format!("empty resource type {kind}").into());
   }
-  let loaded = unsafe { LoadResource(Some(module), handle) }.map_err(|error| format!("load resource type {kind}: {error}"))?;
+  let loaded = unsafe { LoadResource(Some(module), handle) }.map_err(|error| Error::with_source(format!("load resource type {kind}"), error))?;
   let pointer = unsafe { LockResource(loaded) };
   if pointer.is_null() {
-    return Err(format!("lock resource type {kind}: {}", windows::core::Error::from_thread()));
+    let error = windows::core::Error::from_thread();
+    return Err(Error::with_source(format!("lock resource type {kind}"), error));
   }
   // SAFETY: this module remains loaded, and SizeofResource bounds the returned buffer.
   Ok(unsafe { std::slice::from_raw_parts(pointer as *const u8, size as usize) }.to_vec())
 }
 
-fn entries(module: HMODULE, kind: u16) -> Result<Vec<(ResourceName, u16)>, String> {
+fn entries(module: HMODULE, kind: u16) -> Result<Vec<(ResourceName, u16)>, Error> {
   let mut names: Vec<ResourceName> = Vec::new();
   let found = unsafe { EnumResourceNamesW(Some(module), ordinal(kind), Some(collect_name), &mut names as *mut _ as isize) };
   if !found.as_bool() {
@@ -283,13 +287,14 @@ fn entries(module: HMODULE, kind: u16) -> Result<Vec<(ResourceName, u16)>, Strin
     if error == ERROR_RESOURCE_TYPE_NOT_FOUND || error == ERROR_RESOURCE_DATA_NOT_FOUND {
       return Ok(Vec::new());
     }
-    return Err(format!("enumerate resource type {kind}: {}", windows::core::Error::from_thread()));
+    let error = windows::core::Error::from_thread();
+    return Err(Error::with_source(format!("enumerate resource type {kind}"), error));
   }
   let mut pairs = Vec::new();
   for name in names {
     let mut languages: Vec<u16> = Vec::new();
     unsafe { EnumResourceLanguagesW(Some(module), ordinal(kind), name.pointer(), Some(collect_language), &mut languages as *mut _ as isize) }
-      .map_err(|error| format!("enumerate resource languages for type {kind}: {error}"))?;
+      .map_err(|error| Error::with_source(format!("enumerate resource languages for type {kind}"), error))?;
     pairs.extend(languages.into_iter().map(|language| (name.clone(), language)));
   }
   Ok(pairs)
@@ -312,17 +317,17 @@ unsafe extern "system" fn collect_language(_module: HMODULE, _kind: PCWSTR, _nam
   true.into()
 }
 
-fn update_resource(update: HANDLE, kind: u16, name: &ResourceName, language: u16, bytes: &[u8]) -> Result<(), String> {
+fn update_resource(update: HANDLE, kind: u16, name: &ResourceName, language: u16, bytes: &[u8]) -> Result<(), Error> {
   let size = u32::try_from(bytes.len()).map_err(|_| "resource is larger than 4 GiB")?;
   unsafe { UpdateResourceW(update, ordinal(kind), name.pointer(), language, Some(bytes.as_ptr().cast()), size) }
-    .map_err(|error| format!("update resource type {kind}, language {language}: {error}"))
+    .map_err(|error| Error::with_source(format!("update resource type {kind}, language {language}"), error))
 }
 
 fn ordinal(id: u16) -> PCWSTR {
   PCWSTR(id as usize as *const u16)
 }
 
-fn wide_path(path: &Path) -> Result<Vec<u16>, String> {
+fn wide_path(path: &Path) -> Result<Vec<u16>, Error> {
   use std::os::windows::ffi::OsStrExt;
   let mut wide: Vec<_> = path.as_os_str().encode_wide().collect();
   if wide.contains(&0) {
@@ -332,12 +337,12 @@ fn wide_path(path: &Path) -> Result<Vec<u16>, String> {
   Ok(wide)
 }
 
-fn le16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+fn le16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
   let data = bytes.get(offset..offset + 2).ok_or("truncated resource WORD")?;
   Ok(u16::from_le_bytes([data[0], data[1]]))
 }
 
-fn le32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+fn le32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
   let data = bytes.get(offset..offset + 4).ok_or("truncated resource DWORD")?;
   Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
 }
@@ -350,7 +355,7 @@ struct VersionNode {
 }
 
 impl VersionNode {
-  fn parse(bytes: &[u8], depth: usize) -> Result<Self, String> {
+  fn parse(bytes: &[u8], depth: usize) -> Result<Self, Error> {
     if depth > 8 {
       return Err("version resource nesting exceeds the Windows version schema".into());
     }
@@ -369,7 +374,7 @@ impl VersionNode {
       if ch == 0 { break; }
       key.push(ch);
     }
-    let key = String::from_utf16(&key).map_err(|error| format!("invalid version key UTF-16: {error}"))?;
+    let key = String::from_utf16(&key).map_err(|error| Error::with_source("invalid version key UTF-16", error))?;
     let start = (offset + 3) & !3;
     let value_bytes = value_length.checked_mul(if kind == 1 { 2 } else { 1 }).ok_or("version value length overflows")?;
     let end = start.checked_add(value_bytes).ok_or("version value range overflows")?;
@@ -389,7 +394,7 @@ impl VersionNode {
     Ok(Self { key, kind, value, children })
   }
 
-  fn encode(&self) -> Result<Vec<u8>, String> {
+  fn encode(&self) -> Result<Vec<u8>, Error> {
     let value_length = if self.kind == 1 { self.value.len() / 2 } else { self.value.len() };
     let value_length = u16::try_from(value_length).map_err(|_| "version value is too large")?;
     let mut bytes = vec![0, 0];
@@ -418,7 +423,7 @@ impl VersionNode {
   }
 }
 
-fn brand_version(bytes: &[u8], name: &str, filename: &str) -> Result<Vec<u8>, String> {
+fn brand_version(bytes: &[u8], name: &str, filename: &str) -> Result<Vec<u8>, Error> {
   let mut root = VersionNode::parse(bytes, 0)?;
   if root.key != "VS_VERSION_INFO" || root.value.len() < 52 || le32(&root.value, 0)? != 0xFEEF04BD {
     return Err("invalid VS_VERSION_INFO fixed data".into());
@@ -437,6 +442,14 @@ fn brand_version(bytes: &[u8], name: &str, filename: &str) -> Result<Vec<u8>, St
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn io_and_utf16_errors_retain_their_sources() {
+    let error = validate_icon(Path::new("")).unwrap_err();
+    assert!(std::error::Error::source(&error).unwrap().is::<std::io::Error>());
+    let error = VersionNode::parse(&[12, 0, 0, 0, 0, 0, 0, 0xd8, 0, 0, 0, 0], 0).err().unwrap();
+    assert!(std::error::Error::source(&error).unwrap().is::<std::string::FromUtf16Error>());
+  }
 
   #[test]
   fn version_rebuild_preserves_fixed_data_and_aligned_utf16_fields() {

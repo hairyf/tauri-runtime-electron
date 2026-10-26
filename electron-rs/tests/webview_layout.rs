@@ -62,7 +62,8 @@ fn four_native_children_keep_url_ownership_and_resize_without_gaps_or_drift() {
             child["preferences"],
             json!({
                 "contextIsolation": true, "sandbox": true, "nodeIntegration": false,
-                "nodeIntegrationInSubFrames": true, "preload": "preload.cjs"
+                "nodeIntegrationInSubFrames": true, "preload": "preload.cjs",
+                "javascript": true, "devTools": true, "backgroundThrottling": true
             })
         );
     }
@@ -140,13 +141,11 @@ fn child_dispatch_and_close_never_target_the_unloaded_host() {
     let cursors = observed["cursors"].as_array().unwrap();
     assert_eq!(cursors.len(), 3);
     for (observation, cursor) in cursors.iter().zip(["pointer", "none", "default"]) {
-        assert_eq!(observation["host"], Value::Null);
+        assert_eq!(observation["host"], json!([]));
         assert_eq!(
             observation["children"],
             json!(vec![
-                format!(
-                    "document.documentElement.style.cursor = {cursor:?}"
-                );
+                json!([{ "css": format!("* {{ cursor: {cursor} !important }}"), "cssOrigin": "user" }]);
                 4
             ])
         );
@@ -242,13 +241,14 @@ fn main_webview_dispatch_survives_failed_child_attach_and_stays_window_local() {
     assert_eq!(observed["url"], "tauri://localhost/main");
     assert_eq!(observed["evalResult"], observed["contentsId"]);
     assert!(observed["contentsId"].as_u64().is_some());
+    assert_eq!(observed["script"], "main-script");
     assert_eq!(
-        observed["script"],
-        "document.documentElement.style.cursor = \"crosshair\""
+        observed["cursor"],
+        json!([{ "css": "* { cursor: crosshair !important }", "cssOrigin": "user" }])
     );
     assert_eq!(
-        observed["unrelatedScript"],
-        "document.documentElement.style.cursor = \"default\""
+        observed["unrelatedCursor"],
+        json!([{ "css": "* { cursor: default !important }", "cssOrigin": "user" }])
     );
     assert_eq!(observed["visible"], false);
     assert_eq!(observed["closeRequested"], true);
@@ -278,6 +278,283 @@ fn clearing_background_effects_restores_transparency_and_updated_color() {
         observed["unsupported"],
         "Electron background materials require Windows 11 22H2 or later"
     );
+}
+
+#[test]
+fn creation_uses_nested_config_and_applies_webview_preferences_before_navigation() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["configuration"],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        observed["nested"],
+        json!({
+            "title": "Nested window", "width": 640, "height": 480,
+            "useContentSize": true, "acceptFirstMouse": true,
+            "backgroundColor": "rgba(10, 20, 30, 0.502)", "titleBarStyle": "hiddenInset"
+        })
+    );
+    for (target, agent, url) in [
+        ("main", "main-agent", "tauri://localhost/main"),
+        ("child", "child-agent", "tauri://localhost/child"),
+        ("fallback", "fallback-agent", "tauri://localhost/fallback"),
+    ] {
+        assert_eq!(
+            observed[target]["preferences"],
+            json!({ "javascript": false, "devTools": false, "backgroundThrottling": false, "userAgent": null }),
+            "preferences for {target}"
+        );
+        assert_eq!(
+            observed[target]["calls"],
+            json!([
+                { "method": "setUserAgent", "value": agent },
+                { "method": "loadURL", "value": url }
+            ]),
+            "user agent must be set before the first load for {target}"
+        );
+    }
+    assert_eq!(
+        observed["defaults"],
+        json!({ "javascript": true, "devTools": true, "backgroundThrottling": true, "userAgent": null })
+    );
+    assert_eq!(
+        observed["flat"],
+        json!({ "title": "Flat window", "width": 360, "height": 240,
+            "acceptFirstMouse": true, "backgroundColor": "#123456", "titleBarStyle": "hidden" })
+    );
+    assert_eq!(
+        observed["titleStyles"],
+        json!(["hidden", "hidden", "default"])
+    );
+}
+
+#[test]
+fn content_constraints_keep_each_axis_and_reapply_frame_and_physical_units() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["constraints"],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        observed["creation"],
+        json!({ "min": [240, 180], "max": [1000, 800] })
+    );
+    assert_eq!(
+        observed["framed"],
+        json!({ "min": [256, 218], "max": [1016, 838] })
+    );
+    assert_eq!(observed["clamped"], json!([240, 800]));
+    assert_eq!(
+        observed["heightOnlyMin"],
+        json!({ "min": [0, 338], "max": [1016, 838] })
+    );
+    assert_eq!(
+        observed["heightOnlyMax"],
+        json!({ "min": [0, 338], "max": [0, 488] })
+    );
+    let framed = json!({ "min": [316, 238], "max": [516, 438] });
+    assert_eq!(observed["atomic"], framed);
+    assert_eq!(observed["physicalClamped"], json!([500, 200]));
+    assert_eq!(
+        observed["menu"],
+        json!({ "min": [316, 258], "max": [516, 458] })
+    );
+    assert_eq!(observed["menuRemoved"], framed);
+    assert_eq!(
+        observed["undecorated"],
+        json!({ "min": [300, 200], "max": [500, 400] })
+    );
+    assert_eq!(observed["decorated"], framed);
+    assert_eq!(
+        observed["dpi"],
+        json!({ "min": [312, 350], "max": [812, 670] })
+    );
+    assert_eq!(observed["cleared"], json!({ "min": [0, 0], "max": [0, 0] }));
+    assert_eq!(
+        observed["restoredHeightOnly"],
+        json!({ "min": [0, 150], "max": [0, 330] })
+    );
+    assert_eq!(observed["legacyCleared"], observed["cleared"]);
+}
+
+#[test]
+fn cursor_visibility_preserves_the_icon_across_navigation_and_new_children() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["cursors"],
+    ))
+    .unwrap();
+
+    let crosshair = json!([{ "css": "* { cursor: crosshair !important }", "cssOrigin": "user" }]);
+    let hidden = json!([{ "css": "* { cursor: none !important }", "cssOrigin": "user" }]);
+    let pointer = json!([{ "css": "* { cursor: pointer !important }", "cssOrigin": "user" }]);
+    let wait = json!([{ "css": "* { cursor: wait !important }", "cssOrigin": "user" }]);
+    assert_eq!(observed["chosen"], json!(vec![crosshair; 4]));
+    assert_eq!(observed["hidden"], json!(vec![&hidden; 4]));
+    assert_eq!(observed["chosenWhileHidden"], observed["hidden"]);
+    assert_eq!(observed["inheritedHidden"], hidden);
+    assert_eq!(observed["visible"], json!(vec![&pointer; 5]));
+    assert_eq!(observed["restored"], pointer);
+    assert_eq!(observed["inheritedVisible"], pointer);
+    assert_eq!(observed["legacy"], json!(vec![wait; 6]));
+    assert_eq!(observed["host"], json!([]));
+    assert_eq!(observed["other"], json!([]));
+    assert!(observed["removed"].as_u64().unwrap() >= 3);
+}
+
+#[test]
+fn parent_and_recursive_menu_dispatch_validate_ownership_and_ignore_closed_windows() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["parent-menu"],
+    ))
+    .unwrap();
+
+    assert_eq!(observed["attached"], true);
+    assert_eq!(observed["detached"], true);
+    assert_eq!(observed["unknown"], "unknown window 999");
+    assert!(observed["self"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
+    assert_eq!(observed["parentCalls"], json!(["Parent", null]));
+    let file = &observed["template"][0];
+    assert_eq!(file["label"], "File");
+    assert_eq!(file["enabled"], true);
+    assert_eq!(
+        file["submenu"][0],
+        json!({ "label": "Open", "enabled": true, "accelerator": "CmdOrCtrl+O" })
+    );
+    let tools = &file["submenu"][1];
+    assert_eq!(tools["label"], "Tools");
+    assert_eq!(tools["enabled"], false);
+    assert_eq!(
+        tools["submenu"][0],
+        json!({ "label": "Pinned", "enabled": true, "type": "checkbox", "checked": true })
+    );
+    assert_eq!(tools["submenu"][1], json!({ "type": "separator" }));
+    assert_eq!(tools["submenu"][2]["label"], "Disabled");
+    assert_eq!(tools["submenu"][2]["enabled"], false);
+    assert_eq!(
+        observed["clicks"],
+        json!([
+            { "event": "menu.command", "params": { "windowId": 51, "commandId": 71 } },
+            { "event": "menu.command", "params": { "windowId": 51, "commandId": 72 } }
+        ])
+    );
+    assert_eq!(
+        observed["visibility"],
+        json!({ "autoHide": false, "visible": true })
+    );
+    assert_eq!(observed["cleared"], true);
+    assert_eq!(observed["afterClose"], json!([]));
+}
+
+#[test]
+fn per_window_theme_emulates_owned_pages_and_cleans_native_listeners() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["themes"],
+    ))
+    .unwrap();
+
+    let dark = json!({ "method": "Emulation.setEmulatedMedia",
+        "params": { "features": [{ "name": "prefers-color-scheme", "value": "dark" }] } });
+    let light = json!({ "method": "Emulation.setEmulatedMedia",
+        "params": { "features": [{ "name": "prefers-color-scheme", "value": "light" }] } });
+    assert_eq!(observed["dark"], json!({ "theme": "dark" }));
+    assert_eq!(observed["light"], json!({ "theme": "light" }));
+    assert_eq!(observed["children"], json!(vec![&dark; 4]));
+    assert_eq!(observed["mainCommand"], light);
+    assert_eq!(observed["pageQuery"], json!({ "theme": "dark" }));
+    assert!(observed["pageQueries"].as_u64().unwrap() > 0);
+    assert_eq!(observed["inherited"], dark);
+    assert_eq!(observed["inheritedDark"], "dark");
+    assert_eq!(
+        observed["cleared"],
+        json!(vec![
+            json!({ "command": { "method": "Emulation.setEmulatedMedia",
+            "params": { "features": [] } }, "attached": false });
+            5
+        ])
+    );
+    assert!(observed["invalid"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
+    assert_eq!(observed["system"], json!({ "theme": "dark" }));
+    assert_eq!(observed["stillLight"], json!({ "theme": "light" }));
+    assert_eq!(observed["nativeSource"], "system");
+    assert_eq!(observed["beforeListeners"], 2);
+    assert_eq!(observed["afterFirstClose"], 1);
+    assert_eq!(observed["afterClose"], 0);
+    assert_eq!(observed["afterCloseEvents"], json!([]));
+}
+
+#[test]
+fn linux_window_state_retains_requested_flags_and_vetoes_unclosable_windows() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["linux-state"],
+    ))
+    .unwrap();
+
+    let disabled = json!({ "maximizable": false, "minimizable": false, "closable": false });
+    assert_eq!(observed["initial"], disabled);
+    assert_eq!(
+        observed["vetoed"],
+        json!({ "prevented": true, "events": [] })
+    );
+    assert_eq!(
+        observed["enabled"],
+        json!({ "maximizable": true, "minimizable": true, "closable": true })
+    );
+    assert_eq!(
+        observed["requested"],
+        json!({ "prevented": true, "events": [
+            { "event": "window.closeRequested", "params": { "windowId": 60 } }
+        ] })
+    );
+    assert_eq!(observed["disabled"], disabled);
+    assert_eq!(observed["vetoedAgain"], observed["vetoed"]);
+    assert_eq!(observed["destroyed"], true);
+    assert_eq!(
+        observed["closedEvents"],
+        json!([{ "event": "window.closed", "params": { "windowId": 60 } }])
+    );
+}
+
+#[test]
+fn navigation_acknowledges_before_load_and_fixed_children_survive_fullscreen_fallback() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["lifecycle"],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        observed["initialBounds"],
+        json!({ "x": 0, "y": 0, "width": 800, "height": 600 })
+    );
+    assert_eq!(observed["resizedBounds"], observed["initialBounds"]);
+    assert_eq!(
+        observed["navigation"],
+        json!({ "acknowledged": true, "loaded": false,
+            "url": "tauri://localhost/next", "hostUrl": "" })
+    );
+    assert_eq!(
+        observed["beforeFallback"],
+        json!({ "fullscreen": false, "simpleCalls": [] })
+    );
+    assert_eq!(observed["entered"], true);
+    assert_eq!(observed["exited"], false);
+    assert_eq!(observed["nativeFullscreen"], true);
+    assert_eq!(observed["nativeCalls"], json!([true, false, true, true]));
+    assert_eq!(observed["simpleCalls"], json!([true, false]));
+    assert_eq!(observed["delays"], json!([600, 600, 600, 600]));
+    assert_eq!(observed["closedError"], Value::Null);
+    assert_eq!(observed["timers"], 0);
 }
 
 #[test]

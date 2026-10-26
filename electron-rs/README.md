@@ -22,48 +22,60 @@ electron-rs = { git = "https://github.com/hairyf/tauri-runtime-electron", branch
 Pin a Git revision or tag for release builds. In your application's build script:
 
 ```rust
-use electron_rs::{ElectronBuilder, Metadata, DEFAULT_VERSION};
+use electron_rs::{ElectronBuilder, Error, Metadata, DEFAULT_VERSION};
 
-fn main() -> Result<(), String> {
-    let builder = ElectronBuilder::new(DEFAULT_VERSION)
+fn main() -> Result<(), Error> {
+    let prepared = ElectronBuilder::new(DEFAULT_VERSION)
         .metadata(Metadata {
             app_name: Some("My App".into()),
             ..Default::default()
-        });
-    builder.build()?;
-    let binary = builder.binary()?;
-    println!("cargo:rustc-env=APP_ELECTRON_BINARY={}", binary.display());
+        })
+        .build()?;
+    if let Some(warning) = &prepared.cleanup_warning {
+        println!("cargo:warning={warning}");
+    }
+    println!("cargo:rustc-env=APP_ELECTRON_BINARY={}", prepared.binary.display());
     Ok(())
 }
 ```
 
-`DEFAULT_VERSION` is currently `45.0.0`. The output is `target/electron/<platform>-<arch>` (or beneath `CARGO_TARGET_DIR`), with **no version directory**. Bundle the entire distribution, including libraries, resources, metadata and scripts. The absolute `APP_ELECTRON_BINARY` path above is for local development; resolve packaged resources on the destination machine.
+`DEFAULT_VERSION` is currently `45.0.0`. `build()` returns `Result<PreparedDistribution, Error>`. Its fields are `directory: PathBuf` and `binary: PathBuf`, both absolute, and `cleanup_warning: Option<Error>`. Reuse those paths for that build invocation. Bundle the entire `prepared.directory`, including libraries, resources, metadata and scripts. The absolute `APP_ELECTRON_BINARY` path above is for local development; resolve packaged resources on the destination machine.
 
 Launch from the prepared runtime directory or executable:
 
 ```rust
-use std::{path::Path, time::Duration};
+use std::{error::Error, path::Path, thread, time::Duration};
 use electron_rs::{find_binary, Electron};
 use serde_json::json;
 
-fn connect(runtime: &Path) -> Result<(), String> {
+fn connect(runtime: &Path) -> Result<(), Box<dyn Error>> {
     let binary = find_binary(runtime)?;
     let electron = Electron::new(&binary, 0)?;
-    let _events = electron.events()?;
-    electron.on(|event| eprintln!("{event}"));
+    let events = electron.events()?;
+    thread::spawn(move || {
+        for event in events {
+            eprintln!("{event}");
+        }
+    });
     electron.call("app.theme", json!({ "theme": "system" }), Duration::from_secs(5))?;
     let output = electron.node(&["-p", "process.versions.node"])?;
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    if output.status.success() {
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        eprintln!("Node exited {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+    }
     electron.shutdown();
     Ok(())
 }
 ```
 
-`find_binary` accepts an executable, a distribution directory or a resource root containing `<platform>-<arch>`. It also resolves renamed executables from staged metadata. Launching needs the prepared scripts; **it never downloads, extracts, brands or repairs files**. The crate owns [main.cjs](assets/main.cjs) and [preload.cjs](assets/preload.cjs); consumers supply neither assets nor a `main_script` argument.
+`find_binary` accepts an executable, a distribution directory or a resource root containing `<platform>-<arch>`. It resolves renamed executables from staged metadata and checks executable headers for the target OS and CPU architecture. Launching needs the prepared scripts; **it never downloads, extracts, brands or repairs files**. The crate owns [main.cjs](assets/main.cjs) and [preload.cjs](assets/preload.cjs); consumers supply neither assets nor a `main_script` argument.
 
 ## Build options
 
-Call `build()` in a build script; `binary()` and `directory()` only resolve the prepared output. `ElectronBuilder::node(args)` runs that binary in Node mode without starting the RPC bridge.
+Call `build()` in a build script. It resolves the output once, prepares any changes privately, and returns the published paths. Both `binary()` and `directory()` return `Result<PathBuf, Error>` and resolve using the current environment without changing files. Prefer the returned `PreparedDistribution` when reusing the result of a particular build.
+
+The default layout is `<target-root>/electron/<platform>-<arch>`, with **no version directory**. The target root comes from the consuming build script's `OUT_DIR`, then `CARGO_TARGET_DIR`, then offline `cargo metadata` for the enclosing project, including its workspace and configured target directory. Outside a Cargo project it falls back to `cwd/target`. An invalid Cargo context returns an error. `output(path)` replaces the full default path; a relative path resolves against the current directory.
 
 | Builder method | Purpose |
 | --- | --- |
@@ -73,7 +85,11 @@ Call `build()` in a build script; `binary()` and `directory()` only resolve the 
 | `output(path)` | Replace the entire default output path; no platform/version suffix is added. |
 | `metadata(value)` | Apply optional app identity to the staged copy. |
 
-The builder reuses a matching output, source path, local `node_modules/electron/dist` or cached release before downloading from official Electron releases. Downloads require `curl`, a SHA-256 tool and a ZIP extractor. Branding applies to a private copy; changed metadata is reapplied from a clean source. Use separate outputs for concurrent builds.
+The builder reuses a matching output, source path, local `node_modules/electron/dist` or cached release before downloading from official Electron releases. Every candidate, including the existing output and cache, needs executable headers matching the target OS/architecture and consistent evidence for the requested Electron version. At least one of `version` or `.electron-rs-version` must match; missing evidence, unreadable files or conflicting version files prevent reuse. Downloads require `curl`, a SHA-256 tool and a ZIP extractor, and the extracted distribution receives the same compatibility checks.
+
+Branding changes and repairs to missing or stale scripts use a full private staging copy. Preparation errors leave the previous output intact. Publication moves the previous output to a backup and renames the stage into place; if publication fails, it attempts to restore the backup. A failed restore returns an error naming the backup and output state. Once publication succeeds, failure to remove the backup still returns `Ok(PreparedDistribution)` with `cleanup_warning` identifying the leftover backup. Changed metadata is reapplied from a clean source. Use separate outputs for concurrent builds.
+
+New branding metadata uses the v2 marker, adding `arch` and `electronVersion` to the platform and branding identity. Runtime discovery continues to read v1 markers after checking the executable's OS/architecture; legacy metadata does not qualify as matching v2 branding for build reuse.
 
 `Metadata` has optional `app_name`, `identifier`, `icon` and `host_executable` fields:
 
@@ -87,11 +103,14 @@ Branding changes existing signatures. Apply release signing and macOS notarizati
 
 `Electron::new(binary, 0)` selects a free loopback IPC port and returns `Arc<Electron>`. `with_args(binary, port, &args, timeout)` adds `Vec<String>` switches and a positive startup deadline covering connection and handshake; `new` uses 15 seconds. `version` contains the Electron handshake version.
 
-- `events()` takes the initial receiver **once**, including notifications buffered since launch.
-- `on(handler)` invokes a `Send + 'static` callback on a dedicated thread for **future** events. `subscribe()` returns a separate receiver for future events.
+- `events()` takes the initial receiver **once**, including notifications buffered since launch. Its queue holds at most 1,024 events, even before the receiver is taken. Drain it or explicitly drop the receiver; a new event arriving while the initial queue is full shuts down Electron and disconnects IPC.
+- `on(handler)` invokes a `Send + 'static` callback on a dedicated thread for **future** events. `subscribe()` returns a separate receiver for future events. Each has a 1,024-event queue. Overflow closes only that subscription and writes a diagnostic to stderr; other subscriptions and RPC continue. Buffered events drain before the receiver reports disconnection or the callback is dropped. Event delivery never waits for a slow receiver or callback on the RPC reader.
 - `call(method, params, timeout)` sends synchronous RPC with a response timeout. Supported methods and notification payloads live in the bundled [RPC handler](assets/main.cjs#L856).
-- `node(args)` starts a separate `ELECTRON_RUN_AS_NODE` process and returns its output.
-- `shutdown()` closes IPC/subscriptions, wakes pending calls and terminates/reaps Electron. Dropping the final `Arc` also shuts it down; disconnection emits `ipc.closed`.
+- `shutdown()` closes IPC/subscriptions, wakes pending calls and terminates/reaps Electron. Dropping the final `Arc` also shuts it down. `ipc.closed` is a best-effort final event; it cannot be queued into a full buffer, so consumers must handle channel disconnection. New subscriptions after disconnect are already closed.
+
+Both `ElectronBuilder::node(args)` and `Electron::node(args)` start a separate `ELECTRON_RUN_AS_NODE` process without starting an RPC bridge and return `std::io::Result<std::process::Output>`. A nonzero exit is `Ok(Output)`: inspect `status`, `stdout` and `stderr`. Errors report binary resolution, process creation or output collection failures. Both methods use the same launcher and set `CREATE_NO_WINDOW` on Windows.
+
+Preparation, discovery and RPC return the concrete `electron_rs::Error`, which implements `Display` and `std::error::Error`. Its display text includes context and the cause; `source()` retains the underlying error, including I/O, JSON, UTF-16 and Windows errors where applicable. Validation messages can be represented directly. Use `Error` for operations returning crate errors or `Box<dyn std::error::Error>` when combining crate and I/O errors, as in the examples.
 
 The bundled bridge uses sandboxed, isolated renderers and main-frame IPC. Standalone callers own host policy decisions; Tauri CSP/ACL are provided by the Tauri adapter. Keep IPC and executable/resource paths within your application's trust boundary.
 

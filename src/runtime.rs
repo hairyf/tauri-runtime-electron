@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use tauri_runtime::{
   DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
   RuntimeInitArgs, UserEvent, WindowEventId,
-  dpi::{PhysicalPosition, PhysicalSize, Position, Size},
+  dpi::{PhysicalPosition, PhysicalSize, PixelUnit, Position, Size},
+  window::WindowSizeConstraints,
   monitor::Monitor,
   webview::{
     DetachedWebview, DownloadEvent,
@@ -135,6 +136,20 @@ pub(crate) fn size_payload(size: Size) -> Value {
   }
 }
 
+/// Keep each constraint's unit until the target display is known in Electron.
+pub(crate) fn size_constraints_payload(constraints: WindowSizeConstraints) -> Value {
+  let axis = |unit: Option<PixelUnit>| unit.map(|unit| match unit {
+    PixelUnit::Physical(unit) => json!({ "value": unit.0, "physical": true }),
+    PixelUnit::Logical(unit) => json!({ "value": unit.0, "physical": false }),
+  });
+  json!({
+    "minWidth": axis(constraints.min_width),
+    "minHeight": axis(constraints.min_height),
+    "maxWidth": axis(constraints.max_width),
+    "maxHeight": axis(constraints.max_height),
+  })
+}
+
 pub(crate) fn position_payload(position: Position) -> Value {
   match position {
     Position::Physical(position) => json!({ "x": position.x, "y": position.y, "physical": true }),
@@ -183,6 +198,8 @@ struct Window {
   webviews: Vec<Webview>,
   /// Handlers registered by Tauri to observe this window's events.
   handlers: Vec<(WindowEventId, Rc<WindowEventHandler>)>,
+  #[cfg(windows)]
+  menu_owner: Option<crate::window::imp::MenuOwner>,
 }
 
 #[derive(Clone)]
@@ -208,22 +225,22 @@ pub struct RuntimeContext {
   ///
   /// The handler is closed over the [`DetachedWebview`] it belongs to, so the
   /// map does not need to know the runtime's generic parameters.
-  ipc_handlers: Rc<RefCell<HashMap<u32, Rc<IpcHandler>>>>,
+  ipc_handlers: Arc<RefCell<HashMap<u32, Rc<IpcHandler>>>>,
   /// Tauri's page-load, title and new-window callbacks, by webview serial.
-  webview_handlers: Rc<RefCell<HashMap<u32, WebviewHandlers>>>,
+  webview_handlers: Arc<RefCell<HashMap<u32, WebviewHandlers>>>,
   /// Custom protocols registered by Tauri, served through Electron's
   /// `protocol.handle`.
-  protocol_handlers: Rc<RefCell<ProtocolHandlerMap>>,
+  protocol_handlers: Arc<RefCell<ProtocolHandlerMap>>,
   /// Page origin per webview label, injected as the `Origin` header on
   /// custom-protocol requests (Electron reports the request URL instead).
-  webview_origins: Rc<RefCell<HashMap<String, String>>>,
+  webview_origins: Arc<RefCell<HashMap<String, String>>>,
   /// Download and permission callbacks, by webview serial. Electron asks for
   /// these asynchronously, so the run loop answers over IPC.
-  policy_handlers: Rc<RefCell<HashMap<u32, PolicyHandlers>>>,
+  policy_handlers: Arc<RefCell<HashMap<u32, PolicyHandlers>>>,
   /// Native window handle per window serial, asked from Electron once.
   /// HWND/X11 IDs permit selected cross-process operations; AppKit pointers
   /// cannot be borrowed from Electron's process.
-  native_handles: Rc<RefCell<HashMap<u32, isize>>>,
+  native_handles: Arc<RefCell<HashMap<u32, isize>>>,
 }
 
 // SAFETY: we ensure this type is only used on the main thread.
@@ -235,9 +252,26 @@ unsafe impl Send for RuntimeContext {}
 unsafe impl Sync for RuntimeContext {}
 
 impl RuntimeContext {
+  /// RefCell state and native menus belong to the runtime's UI thread.
+  fn on_main_thread<R: Send + 'static>(
+    &self,
+    task: impl FnOnce(&Self) -> R + Send + 'static,
+  ) -> Result<R> {
+    if std::thread::current().id() == self.main_thread_id {
+      return Ok(task(self));
+    }
+    let context = self.clone();
+    let (tx, rx) = sync_channel(1);
+    self.run_tx.send(Message::Task(Box::new(move || {
+      let _ = tx.send(task(&context));
+    }))).map_err(|_| Error::FailedToSendMessage)?;
+    rx.recv().map_err(|_| Error::FailedToReceiveMessage)
+  }
+
   pub(crate) fn send_message(&self, message: Message) -> Result<()> {
     // Tasks run inline on the main thread; everything else goes to the loop.
-    let message = match (std::thread::current().id() == self.main_thread_id, message) {
+    let is_main_thread = std::thread::current().id() == self.main_thread_id;
+    let message = match (is_main_thread, message) {
       (true, Message::Task(task)) => {
         task();
         return Ok(());
@@ -246,7 +280,7 @@ impl RuntimeContext {
     };
     // Like Wry's proxy, explicit exit requests must reach the callback even
     // when requested during setup, before the event loop starts.
-    if matches!(&message, Message::RequestExit(_)) || self.is_running.load(Ordering::Relaxed) {
+    if !is_main_thread || matches!(&message, Message::RequestExit(_)) || self.is_running.load(Ordering::Relaxed) {
       self
         .run_tx
         .send(message)
@@ -265,7 +299,35 @@ impl RuntimeContext {
   }
 
   fn forget_window(&self, id: WindowId) -> bool {
-    self.windows.borrow_mut().remove(&id).is_some()
+    let Some(window) = self.windows.borrow_mut().remove(&id) else {
+      return false;
+    };
+    for webview in &window.webviews {
+      self.forget_webview_handlers(webview.serial, &webview.label);
+    }
+    self.native_handles.borrow_mut().remove(&window.serial);
+    // MenuOwner deliberately retains its HWND: muda can still reference it.
+    true
+  }
+
+  pub(crate) fn forget_webview(&self, serial: u32) -> Result<()> {
+    self.on_main_thread(move |context| {
+      let removed = context.windows.borrow_mut().values_mut().find_map(|window| {
+        let index = window.webviews.iter().position(|webview| webview.serial == serial)?;
+        Some(window.webviews.remove(index))
+      });
+      if let Some(webview) = removed {
+        context.forget_webview_handlers(webview.serial, &webview.label);
+      }
+    })
+  }
+
+  fn forget_webview_handlers(&self, serial: u32, label: &str) {
+    self.ipc_handlers.borrow_mut().remove(&serial);
+    self.webview_handlers.borrow_mut().remove(&serial);
+    self.policy_handlers.borrow_mut().remove(&serial);
+    self.webview_origins.borrow_mut().remove(label);
+    remove_webview_protocols(&mut self.protocol_handlers.borrow_mut(), serial, label);
   }
 
   fn next_window_id(&self) -> WindowId {
@@ -290,12 +352,17 @@ impl RuntimeContext {
   }
 
   pub(crate) fn serial_for_window(&self, id: WindowId) -> Option<u32> {
-    self.windows.borrow().get(&id).map(|window| window.serial)
+    self.on_main_thread(move |context| {
+      context.windows.borrow().get(&id).map(|window| window.serial)
+    }).ok().flatten()
   }
 
   /// The native handle of a window, as Electron knows it. Cached because Tauri
   /// asks for it on every menu/effect/decoration call.
   pub(crate) fn native_handle(&self, id: WindowId) -> Result<isize> {
+    if std::thread::current().id() != self.main_thread_id {
+      return self.on_main_thread(move |context| context.native_handle(id))?;
+    }
     let serial = self
       .serial_for_window(id)
       .ok_or_else(|| create_window_err("window is gone".to_string()))?;
@@ -309,13 +376,51 @@ impl RuntimeContext {
         json!({ "windowId": serial }),
         IPC_TIMEOUT,
       )
-      .map_err(create_window_err)?;
+      .map_err(|error| create_window_err(error.to_string()))?;
     let handle = value["handle"]
       .as_i64()
       .ok_or_else(|| create_window_err("electron returned no native handle".to_string()))?;
     let handle = handle as isize;
     self.native_handles.borrow_mut().insert(serial, handle);
     Ok(handle)
+  }
+
+  #[cfg(windows)]
+  pub(crate) fn menu_owner_window(&self, id: WindowId) -> Result<isize> {
+    if std::thread::current().id() != self.main_thread_id {
+      return self.on_main_thread(move |context| context.menu_owner_window(id))?;
+    }
+    let mut windows = self.windows.borrow_mut();
+    let window = windows.get_mut(&id).ok_or_else(|| create_window_err("window is gone".into()))?;
+    if window.menu_owner.is_none() {
+      window.menu_owner = crate::window::imp::MenuOwner::new();
+    }
+    window.menu_owner.as_ref().map(|owner| owner.handle)
+      .ok_or_else(|| create_window_err("could not create menu owner".into()))
+  }
+
+  #[cfg(windows)]
+  fn sync_window_menus(&self) {
+    // ponytail: O(total menu items) per pump; use native mutation hooks if
+    // polling becomes measurable. Only changed menus cross IPC.
+    let changed: Vec<_> = self.windows.borrow().iter().filter_map(|(id, window)| {
+      let owner = window.menu_owner.as_ref()?;
+      match crate::window::imp::menu_snapshot(owner.handle) {
+        Ok(menu) if menu != owner.mirrored => Some((*id, window.serial, menu)),
+        Ok(_) => None,
+        Err(error) => { eprintln!("[electron] menu snapshot failed: {error}"); None }
+      }
+    }).collect();
+    for (id, serial, menu) in changed {
+      match self.ipc.call("window.setMenu", json!({ "windowId": serial, "menu": { "items": menu } }), IPC_TIMEOUT) {
+        Ok(_) => {
+          if let Some(owner) = self.windows.borrow_mut().get_mut(&id).and_then(|window| window.menu_owner.as_mut()) {
+            owner.mirrored = menu;
+          }
+        }
+        Err(error) => eprintln!("[electron] menu mirror failed: {error}"),
+      }
+    }
   }
 
   /// Tauri resolves [`WebviewUrl::App`] against the dev server (`devUrl`) or the
@@ -331,6 +436,13 @@ impl RuntimeContext {
 
   /// Updates the remembered origin after a navigation.
   pub(crate) fn set_webview_origin_by_serial(&self, serial: u32, url: &str) {
+    if std::thread::current().id() != self.main_thread_id {
+      let url = url.to_owned();
+      if let Err(error) = self.on_main_thread(move |context| context.set_webview_origin_by_serial(serial, &url)) {
+        eprintln!("[electron] failed to update webview origin: {error}");
+      }
+      return;
+    }
     let label = self.windows.borrow().values().find_map(|window| {
       window
         .webviews
@@ -371,10 +483,14 @@ impl RuntimeContext {
     &self,
     window_id: WindowId,
     event_id: WindowEventId,
-    handler: Rc<WindowEventHandler>,
+    handler: impl Fn(&WindowEvent) + Send + 'static,
   ) {
-    if let Some(window) = self.windows.borrow_mut().get_mut(&window_id) {
-      window.handlers.push((event_id, handler));
+    if let Err(error) = self.on_main_thread(move |context| {
+      if let Some(window) = context.windows.borrow_mut().get_mut(&window_id) {
+        window.handlers.push((event_id, Rc::new(handler)));
+      }
+    }) {
+      eprintln!("[electron] failed to register window handler: {error}");
     }
   }
 
@@ -382,17 +498,17 @@ impl RuntimeContext {
     &self,
     serial: u32,
     event_id: tauri_runtime::WebviewEventId,
-    handler: Rc<WebviewEventHandler>,
+    handler: impl Fn(&tauri_runtime::window::WebviewEvent) + Send + 'static,
   ) {
-    for window in self.windows.borrow_mut().values_mut() {
-      if let Some(webview) = window
-        .webviews
-        .iter_mut()
-        .find(|webview| webview.serial == serial)
-      {
-        webview.handlers.push((event_id, handler));
-        return;
+    if let Err(error) = self.on_main_thread(move |context| {
+      for window in context.windows.borrow_mut().values_mut() {
+        if let Some(webview) = window.webviews.iter_mut().find(|webview| webview.serial == serial) {
+          webview.handlers.push((event_id, Rc::new(handler)));
+          break;
+        }
       }
+    }) {
+      eprintln!("[electron] failed to register webview handler: {error}");
     }
   }
 
@@ -491,7 +607,7 @@ impl ElectronRuntime {
 
   fn start(attrs: Electron, custom_schemes: &[&str]) -> Result<Self> {
     crate::platform::dpi::enable_per_monitor_v2();
-    let binary = attrs.resolve_binary().map_err(create_window_err)?;
+    let binary = attrs.resolve_binary().map_err(|error| create_window_err(error.to_string()))?;
     eprintln!("[electron] launching {}", binary.display());
     let mut args = extra_args(&attrs.args);
     switches::warn_about_dangerous_switches(&args);
@@ -527,8 +643,8 @@ impl ElectronRuntime {
       0,
       &args,
       attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
-    ).map_err(create_window_err)?;
-    let event_rx = ipc.events().map_err(create_window_err)?;
+    ).map_err(|error| create_window_err(error.to_string()))?;
+    let event_rx = ipc.events().map_err(|error| create_window_err(error.to_string()))?;
     let icon = attrs.resolve_icon().or_else(|| {
       // A packaged app has no icon file beside it: the bundler embedded the
       // icon in the executable, so copy it back out for Electron.
@@ -606,11 +722,11 @@ impl Electron {
     self
   }
 
-  fn resolve_binary(&self) -> std::result::Result<PathBuf, String> {
+  fn resolve_binary(&self) -> std::result::Result<PathBuf, electron_rs::Error> {
     if let Some(path) = &self.binary {
       return electron_rs::find_binary(path);
     }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe()?;
     let mut lookup_error = None;
     if let Some(dir) = executable.parent() {
       let product_name = option_env!("ELECTRON_RS_TAURI_PRODUCT_NAME")
@@ -859,22 +975,88 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  // Electron pumps its own event loop in the main process; there is nothing to
-  // iterate here, and callers invoke this in a loop so it must stay silent.
-  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, _callback: F) {}
+  fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, callback: F) {
+    self.pump(callback, true);
+  }
 
   fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
     std::process::exit(self.run_return(callback));
   }
 
-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) -> i32 {
+  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
+    self.pump(callback, false)
+  }
+
+  fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
+    let point = self.context.ipc.call("window.cursorPosition", json!({}), IPC_TIMEOUT)
+      .map_err(|error| create_window_err(error.to_string()))?;
+    Ok(PhysicalPosition::new(
+      point["x"].as_f64().unwrap_or_default(),
+      point["y"].as_f64().unwrap_or_default(),
+    ))
+  }
+}
+
+impl ElectronRuntime {
+  fn pump<T: UserEvent, F: FnMut(RunEvent<T>)>(&self, mut callback: F, once: bool) -> i32 {
     self.is_running.store(true, Ordering::Relaxed);
-    callback(RunEvent::Ready);
+    if !once {
+      callback(RunEvent::Ready);
+    }
 
     let exit_code = 'event_loop: loop {
       // Events pushed by the Electron process.
-      while let Ok(event) = self.event_rx.try_recv() {
+      loop {
+        let event = match self.event_rx.try_recv() {
+          Ok(event) => event,
+          Err(std::sync::mpsc::TryRecvError::Empty) => break,
+          // A full event queue can drop ipc.closed; disconnect is definitive.
+          Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'event_loop 0,
+        };
         match event["event"].as_str() {
+          #[cfg(windows)]
+          Some("menu.command") => {
+            let params = &event["params"];
+            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
+            let Some(command) = params["commandId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
+            let owner = self.context.windows.borrow().values()
+              .find(|window| window.serial == serial)
+              .and_then(|window| window.menu_owner.as_ref().map(|owner| owner.handle));
+            if let Some(owner) = owner {
+              if crate::window::imp::menu_snapshot(owner).is_ok_and(|menu| menu_command_enabled(&menu, command)) {
+                crate::window::imp::dispatch_menu_command(owner, command);
+              }
+            }
+          }
+          Some("window.themeChanged") => {
+            let params = &event["params"];
+            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
+            let Some(id) = self.context.window_for_serial(serial) else { continue };
+            let theme = match params["theme"].as_str() {
+              Some("dark") => Theme::Dark,
+              Some("light") => Theme::Light,
+              _ => continue,
+            };
+            #[cfg(windows)]
+            if let Some(dark) = params["dark"].as_bool() {
+              if let Err(error) = self.context.native_handle(id)
+                .and_then(|handle| crate::window::imp::set_theme(handle, dark)) {
+                eprintln!("[electron] native caption theme failed: {error}");
+              }
+            }
+            let label = self.context.windows.borrow().get(&id).map(|window| window.label.clone());
+            if let Some(label) = label {
+              self.context.emit_window_event(id, &WindowEvent::ThemeChanged(theme));
+              callback(RunEvent::WindowEvent { label, event: WindowEvent::ThemeChanged(theme) });
+            }
+          }
+          Some("webview.closed") => {
+            if let Some(serial) = event["params"]["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok()) {
+              if let Err(error) = self.context.forget_webview(serial) {
+                eprintln!("[electron] webview cleanup failed: {error}");
+              }
+            }
+          }
           Some("app.exitRequested") => {
             if request_exit(None, &mut callback) {
               break 'event_loop 0;
@@ -929,10 +1111,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
               continue;
             };
-            let handlers = self.context.webview_handlers.borrow();
-            if let Some(handler) = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.page_load.as_ref())
+            let handler = self.context.webview_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.page_load.clone());
+            if let Some(handler) = handler
             {
               let page_load = if name == "webview.loadStarted" {
                 PageLoadEvent::Started
@@ -948,10 +1129,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               continue;
             };
             let title = params["title"].as_str().unwrap_or_default().to_string();
-            let handlers = self.context.webview_handlers.borrow();
-            if let Some(handler) = handlers
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.title.as_ref())
+            let handler = self.context.webview_handlers.borrow()
+              .get(&(serial as u32)).and_then(|handlers| handlers.title.clone());
+            if let Some(handler) = handler
             {
               handler(title);
             }
@@ -1132,12 +1312,13 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
               .context
               .protocol_handlers
               .borrow()
-              .get(&(scheme.clone(), if scheme == "ipc" {
-                params["webviewId"].as_u64().map(|id| id as u32)
-              } else {
-                None
-              }))
-              .cloned()
+              .iter()
+              .filter(|((registered, owner), _)| {
+                registered == &scheme && (scheme != "ipc" || *owner ==
+                  params["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok()))
+              })
+              .min_by_key(|((_, owner), _)| *owner)
+              .map(|(_, handler)| handler.clone())
             else {
               eprintln!("[electron] no protocol handler for {scheme}");
               continue;
@@ -1222,8 +1403,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
             }
           }
           Message::DestroyWindow(id) => {
-            let removed = self.context.forget_window(id);
-            if removed && exit_if_empty(&self.context, &mut callback) {
+            if window_closed(&self.context, id, &mut callback) {
               break 'event_loop 0;
             }
           }
@@ -1245,7 +1425,25 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       // Native UI (tray icons, menus) lives on this thread and posts window
       // messages here; Electron owns its own process, so nothing else pumps them.
       pump_thread_messages();
-
+      #[cfg(windows)]
+      {
+        for (owner, method) in crate::window::imp::take_menu_actions() {
+          let target = self.context.windows.borrow().iter().find_map(|(id, window)| {
+            window.menu_owner.as_ref().filter(|menu| menu.handle == owner)
+              .map(|_| (*id, window.serial))
+          });
+          let Some((id, serial)) = target else { continue };
+          if method == "window.close" {
+            close_window(&self.context, id, &mut callback);
+          } else if let Err(error) = self.context.ipc.call(method, json!({ "windowId": serial }), IPC_TIMEOUT) {
+            eprintln!("[electron] native menu action failed: {error}");
+          }
+        }
+        self.context.sync_window_menus();
+      }
+      if once {
+        return 0;
+      }
       std::thread::sleep(Duration::from_millis(10));
     };
 
@@ -1258,17 +1456,6 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     exit_code
   }
 
-  fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
-    let point = self
-      .context
-      .ipc
-      .call("window.cursorPosition", json!({}), IPC_TIMEOUT)
-      .map_err(create_window_err)?;
-    Ok(PhysicalPosition::new(
-      point["x"].as_f64().unwrap_or_default(),
-      point["y"].as_f64().unwrap_or_default(),
-    ))
-  }
 }
 
 /// Translates an Electron window event into the Tauri equivalent.
@@ -1377,11 +1564,32 @@ fn request_exit<T: UserEvent, F: FnMut(RunEvent<T>)>(code: Option<i32>, callback
   !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent))
 }
 
+#[cfg(any(windows, test))]
+fn menu_command_enabled(menu: &Value, command: u32) -> bool {
+  command <= u16::MAX as u32 && menu.as_array().is_some_and(|items| items.iter().any(|item| {
+    item["enabled"].as_bool() == Some(true) && item["type"] != "separator" &&
+      if item["submenu"].is_array() {
+        menu_command_enabled(&item["submenu"], command)
+      } else {
+        item["commandId"].as_u64() == Some(command as u64)
+      }
+  }))
+}
+
+fn remove_webview_protocols(protocols: &mut ProtocolHandlerMap, serial: u32, label: &str) {
+  protocols.retain(|(_, owner), (registered_label, _)| {
+    *owner != Some(serial) && (owner.is_some() || registered_label != label)
+  });
+}
+
 pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'static>(
   context: &RuntimeContext,
   pending: PendingWindow<T, ElectronRuntime>,
   after_window_creation: Option<F>,
 ) -> Result<DetachedWindow<T, ElectronRuntime>> {
+  if std::thread::current().id() != context.main_thread_id {
+    return context.on_main_thread(move |context| create_window_impl(context, pending, after_window_creation))?;
+  }
   let PendingWindow {
     label,
     window_builder,
@@ -1391,12 +1599,9 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   if let Some(webview) = &webview {
     validate_webview(webview)?;
   }
-  let config = &window_builder.config;
   #[cfg(target_os = "macos")]
-  if config.hidden_title || matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Transparent) {
-    return Err(create_window_err(
-      "Electron does not support Tauri hidden_title or the Transparent title bar style; use Overlay without hidden_title".into(),
-    ));
+  if window_builder.macos_parent.is_some() {
+    return Err(create_window_err("Electron cannot use a process-local AppKit parent pointer".into()));
   }
   let id = context.next_window_id();
   let serial = context.next_serial();
@@ -1408,9 +1613,9 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
 
   if let Some(webview) = webview.as_mut() {
     for (scheme, handler) in webview.uri_scheme_protocols.drain() {
-      // Asset protocols are session-wide; IPC captures a specific webview's
-      // Tauri invoke key/ACL and must be selected by the authenticated sender.
-      let owner = if scheme == "ipc" { webview_id } else { None };
+      // Keep every owner's handler so closing one window does not discard the
+      // session-wide asset protocol still used by another window.
+      let owner = webview_id;
       context
         .protocol_handlers
         .borrow_mut()
@@ -1435,64 +1640,20 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     _ => json!(null),
   };
 
-  let mut payload = json!({
-    "windowId": serial,
-    "label": label,
-    "title": config.title,
-    "width": config.width,
-    "height": config.height,
-    "x": config.x,
-    "y": config.y,
-    "center": config.center,
-    "resizable": config.resizable,
-    "decorations": config.decorations,
-    "transparent": config.transparent,
-    "visible": config.visible,
-    "alwaysOnTop": config.always_on_top,
-    // Everything below is creation-time only: Electron cannot change these
-    // after the window exists, so a field left out here is silently lost.
-    "minWidth": config.min_width,
-    "minHeight": config.min_height,
-    "maxWidth": config.max_width,
-    "maxHeight": config.max_height,
-    "maximized": config.maximized,
-    "fullscreen": config.fullscreen,
-    "maximizable": config.maximizable,
-    "minimizable": config.minimizable,
-    "closable": config.closable,
-    "focusable": config.focusable,
-    "skipTaskbar": config.skip_taskbar,
-    "alwaysOnBottom": config.always_on_bottom,
-    "visibleOnAllWorkspaces": config.visible_on_all_workspaces,
-    "contentProtected": config.content_protected,
-    "shadow": config.shadow,
-    "backgroundColor": config.background_color.map(|color| {
-      let tauri_utils::config::Color(red, green, blue, alpha) = color;
-      format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}")
-    }),
-    "titleBarHidden": !matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Visible),
-    "titleBarOverlay": matches!(config.title_bar_style, tauri_utils::TitleBarStyle::Overlay),
-    "trafficLightPosition": config.traffic_light_position,
-    "tabbingIdentifier": config.tabbing_identifier,
-  });
+  let mut payload = window_create_payload(&window_builder, serial, &label)?;
   if let Some(icon) = &context.icon {
     payload["icon"] = json!(icon.display().to_string());
   }
   if let (Some(webview), Some(webview_id)) = (&webview, webview_id) {
-    payload["webview"] = json!({
-      "webviewId": webview_id,
-      "url": webview_url.clone(),
-      "initScripts": initialization_scripts(webview),
-      "dataDirectory": webview.webview_attributes.data_directory,
-      "incognito": webview.webview_attributes.incognito,
-      "policy": policy,
-    });
+    payload["webview"] = webview_create_payload(webview, webview_id, &webview_url, policy);
   }
 
-  context
-    .ipc
-    .call("window.create", payload, IPC_TIMEOUT)
-    .map_err(create_window_err)?;
+  if let Err(error) = context.ipc.call("window.create", payload, IPC_TIMEOUT) {
+    if let (Some(webview), Some(serial)) = (webview.as_ref(), webview_id) {
+      context.forget_webview_handlers(serial, &webview.label);
+    }
+    return Err(create_window_err(error.to_string()));
+  }
   eprintln!("[electron] created window {label} (serial {serial})");
 
   context.windows.borrow_mut().insert(
@@ -1503,27 +1664,43 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       webviews: webview_id
         .map(|serial| Webview {
           serial,
-          label: label.clone(),
+          label: webview.as_ref().map(|pending| pending.label.clone()).unwrap_or_else(|| label.clone()),
           handlers: Vec::new(),
         })
         .into_iter()
         .collect(),
       handlers: Vec::new(),
+      #[cfg(windows)]
+      menu_owner: None,
     },
   );
 
-  if let (Some(pending_webview), Some(webview_serial)) = (webview.as_mut(), webview_id) {
-    if let Some(origin) = origin_of(&webview_url) {
-      context
-        .webview_origins
-        .borrow_mut()
-        .insert(label.clone(), origin);
+  #[cfg(windows)]
+  if window_builder.owner.is_some() || window_builder.parent.is_some()
+    || window_builder.config.always_on_bottom {
+    let handle = context.native_handle(id)?;
+    if window_builder.config.always_on_bottom {
+      crate::window::imp::send_to_bottom(handle);
     }
+    if let Some(owner) = window_builder.owner.or(window_builder.parent) {
+      let parent_id = context.windows.borrow().iter().find_map(|(id, window)| {
+        window.menu_owner.as_ref().filter(|menu| menu.handle == owner).map(|_| *id)
+      });
+      let owner = match parent_id {
+        Some(id) => context.native_handle(id)?,
+        None => owner,
+      };
+      crate::window::imp::set_owner(handle, owner)?;
+    }
+  }
+
+  if let (Some(pending_webview), Some(webview_serial)) = (webview.as_mut(), webview_id) {
+    context.set_webview_origin(&pending_webview.label, &webview_url);
     if let Some(handler) = pending_webview.ipc_handler.take() {
       register_ipc_handler::<T>(
         context,
         webview_serial,
-        label.clone(),
+        pending_webview.label.clone(),
         webview_url.clone(),
         handler,
       );
@@ -1535,7 +1712,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     #[cfg(any(windows, target_os = "macos"))]
     handler(RawWindow {
       #[cfg(windows)]
-      hwnd: context.native_handle(id)?,
+      hwnd: context.menu_owner_window(id)?,
       _marker: &std::marker::PhantomData,
     });
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -1550,7 +1727,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
 
   let webview = webview_id.map(|webview_id| DetachedWindowWebview {
     webview: DetachedWebview {
-      label: label.clone(),
+      label: webview.as_ref().map(|pending| pending.label.clone()).unwrap_or_else(|| label.clone()),
       dispatcher: ElectronWebviewDispatcher {
         id: webview_id,
         context: context.clone(),
@@ -1578,6 +1755,9 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   window_id: WindowId,
   mut pending: PendingWebview<T, ElectronRuntime>,
 ) -> Result<DetachedWebview<T, ElectronRuntime>> {
+  if std::thread::current().id() != context.main_thread_id {
+    return context.on_main_thread(move |context| create_webview_impl(context, window_id, pending))?;
+  }
   validate_webview(&pending)?;
   let serial = context
     .serial_for_window(window_id)
@@ -1595,7 +1775,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   // Schemes must be installed before the page is loaded, otherwise the initial
   // `tauri://` navigation fails with ERR_FAILED.
   for (scheme, handler) in pending.uri_scheme_protocols.drain() {
-    let owner = if scheme == "ipc" { Some(webview_id) } else { None };
+    let owner = Some(webview_id);
     context
       .protocol_handlers
       .borrow_mut()
@@ -1611,24 +1791,12 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   }
 
   let policy = register_policy_handlers(context, webview_id, &mut pending);
-  let payload = json!({
-    "windowId": serial,
-    "webviewId": webview_id,
-    "url": url.clone(),
-    "bounds": pending.webview_attributes.bounds.as_ref().map(|bounds| json!({
-      "position": position_payload(bounds.position),
-      "size": size_payload(bounds.size),
-    })),
-    "autoResize": pending.webview_attributes.auto_resize,
-    "initScripts": initialization_scripts(&pending),
-    "dataDirectory": pending.webview_attributes.data_directory,
-    "incognito": pending.webview_attributes.incognito,
-    "policy": policy,
-  });
-  context
-    .ipc
-    .call("webview.create", payload, IPC_TIMEOUT)
-    .map_err(create_webview_err)?;
+  let mut payload = webview_create_payload(&pending, webview_id, &url, policy);
+  payload["windowId"] = json!(serial);
+  if let Err(error) = context.ipc.call("webview.create", payload, IPC_TIMEOUT) {
+    context.forget_webview_handlers(webview_id, &pending.label);
+    return Err(create_webview_err(error.to_string()));
+  }
 
   if let Some(window) = context.windows.borrow_mut().get_mut(&window_id) {
     window.webviews.push(Webview {
@@ -1657,6 +1825,62 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
       url: Arc::new(Mutex::new(url.clone())),
       last_evaluated_script: Default::default(),
     },
+  })
+}
+
+fn window_create_payload(builder: &crate::window_builder::ElectronWindowBuilder, serial: u32, label: &str) -> Result<Value> {
+  let mut payload = json!({
+    "windowId": serial,
+    "label": label,
+    "window": serde_json::to_value(&builder.config).map_err(|error| create_window_err(error.to_string()))?,
+  });
+  if let Some(constraints) = builder.size_constraints {
+    payload["sizeConstraints"] = size_constraints_payload(constraints);
+  }
+  if let Some(icon) = &builder.icon {
+    use base64::Engine as _;
+    let mut bgra = icon.rgba.clone();
+    for pixel in bgra.chunks_exact_mut(4) {
+      pixel.swap(0, 2);
+    }
+    payload["windowIcon"] = json!({
+      "width": icon.width, "height": icon.height,
+      "bgra": base64::engine::general_purpose::STANDARD.encode(bgra),
+    });
+  }
+  Ok(payload)
+}
+
+/// Main pages and native children use exactly the same webview preferences.
+fn webview_create_payload<T: UserEvent>(pending: &PendingWebview<T, ElectronRuntime>, serial: u32, url: &str, policy: Value) -> Value {
+  let attributes = &pending.webview_attributes;
+  let scroll_bar_style = match attributes.scroll_bar_style {
+    #[cfg(windows)]
+    tauri_runtime::webview::ScrollBarStyle::FluentOverlay => "fluentOverlay",
+    _ => "default",
+  };
+  json!({
+    "webviewId": serial,
+    "url": url,
+    "bounds": attributes.bounds.as_ref().map(|bounds| json!({
+      "position": position_payload(bounds.position), "size": size_payload(bounds.size),
+    })),
+    "autoResize": attributes.auto_resize,
+    "initScripts": initialization_scripts(pending),
+    "dataDirectory": attributes.data_directory,
+    "incognito": attributes.incognito,
+    "userAgent": attributes.user_agent,
+    "acceptFirstMouse": attributes.accept_first_mouse,
+    "javascriptDisabled": attributes.javascript_disabled,
+    "devtools": attributes.devtools,
+    "backgroundThrottling": attributes.background_throttling,
+    "dragDropEnabled": attributes.drag_drop_handler_enabled,
+    "zoomHotkeysEnabled": attributes.zoom_hotkeys_enabled,
+    "scrollBarStyle": scroll_bar_style,
+    "transparent": attributes.transparent,
+    "focus": attributes.focus,
+    "backgroundColor": attributes.background_color,
+    "policy": policy,
   })
 }
 
@@ -1861,6 +2085,84 @@ fn pump_thread_messages() {}
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn window_creation_preserves_config_icons_and_mixed_constraints() {
+    use tauri_runtime::window::WindowBuilder;
+    use tauri_runtime::dpi::{LogicalUnit, PhysicalUnit};
+    use base64::Engine as _;
+    let config = tauri_utils::config::WindowConfig {
+      focus: false,
+      hidden_title: true,
+      user_agent: Some("root-parity".into()),
+      prevent_overflow: Some(tauri_utils::config::PreventOverflowConfig::Enable(true)),
+      ..Default::default()
+    };
+    let builder = crate::window_builder::ElectronWindowBuilder::with_config(&config)
+      .inner_size_constraints(WindowSizeConstraints {
+        min_width: Some(PixelUnit::Physical(PhysicalUnit(250))),
+        min_height: Some(PixelUnit::Logical(LogicalUnit(120.5))),
+        max_width: None,
+        max_height: Some(PixelUnit::Physical(PhysicalUnit(900))),
+      })
+      .icon(tauri_runtime::Icon { rgba: std::borrow::Cow::Borrowed(&[1, 2, 3, 4, 5, 6, 7, 8]), width: 2, height: 1 }).unwrap();
+    let payload = window_create_payload(&builder, 42, "host").unwrap();
+    assert_eq!(payload["window"], serde_json::to_value(config).unwrap());
+    assert_eq!(payload["windowId"], 42);
+    assert_eq!(payload["sizeConstraints"], json!({
+      "minWidth": { "value": 250, "physical": true },
+      "minHeight": { "value": 120.5, "physical": false },
+      "maxWidth": null,
+      "maxHeight": { "value": 900, "physical": true },
+    }));
+    assert_eq!(base64::engine::general_purpose::STANDARD.decode(payload["windowIcon"]["bgra"].as_str().unwrap()).unwrap(), [3, 2, 1, 4, 7, 6, 5, 8]);
+  }
+
+  #[test]
+  fn webview_preferences_reach_the_shared_creation_payload() {
+    let mut attributes = tauri_runtime::webview::WebviewAttributes::new(tauri_utils::config::WebviewUrl::default());
+    attributes.user_agent = Some("child-agent".into());
+    attributes.accept_first_mouse = true;
+    attributes.javascript_disabled = true;
+    attributes.background_throttling = Some(tauri_utils::config::BackgroundThrottlingPolicy::Disabled);
+    attributes.drag_drop_handler_enabled = false;
+    attributes.devtools = Some(false);
+    let pending = PendingWebview::<(), ElectronRuntime>::new(attributes, "child").unwrap();
+    let payload = webview_create_payload(&pending, 8, "tauri://localhost", json!({ "navigation": true }));
+    assert_eq!(payload["userAgent"], "child-agent");
+    assert_eq!(payload["acceptFirstMouse"], true);
+    assert_eq!(payload["javascriptDisabled"], true);
+    assert_eq!(payload["backgroundThrottling"], "disabled");
+    assert_eq!(payload["dragDropEnabled"], false);
+    assert_eq!(payload["devtools"], false);
+    assert_eq!(payload["policy"]["navigation"], true);
+  }
+
+  #[test]
+  fn cleanup_removes_closed_protocol_owners_and_preserves_live_assets() {
+    let handler: Rc<UriSchemeProtocolHandler> = Rc::new(|_, _, _| {});
+    let mut protocols = ProtocolHandlerMap::from([
+      (("ipc".into(), Some(1)), ("closed".into(), handler.clone())),
+      (("asset".into(), Some(1)), ("closed".into(), handler.clone())),
+      (("asset".into(), Some(2)), ("live".into(), handler)),
+    ]);
+    remove_webview_protocols(&mut protocols, 1, "closed");
+    assert_eq!(protocols.keys().cloned().collect::<Vec<_>>(), [("asset".to_string(), Some(2))]);
+  }
+
+  #[test]
+  fn mirrored_menu_dispatch_uses_only_live_enabled_leaf_commands() {
+    let menu = json!([
+      { "enabled": true, "commandId": 7 },
+      { "enabled": false, "commandId": 8 },
+      { "enabled": true, "commandId": 9, "submenu": [{ "enabled": true, "commandId": 10 }] },
+      { "enabled": false, "submenu": [{ "enabled": true, "commandId": 11 }] },
+      { "enabled": true, "type": "separator", "commandId": 12 },
+    ]);
+    assert!(menu_command_enabled(&menu, 7));
+    assert!(menu_command_enabled(&menu, 10));
+    for command in [8, 9, 11, 12, 13, 65536] { assert!(!menu_command_enabled(&menu, command)); }
+  }
 
   #[test]
   fn bundled_roots_include_linux_product_paths_after_adjacent_resources() {

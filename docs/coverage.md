@@ -11,11 +11,12 @@ configured for Windows, macOS and Linux. Platform skips are printed. Configurati
 is not evidence that a particular CI run passed. The tests do not verify every
 method, native effect or official example. The separate `pnpm check` runner records
 official-example assertions and screenshots; those screenshots still require visual
-review. The official generic runtime traits have no native menu attachment or
-window-effects delegation hooks. Tauri's `muda` and `window-vibrancy` paths are not
-delegated to Electron. Native Tauri menus, callbacks/accelerators and popup attachment
-remain unsupported. This crate's own window API delegates supported native effects
-through its Tauri plugin; that extension is outside the trait-method counts below.
+review. The official generic runtime traits have no window-effects delegation hook.
+On Windows a Rust UI-thread HWND owns Tauri's `muda` menu; the event pump mirrors
+attached menus into Electron and routes commands and accelerators back to that owner.
+Native menu integration on macOS/Linux and popup placement remain unverified.
+This crate's own window API delegates supported native effects through its Tauri
+plugin; that extension is outside the trait-method counts below.
 Upstream sources and copied framework files remain unchanged; no framework patch or
 ACL bypass is required. Official generic `setEffects`/`clearEffects` calls are not
 redirected to this extension or the inherent
@@ -48,7 +49,7 @@ three-platform desktop behavior.
 
 | target | CI configured | window-smoke configuration | notes |
 | --- | --- | --- | --- |
-| Windows | yes | desktop smoke and transparent-window check | library window effects support Acrylic/Mica/Tabbed on build 22621+; Win32 decoration/drag/cursor paths exist; WebView2 interop and Tauri native menus remain unsupported |
+| Windows | yes | desktop smoke and transparent-window check | library window effects support Acrylic/Mica/Tabbed on build 22621+; Win32 decoration/drag/cursor and attached menu mirror paths exist; WebView2 interop is unavailable |
 | macOS | yes | desktop smoke | `window_handle` returns `HandleError::Unavailable`; WKWebView data-store enumeration and removal error without callbacks; cursor warp via CoreGraphics |
 | Linux | yes | desktop smoke under xvfb | missing local GTK windows/widgets return errors; `display_handle` reports `Xlib(None)`, so wgpu/GL interop cannot work; cursor warp logs a gap |
 | Android / iOS | no | none | not supported desktop targets; mobile branches remain incomplete |
@@ -69,10 +70,9 @@ subframe preload, while IPC remains main-frame-only. `data_directory` uses resol
 Exit veto/code handling distinguishes `run_return` from process-exiting `run`; macOS
 reopen and supported process-termination events respect trait platform gates.
 
-On macOS, Overlay maps to Electron's hidden title bar; logical traffic-light positions
-and tabbing identifiers are forwarded. Transparent title bars and hidden titles fail
-creation explicitly because no matching public Electron API preserves their semantics.
-Runtime title-bar-style changes remain unsupported.
+Configured hidden titles and transparent title bars map to Electron's `hidden`
+style; Overlay maps to `hiddenInset`. Logical traffic-light positions and tabbing
+identifiers are forwarded. Runtime title-bar-style changes remain unsupported.
 
 ## Library window API (outside trait counts)
 
@@ -131,7 +131,7 @@ file, while denial, timeout and destruction clean it up.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `WindowDispatch` | 81 | 71 | 2 | 0 | 0 | 6 | 2 | 0 |
 | `WebviewDispatch` | 31 | 29 | 1 | 0 | 0 | 1 | 0 | 0 |
-| `Runtime` | 20 | 18 | 0 | 0 | 1 | 1 | 0 | 0 |
+| `Runtime` | 20 | 19 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `RuntimeHandle` | 20 | 14 | 2 | 0 | 0 | 1 | 3 | 0 |
 
 ## Gaps
@@ -140,20 +140,19 @@ Every member that is not `wired`, with the file to open and what wry does instea
 
 | member | electron | location | wry |
 | --- | --- | --- | --- |
-| `WindowDispatch::gtk_window` | `error` | [src/window.rs:272](src/window.rs#L272) | implemented |
-| `WindowDispatch::default_vbox` | `error` | [src/window.rs:283](src/window.rs#L283) | implemented |
-| `WindowDispatch::activity_name` | `panic` | [src/window.rs:288](src/window.rs#L288) | implemented |
-| `WindowDispatch::scene_identifier` | `panic` | [src/window.rs:293](src/window.rs#L293) | implemented |
-| `WindowDispatch::set_decorations` | `warned` — Windows path wired | [src/window.rs:419](src/window.rs#L419) | implemented |
-| `WindowDispatch::set_cursor_grab` | `warned` | [src/window.rs:549](src/window.rs#L549) | implemented |
-| `WindowDispatch::set_cursor_position` | `warned` | [src/window.rs:563](src/window.rs#L563) | implemented |
-| `WindowDispatch::start_dragging` | `warned` — Windows path wired | [src/window.rs:578](src/window.rs#L578) | implemented |
-| `WindowDispatch::start_resize_dragging` | `warned` — Windows path wired | [src/window.rs:593](src/window.rs#L593) | implemented |
-| `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:645](src/window.rs#L645) | implemented |
-| `WebviewDispatch::with_webview` | `error` | [src/webview.rs:84](src/webview.rs#L84) | implemented |
-| `WebviewDispatch::reparent` | `warned` | [src/webview.rs:224](src/webview.rs#L224) | implemented |
-| `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:846](src/runtime.rs#L846) | implemented |
-| `Runtime::run_iteration` | `no-op` | [src/runtime.rs:864](src/runtime.rs#L864) | implemented |
+| `WindowDispatch::gtk_window` | `error` | [src/window.rs:271](src/window.rs#L271) | implemented |
+| `WindowDispatch::default_vbox` | `error` | [src/window.rs:282](src/window.rs#L282) | implemented |
+| `WindowDispatch::activity_name` | `panic` | [src/window.rs:287](src/window.rs#L287) | implemented |
+| `WindowDispatch::scene_identifier` | `panic` | [src/window.rs:292](src/window.rs#L292) | implemented |
+| `WindowDispatch::set_decorations` | `warned` — Windows path wired | [src/window.rs:420](src/window.rs#L420) | implemented |
+| `WindowDispatch::set_cursor_grab` | `warned` — Windows path wired | [src/window.rs:549](src/window.rs#L549) | implemented |
+| `WindowDispatch::set_cursor_position` | `warned` | [src/window.rs:568](src/window.rs#L568) | implemented |
+| `WindowDispatch::start_dragging` | `warned` — Windows path wired | [src/window.rs:583](src/window.rs#L583) | implemented |
+| `WindowDispatch::start_resize_dragging` | `warned` — Windows path wired | [src/window.rs:598](src/window.rs#L598) | implemented |
+| `WindowDispatch::set_title_bar_style` | `warned` | [src/window.rs:650](src/window.rs#L650) | implemented |
+| `WebviewDispatch::with_webview` | `error` | [src/webview.rs:83](src/webview.rs#L83) | implemented |
+| `WebviewDispatch::reparent` | `warned` | [src/webview.rs:225](src/webview.rs#L225) | implemented |
+| `Runtime::set_device_event_filter` | `warned` | [src/runtime.rs:962](src/runtime.rs#L962) | implemented |
 | `RuntimeHandle::display_handle` | `panic` — Windows path wired | [src/window_handle.rs:98](src/window_handle.rs#L98) | implemented |
 | `RuntimeHandle::set_device_event_filter` | `warned` | [src/window_handle.rs:198](src/window_handle.rs#L198) | implemented |
 | `RuntimeHandle::find_class` | `panic` | [src/window_handle.rs:206](src/window_handle.rs#L206) | `noop` |
@@ -197,7 +196,7 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `default_vbox` | `error` | `wired` | returns an explicit unsupported error |
 | `activity_name` | `panic` | `wired` | `#[cfg(target_os = "android")]`; panics if called; wry is `#[cfg(target_os = "android")]` |
 | `scene_identifier` | `panic` | `wired` | `#[cfg(target_os = "ios")]`; panics if called; wry is `#[cfg(target_os = "ios")]` |
-| `window_handle` | `wired` | `wired` | macOS returns HandleError::Unavailable; Win32/X11 IDs are not local native objects |
+| `window_handle` | `wired` | `wired` | Windows returns a UI-thread menu proxy; macOS returns HandleError::Unavailable; X11 IDs do not provide local GTK objects |
 | `theme` | `wired` | `wired` |  |
 | `center` | `wired` | `wired` |  |
 | `request_user_attention` | `wired` | `wired` |  |
@@ -236,7 +235,7 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `set_focusable` | `wired` | `wired` |  |
 | `set_icon` | `wired` | `wired` |  |
 | `set_skip_taskbar` | `wired` | `wired` |  |
-| `set_cursor_grab` | `warned` | `wired` | logs once when the platform refuses |
+| `set_cursor_grab` | `warned` | `wired` | logs once when the platform refuses — Windows path wired |
 | `set_cursor_visible` | `wired` | `wired` |  |
 | `set_cursor_icon` | `wired` | `wired` |  |
 | `set_cursor_position` | `warned` | `wired` | logs once when the platform refuses |
@@ -312,7 +311,7 @@ Every member that is not `wired`, with the file to open and what wry does instea
 | `show` | `wired` | `wired` | `#[cfg(target_os = "macos")]` |
 | `hide` | `wired` | `wired` | `#[cfg(target_os = "macos")]` |
 | `set_device_event_filter` | `warned` | `wired` | logs once when the platform refuses |
-| `run_iteration` | `no-op` | `wired` | never reaches Electron; wry is `#[cfg(desktop)]` |
+| `run_iteration` | `wired` | `wired` | wry is `#[cfg(desktop)]` |
 | `run_return` | `wired` | `wired` | wry is `#[cfg(not(target_os = "ios"))]` |
 | `run` | `wired` | `wired` |  |
 

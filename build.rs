@@ -2,7 +2,7 @@
 
 mod build_support;
 
-use std::{env, path::PathBuf};
+use std::env;
 use tauri_utils::platform::Target;
 
 fn main() {
@@ -18,10 +18,12 @@ fn prepare() -> Result<(), String> {
   for key in ["CARGO_TARGET_DIR", "INIT_CWD", "PWD", "TAURI_CONFIG"] {
     println!("cargo:rerun-if-env-changed={key}");
   }
-  let target_root = target_dir()?;
+  let builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION);
+  let directory = builder.directory().map_err(|error| error.to_string())?;
+  let target_root = directory.parent().and_then(|path| path.parent()).ok_or("Electron output has no Cargo target root")?;
   let triple = env::var("TARGET").map_err(|error| error.to_string())?;
   let target = Target::from_triple(&triple);
-  let app = build_support::discover(&target_root, target)?;
+  let app = build_support::discover(target_root, target)?;
   let mut metadata = electron_rs::Metadata::default();
   if let Some(app) = app {
     for input in &app.inputs {
@@ -40,21 +42,11 @@ fn prepare() -> Result<(), String> {
       metadata.icon = app.icon;
     }
   }
-  let directory = target_root.join("electron").join(format!("{}-{}", electron_rs::platform(), electron_rs::arch()));
-  let builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION)
-    .output(&directory).metadata(metadata);
-  builder.build()?;
-  println!("cargo:rustc-env=ELECTRON_RS_STAGED_BINARY={}", builder.binary()?.display());
-  Ok(())
-}
-
-fn target_dir() -> Result<PathBuf, String> {
-  // OUT_DIR belongs to the consuming Cargo build, unlike this dependency's cwd.
-  let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("no Cargo OUT_DIR")?);
-  let profile = out.ancestors().nth(3).ok_or("unexpected Cargo OUT_DIR layout")?;
-  let mut target = profile.parent().ok_or("Cargo profile has no target directory")?;
-  if target.file_name().is_some_and(|name| env::var_os("TARGET").as_deref() == Some(name)) {
-    target = target.parent().ok_or("Cargo target triple has no parent directory")?;
+  let builder = builder.output(&directory).metadata(metadata);
+  let prepared = builder.build().map_err(|error| error.to_string())?;
+  if let Some(warning) = prepared.cleanup_warning {
+    println!("cargo:warning={warning}");
   }
-  Ok(target.to_path_buf())
+  println!("cargo:rustc-env=ELECTRON_RS_STAGED_BINARY={}", prepared.binary.display());
+  Ok(())
 }

@@ -50,7 +50,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
         json!({ "policy": policy }),
         crate::runtime::IPC_TIMEOUT,
       )
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
 
@@ -65,7 +65,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
         json!({ "visible": visible }),
         crate::runtime::IPC_TIMEOUT,
       )
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
 
@@ -125,7 +125,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       .context
       .ipc
       .call("window.displays", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(monitor_from_value(&displays["primary"]))
   }
 
@@ -138,7 +138,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
         json!({ "x": x, "y": y }),
         crate::runtime::IPC_TIMEOUT,
       )
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(monitor_from_value(&display))
   }
 
@@ -147,7 +147,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       .context
       .ipc
       .call("window.displays", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(
       displays["displays"]
         .as_array()
@@ -179,7 +179,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       .context
       .ipc
       .call("app.show", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
 
@@ -191,7 +191,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       .context
       .ipc
       .call("app.hide", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
 
@@ -248,7 +248,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       .context
       .ipc
       .call("window.cursorPosition", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
+      .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(PhysicalPosition::new(
       point["x"].as_f64().unwrap_or_default(),
       point["y"].as_f64().unwrap_or_default(),

@@ -178,7 +178,7 @@ const detail = rows.map((r) => [
     const notes = []
     if (m.cfg) notes.push(`\`#[cfg(${m.cfg})]\``)
     if (m.kind === 'error') notes.push('returns an explicit unsupported error')
-    if (r.trait === 'WindowDispatch' && m.name === 'window_handle') notes.push('macOS returns HandleError::Unavailable; Win32/X11 IDs are not local native objects')
+    if (r.trait === 'WindowDispatch' && m.name === 'window_handle') notes.push('Windows returns a UI-thread menu proxy; macOS returns HandleError::Unavailable; X11 IDs do not provide local GTK objects')
     if (m.kind === 'stub') notes.push('returns a literal')
     if (m.kind === 'noop') notes.push('never reaches Electron')
     if (m.kind === 'warned') notes.push(`logs once when the platform refuses${windowsPath(m)}`)
@@ -202,11 +202,12 @@ configured for Windows, macOS and Linux. Platform skips are printed. Configurati
 is not evidence that a particular CI run passed. The tests do not verify every
 method, native effect or official example. The separate \`pnpm check\` runner records
 official-example assertions and screenshots; those screenshots still require visual
-review. The official generic runtime traits have no native menu attachment or
-window-effects delegation hooks. Tauri's \`muda\` and \`window-vibrancy\` paths are not
-delegated to Electron. Native Tauri menus, callbacks/accelerators and popup attachment
-remain unsupported. This crate's own window API delegates supported native effects
-through its Tauri plugin; that extension is outside the trait-method counts below.
+review. The official generic runtime traits have no window-effects delegation hook.
+On Windows a Rust UI-thread HWND owns Tauri's \`muda\` menu; the event pump mirrors
+attached menus into Electron and routes commands and accelerators back to that owner.
+Native menu integration on macOS/Linux and popup placement remain unverified.
+This crate's own window API delegates supported native effects through its Tauri
+plugin; that extension is outside the trait-method counts below.
 Upstream sources and copied framework files remain unchanged; no framework patch or
 ACL bypass is required. Official generic \`setEffects\`/\`clearEffects\` calls are not
 redirected to this extension or the inherent
@@ -239,7 +240,7 @@ three-platform desktop behavior.
 
 | target | CI configured | window-smoke configuration | notes |
 | --- | --- | --- | --- |
-| Windows | yes | desktop smoke and transparent-window check | library window effects support Acrylic/Mica/Tabbed on build 22621+; Win32 decoration/drag/cursor paths exist; WebView2 interop and Tauri native menus remain unsupported |
+| Windows | yes | desktop smoke and transparent-window check | library window effects support Acrylic/Mica/Tabbed on build 22621+; Win32 decoration/drag/cursor and attached menu mirror paths exist; WebView2 interop is unavailable |
 | macOS | yes | desktop smoke | \`window_handle\` returns \`HandleError::Unavailable\`; WKWebView data-store enumeration and removal error without callbacks; cursor warp via CoreGraphics |
 | Linux | yes | desktop smoke under xvfb | missing local GTK windows/widgets return errors; \`display_handle\` reports \`Xlib(None)\`, so wgpu/GL interop cannot work; cursor warp logs a gap |
 | Android / iOS | no | none | not supported desktop targets; mobile branches remain incomplete |
@@ -260,10 +261,9 @@ subframe preload, while IPC remains main-frame-only. \`data_directory\` uses res
 Exit veto/code handling distinguishes \`run_return\` from process-exiting \`run\`; macOS
 reopen and supported process-termination events respect trait platform gates.
 
-On macOS, Overlay maps to Electron's hidden title bar; logical traffic-light positions
-and tabbing identifiers are forwarded. Transparent title bars and hidden titles fail
-creation explicitly because no matching public Electron API preserves their semantics.
-Runtime title-bar-style changes remain unsupported.
+Configured hidden titles and transparent title bars map to Electron's \`hidden\`
+style; Overlay maps to \`hiddenInset\`. Logical traffic-light positions and tabbing
+identifiers are forwarded. Runtime title-bar-style changes remain unsupported.
 
 ## Library window API (outside trait counts)
 

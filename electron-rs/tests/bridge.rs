@@ -225,10 +225,11 @@ fn prepare_bridge() {
     .path(&runtime)
     .output(resources.join(format!("{}-{}", platform(), arch())))
     .metadata(metadata.clone());
-  source
+  let source = source
     .build()
     .expect("stage actual DEFAULT_VERSION from the runtime root/cache (or acquire it)");
-  fs::write(source.directory().join("bridge-resource-marker"), &name).unwrap();
+  assert!(source.cleanup_warning.is_none(), "{:?}", source.cleanup_warning);
+  fs::write(source.directory.join("bridge-resource-marker"), &name).unwrap();
 
   // The unique marker proves this resources mapping won over cache/local fallback.
   let builder = ElectronBuilder::new(DEFAULT_VERSION)
@@ -236,17 +237,21 @@ fn prepare_bridge() {
     .resources_dir(&resources)
     .output(distribution())
     .metadata(metadata);
-  builder
+  let prepared = builder
     .build()
     .expect("copy the real prepared distribution through {resources}");
-  let binary = builder.binary().unwrap();
-  assert!(binary.starts_with(distribution()));
-  assert!(!distribution().starts_with(&runtime) && !runtime.starts_with(distribution()));
+  assert!(prepared.cleanup_warning.is_none(), "{:?}", prepared.cleanup_warning);
+  let directory = prepared.directory;
+  let binary = prepared.binary;
+  assert_eq!(directory, fs::canonicalize(distribution()).unwrap());
+  assert_eq!(fs::canonicalize(builder.directory().unwrap()).unwrap(), directory);
+  assert!(binary.starts_with(&directory));
+  assert!(!directory.starts_with(&runtime) && !runtime.starts_with(&directory));
   assert_eq!(
-    fs::read_to_string(distribution().join("bridge-resource-marker")).unwrap(),
+    fs::read_to_string(directory.join("bridge-resource-marker")).unwrap(),
     name
   );
-  for path in [distribution(), stage_root(), binary.clone()] {
+  for path in [directory.clone(), stage_root(), binary.clone()] {
     assert_eq!(
       fs::canonicalize(find_binary(path).unwrap()).unwrap(),
       fs::canonicalize(&binary).unwrap()
@@ -258,56 +263,59 @@ fn prepare_bridge() {
     "linux" => name.clone(),
     other => panic!("real desktop bridge tests do not support {other}"),
   };
-  assert_eq!(binary, distribution().join(relative));
-  let marker = fs::read(distribution().join("electron-rs.json")).unwrap();
-  let binary_modified = fs::metadata(&binary).unwrap().modified().unwrap();
-  fs::write(distribution().join("main.cjs"), b"stale test asset").unwrap();
-  fs::remove_file(distribution().join("preload.cjs")).unwrap();
-  builder
-    .build()
-    .expect("repair assets without restaging/rebranding the binary");
+  assert_eq!(binary, directory.join(relative));
+  let marker = fs::read(directory.join("electron-rs.json")).unwrap();
+  let binary_bytes = fs::read(&binary).unwrap();
+  fs::write(directory.join("main.cjs"), b"stale test asset").unwrap();
+  fs::remove_file(directory.join("preload.cjs")).unwrap();
+  let repaired = builder.build().expect("repair assets by publishing a private copy");
+  assert!(repaired.cleanup_warning.is_none(), "{:?}", repaired.cleanup_warning);
+  assert_eq!(repaired.directory, directory);
+  assert_eq!(repaired.binary, binary);
+  assert_eq!(fs::read(&repaired.binary).unwrap(), binary_bytes);
   assert_eq!(
-    fs::read(distribution().join("main.cjs")).unwrap(),
+    fs::read(directory.join("main.cjs")).unwrap(),
     include_bytes!("../assets/main.cjs")
   );
   assert_eq!(
-    fs::read(distribution().join("preload.cjs")).unwrap(),
+    fs::read(directory.join("preload.cjs")).unwrap(),
     include_bytes!("../assets/preload.cjs")
   );
-  let main_modified = fs::metadata(distribution().join("main.cjs"))
-    .unwrap()
-    .modified()
-    .unwrap();
-  builder.build().expect("repeat preparation idempotently");
+  // Repair republishes the directory; only the following no-op must preserve times.
+  let paths = [binary.clone(), directory.join("main.cjs"), directory.join("preload.cjs")];
+  let modified = paths.each_ref().map(|path| fs::metadata(path).unwrap().modified().unwrap());
+  let repeated = builder.build().expect("repeat preparation idempotently");
+  assert!(repeated.cleanup_warning.is_none(), "{:?}", repeated.cleanup_warning);
+  assert_eq!(repeated.directory, directory);
+  assert_eq!(repeated.binary, binary);
   assert_eq!(
-    fs::metadata(distribution().join("main.cjs"))
-      .unwrap()
-      .modified()
-      .unwrap(),
-    main_modified
+    paths.each_ref().map(|path| fs::metadata(path).unwrap().modified().unwrap()),
+    modified
   );
-  assert_eq!(
-    fs::metadata(&binary).unwrap().modified().unwrap(),
-    binary_modified
-  );
-  assert_eq!(
-    fs::read(distribution().join("electron-rs.json")).unwrap(),
-    marker
-  );
+  assert_eq!(fs::read(&repeated.binary).unwrap(), binary_bytes);
+  assert_eq!(fs::read(directory.join("main.cjs")).unwrap(), include_bytes!("../assets/main.cjs"));
+  assert_eq!(fs::read(directory.join("preload.cjs")).unwrap(), include_bytes!("../assets/preload.cjs"));
+  assert_eq!(fs::read(directory.join("electron-rs.json")).unwrap(), marker);
   let output = builder.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,platform:process.platform,arch:process.arch,answer:6*7}))"])
     .expect("run the staged real binary in Node mode");
+  assert!(output.status.success(), "{:?}", output);
   let result: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(
     result,
     json!({"electron":DEFAULT_VERSION,"platform":platform(),"arch":arch(),"answer":42})
   );
-  assert!(builder
+  let failed = builder
     .node(&[
       "-e",
       "process.stderr.write('bridge-node-error');process.exit(23)"
     ])
-    .unwrap_err()
-    .contains("bridge-node-error"));
+    .expect("collect nonzero Node output");
+  assert_eq!(failed.status.code(), Some(23));
+  assert!(failed.stdout.is_empty());
+  assert_eq!(failed.stderr, b"bridge-node-error");
+  let silent = builder.node(&["-e", "process.exit(17)"]).expect("collect silent Node failure");
+  assert_eq!(silent.status.code(), Some(17));
+  assert!(silent.stdout.is_empty() && silent.stderr.is_empty());
   assert_eq!(
     snapshot(&runtime_dist),
     before,
@@ -436,27 +444,31 @@ fn real_bridge() {
   let electron = &running.0;
   assert_eq!(electron.version, DEFAULT_VERSION);
   let events = electron.events().unwrap();
-  assert!(electron.events().unwrap_err().contains("already taken"));
+  assert!(electron.events().unwrap_err().to_string().contains("already taken"));
   let subscription = electron.subscribe();
   let (callback_tx, callback) = mpsc::channel();
   electron.on(move |event| {
     let _ = callback_tx.send(event);
   });
   let output = electron.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,answer:21*2,page:Buffer.from(process.argv[1]).toString('base64')}))", PAGE]).unwrap();
+  assert!(output.status.success(), "{:?}", output);
   let node: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(node["electron"], DEFAULT_VERSION);
   assert_eq!(node["answer"], 42);
-  assert!(electron
+  let failed = electron
     .node(&[
       "-e",
       "process.stderr.write('connected-node-error');process.exit(23)"
     ])
-    .unwrap_err()
-    .contains("connected-node-error"));
+    .expect("collect connected Node failure output");
+  assert_eq!(failed.status.code(), Some(23));
+  assert!(failed.stdout.is_empty());
+  assert_eq!(failed.stderr, b"connected-node-error");
   assert_eq!(
     electron
       .call("bridge.unknown", Value::Null, WAIT)
-      .unwrap_err(),
+      .unwrap_err()
+      .to_string(),
     "unknown method bridge.unknown"
   );
   for scheme in ["bridge", "ipc"] {
@@ -587,6 +599,7 @@ fn real_bridge() {
   assert!(electron
     .call("window.geometry", json!({"windowId":WINDOW}), WAIT)
     .unwrap_err()
+    .to_string()
     .contains("is gone"));
   electron.shutdown(); // Idempotent, including the guard's eventual shutdown.
   println!(
@@ -676,6 +689,7 @@ fn native_window_and_child(electron: &Electron, events: &Receiver<Value>) {
       WAIT
     )
     .unwrap_err()
+    .to_string()
     .contains("unknown webview"));
   call(electron, "window.hide", json!({"windowId":WINDOW}));
   geometry_matching(electron, "native hide", |geometry| {
@@ -693,5 +707,6 @@ fn native_window_and_child(electron: &Electron, events: &Receiver<Value>) {
   assert!(electron
     .call("window.geometry", json!({"windowId":WINDOW}), WAIT)
     .unwrap_err()
+    .to_string()
     .contains("unknown window"));
 }
