@@ -124,15 +124,17 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
       .lock()
       .unwrap()
       .replace(script.clone());
+    // Fire and forget: Tauri evaluates scripts from its event loop (channel
+    // sends, event emitters), so a page that is busy for longer than
+    // `IPC_TIMEOUT` must not block window events and IPC handling behind it.
     self
       .context
       .ipc
-      .call(
+      .post(
         "webview.eval",
         json!({ "webviewId": self.id, "script": script }),
         IPC_TIMEOUT,
       )
-      .map(|_| ())
       .map_err(create_webview_err)
   }
 

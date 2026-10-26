@@ -314,7 +314,11 @@ function installPolicyHandlers(target = session.defaultSession) {
   target.webRequest.onErrorOccurred(retireNavigation)
   // Pause the real request: preserve POST data, redirects and initiating frame.
   target.webRequest.onBeforeRequest((details, callback) => {
-    const contents = details.webContents ?? webContents.fromId(details.webContentsId)
+    // Requests raised without a page (protocol handlers, net.fetch) have no
+    // navigation policy, and `webContents.fromId(undefined)` throws: an
+    // uncaught main-process error opens a modal dialog that stalls every RPC.
+    const contents = details.webContents
+      ?? (details.webContentsId === undefined ? undefined : webContents.fromId(details.webContentsId))
     if (!['mainFrame', 'subFrame'].includes(details.resourceType) || !policyFor(contents)?.navigation) {
       callback({})
       return
@@ -863,7 +867,12 @@ function handle(method, params) {
       return createChildWebview(window, params)
     }
     case 'webview.eval': {
-      return contentsFor(params.webviewId).executeJavaScript(params.script, true)
+      const contents = contentsFor(params.webviewId)
+      // The runtime posts eval without waiting, so a failure is only visible here.
+      return contents.executeJavaScript(params.script, true).catch((error) => {
+        log('eval failed', contents.id, String(error), params.script.slice(0, 200))
+        throw error
+      })
     }
     case 'window.setTitle': {
       const window = windows.get(params.windowId)

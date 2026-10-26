@@ -10,3 +10,5 @@ target
 /source/*
 !/source/tauri
 !/source/electron
+
+skills

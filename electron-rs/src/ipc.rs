@@ -260,6 +260,36 @@ impl Electron {
     }
   }
 
+  /// Send an RPC without waiting for its reply.
+  ///
+  /// `eval` scripts have no useful reply, and the callers run on Tauri's event
+  /// loop: waiting for the page to execute each script would stall every window
+  /// event behind it. The reply is dropped even if Electron sends one.
+  pub fn post(&self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
+    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))
+      .map_err(|error| error.to_string())?;
+    line.push(b'\n');
+    if self.closed.load(Ordering::SeqCst) {
+      return Err(format!("Electron is gone ({method})"));
+    }
+    let written = self
+      .writer
+      .lock()
+      .map_err(|_| "writer lock poisoned".to_string())
+      .and_then(|mut writer| {
+        writer
+          .set_write_timeout(Some(timeout))
+          .and_then(|()| writer.write_all(&line))
+          .map_err(|error| error.to_string())
+      });
+    if let Err(error) = written {
+      self.shutdown();
+      return Err(format!("write Electron RPC `{method}`: {error}"));
+    }
+    Ok(())
+  }
+
   /// Run this Electron binary in Node mode.
   pub fn node(&self, args: &[&str]) -> Result<std::process::Output, String> {
     let mut command = Command::new(&self.binary);
@@ -540,11 +570,20 @@ mod tests {
     let peer = std::thread::spawn(move || {
       let mut reader = BufReader::new(peer);
       let mut line = String::new();
-      for method in ["echo", "timeout", "disconnect"] {
+      for method in ["notify", "echo", "timeout", "disconnect"] {
         line.clear();
         assert!(reader.read_line(&mut line).unwrap() > 0);
         let request: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["method"], method);
+        if method == "notify" {
+          // A reply to a posted call has no waiter and must be dropped.
+          writeln!(
+            reader.get_mut(),
+            "{}",
+            json!({"id":request["id"],"result":null})
+          )
+          .unwrap();
+        }
         if method == "echo" {
           writeln!(
             reader.get_mut(),
@@ -557,6 +596,11 @@ mod tests {
       }
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
+    electron.post("notify", Value::Null, timeout).unwrap();
+    assert!(
+      electron.pending.lock().unwrap().is_empty(),
+      "a posted call must not register a waiter"
+    );
     assert_eq!(electron.call("echo", Value::Null, timeout).unwrap(), 42);
     assert_eq!(future.recv_timeout(timeout).unwrap()["event"], "future");
     assert_eq!(
