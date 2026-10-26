@@ -208,7 +208,7 @@ fn exercise(handle: &ElectronRuntimeHandle) {
     json!(["undefined", "undefined", "undefined"])
   );
   let scale = WindowDispatch::<()>::scale_factor(&source.dispatcher).unwrap();
-  assert_eq!(eval(&child, "devicePixelRatio"), json!(scale));
+  assert_eq!(eval(&child, "devicePixelRatio").as_f64(), Some(scale));
   layout(&child, scale, [20, 30, 240, 160]);
   evidence("WebviewDispatch::bounds", "bounds", "native child bounds equal requested parent-relative rect and physical renderer viewport, not the host window rect");
   assert_eq!(

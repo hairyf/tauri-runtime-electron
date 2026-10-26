@@ -349,10 +349,10 @@ fn native_flag(window: &Window, flag: &str) -> Result<bool, String> {
       if (count of matches) is not 1 then error "Expected one real Electron AX window"
       set w to item 1 of matches
       if not (exists attribute attributeName of w) then error "Native AX attribute is unavailable"
-      set control to value of attribute attributeName of w
-      if control is missing value then return false
+      set axElement to (get value of attribute attributeName of w)
+      if axElement is missing value then return false
       if attributeName is "AXTitleUIElement" then return true
-      return value of attribute "AXEnabled" of control
+      return (get value of attribute "AXEnabled" of axElement)
     end tell
   end run"#;
   match probe("osascript", &["-e", source, &title, attribute])?.as_str() {

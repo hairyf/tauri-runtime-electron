@@ -536,7 +536,9 @@ function browserWindowOptions(config, params) {
     maximizable: config.maximizable ?? true,
     minimizable: config.minimizable ?? true,
     closable: config.closable ?? true,
-    focusable: config.focusable ?? true,
+    // Linux cannot undo Chromium's constructor-only kNo activation flag.
+    // Apply the requested state with setFocusable before the hidden host shows.
+    focusable: process.platform === 'linux' ? true : config.focusable ?? true,
     alwaysOnTop: config.alwaysOnTop ?? false,
     alwaysOnBottom: config.alwaysOnBottom ?? false,
     skipTaskbar: config.skipTaskbar ?? false,
@@ -587,10 +589,12 @@ function applyWebviewConfig(contents, config) {
 }
 
 function applyWindowConfig(window, config, constraints) {
+  if (process.platform === 'linux' && config.focusable === false) window.setFocusable(false)
   sizeConstraints.set(window, constraints)
   applySizeConstraints(window)
   setWindowSize(window, { width: config.width ?? 800, height: config.height ?? 600 })
   if (config.maximized && !config.fullscreen) window.maximize()
+  if (process.platform === 'darwin' && config.center && !config.maximized && !config.fullscreen) centerWindowOnDisplay(window)
   if (config.focus && config.focusable !== false && config.visible !== false) window.focus()
   if (config.visibleOnAllWorkspaces) window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   if (config.contentProtected) window.setContentProtection(true)
@@ -1152,6 +1156,15 @@ function displayForPoint(x, y, physical = true) {
   })
 }
 
+function centerWindowOnDisplay(window) {
+  const bounds = window.getBounds()
+  const workArea = screen.getDisplayMatching(bounds).workArea
+  window.setPosition(
+    Math.round(workArea.x + (workArea.width - bounds.width) / 2),
+    Math.round(workArea.y + (workArea.height - bounds.height) / 2),
+  )
+}
+
 /** Tauri monitors are physical pixels, Electron displays are DIPs. */
 function readDisplay(display) {
   const toPhysical = (rect) => physicalScreenRect(null, rect, display.scaleFactor)
@@ -1517,9 +1530,12 @@ function handle(method, params) {
     case 'window.contentProtected':
       findWindow(params.windowId).setContentProtection(params.protected)
       return null
-    case 'window.center':
-      findWindow(params.windowId).center()
+    case 'window.center': {
+      const window = findWindow(params.windowId)
+      if (process.platform === 'darwin') centerWindowOnDisplay(window)
+      else window.center()
       return null
+    }
     case 'window.requestAttention':
       findWindow(params.windowId).flashFrame(Boolean(params.flash))
       return null
@@ -1605,9 +1621,13 @@ function handle(method, params) {
     case 'window.hide':
       windows.get(params.windowId)?.hide()
       return null
-    case 'window.focus':
+    case 'window.focus': {
+      // macOS `app.show()` restores windows but intentionally does not activate
+      // the app; a Tauri focus request must make the Electron app frontmost.
+      if (process.platform === 'darwin') app.focus({ steal: true })
       windows.get(params.windowId)?.focus()
       return null
+    }
     case 'window.nativeHandle': {
       // Tauri's host-side code (menus, window effects, Win32 tweaks) needs the
       // native handle; the Buffer holds the HWND / NSView / X11 window id.

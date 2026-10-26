@@ -206,7 +206,8 @@ class Window extends EventEmitter {
   setClosable(value) { this.nativeCalls.push({ method: 'setClosable', value }); this.closable = value }
   isAlwaysOnTop() { return false }
   getTitle() { return this.options.title ?? '' }
-  focus() { this.focused = true }
+  focus() { this.focused = this.options.focusable !== false && this.focusable !== false }
+  setFocusable(value) { this.nativeCalls.push({ method: 'setFocusable', value }); this.focusable = value }
   show() {
     if (faults.show) throw new Error('window show failed')
     this.visible = true
@@ -904,6 +905,45 @@ switch (process.argv[2]) {
     result = { initial, vetoed, enabled, requested, disabled, vetoedAgain,
       destroyed: host.isDestroyed(), closedEvents,
       disconnected: { prevented: disconnected.lastClosePrevented, destroyed: disconnected.isDestroyed() } }
+    break
+  }
+  case 'linux-focus': {
+    context.process.platform = 'linux'
+    await call('window.create', { windowId: 62, window: { focusable: false, focus: false } })
+    const host = inspect('windows.get(62)')
+    const configured = { constructor: host.options.focusable, setterCalls: [...host.nativeCalls], focused: host.focused }
+    await call('window.focus', { windowId: 62 })
+    const blocked = host.focused
+    await call('window.focusable', { windowId: 62, focusable: true })
+    const setterDidNotFocus = host.focused === false
+    await call('window.focus', { windowId: 62 })
+    const enabled = host.focused
+    await call('window.focusable', { windowId: 62, focusable: false })
+    host.focused = false
+    await call('window.focus', { windowId: 62 })
+    result = { configured, blocked, setterDidNotFocus, enabled, disabled: host.focused }
+    break
+  }
+  case 'macos-center-focus': {
+    context.process.platform = 'darwin'
+    screen.getDisplayMatching = () => displays[1]
+    await call('window.create', { windowId: 63,
+      window: { width: 640, height: 400, center: true, focus: false } })
+    const host = inspect('windows.get(63)')
+    const builder = host.getBounds()
+    host.frame = { width: 20, height: 40 }
+    host.setBounds({ x: 2000, y: 50, width: 480, height: 340 })
+    await call('window.center', { windowId: 63 })
+    const centered = host.getBounds()
+    const focus = []
+    inspect('app').focus = (options) => focus.push({ app: options })
+    host.focus = () => focus.push('window')
+    await call('window.focus', { windowId: 63 })
+    context.process.platform = 'linux'
+    let nativeCenters = 0
+    host.center = () => { nativeCenters++ }
+    await call('window.center', { windowId: 63 })
+    result = { builder, centered, focus, nativeCenters }
     break
   }
   case 'lifecycle': {

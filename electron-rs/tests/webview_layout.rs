@@ -634,6 +634,33 @@ fn linux_native_button_state_is_not_a_requested_flag_mirror_and_close_policy_sti
 }
 
 #[test]
+fn linux_focusable_is_applied_before_show_without_an_irreversible_constructor_flag() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["linux-focus"],
+    ))
+    .unwrap();
+    assert_eq!(observed, json!({
+        "configured": { "constructor": true, "setterCalls": [{ "method": "setFocusable", "value": false }], "focused": false },
+        "blocked": false, "setterDidNotFocus": true, "enabled": true, "disabled": false,
+    }));
+}
+
+#[test]
+fn macos_center_uses_current_work_area_and_focus_activates_app_before_window() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["macos-center-focus"],
+    ))
+    .unwrap();
+    assert_eq!(observed, json!({
+        "builder": { "x": 2240, "y": 140, "width": 640, "height": 400, "scale": 2 },
+        "centered": { "x": 2320, "y": 170, "width": 480, "height": 340, "scale": 2 },
+        "focus": [{ "app": { "steal": true } }, "window"], "nativeCenters": 1,
+    }));
+}
+
+#[test]
 fn navigation_acknowledges_before_load_and_native_fullscreen_waits_for_real_events() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
