@@ -106,7 +106,8 @@ fn parse_ico(bytes: &[u8]) -> Result<Icon, String> {
   let mut images = Vec::with_capacity(count);
   for index in 0..count {
     let entry = &bytes[6 + index * 16..6 + (index + 1) * 16];
-    if le16(entry, 4)? != 1 { return Err("icon directory image planes must equal one".into()); }
+    // ICO directories may leave planes unspecified; the image header is validated below.
+    if le16(entry, 4)? > 1 { return Err("icon directory image planes must be zero or one".into()); }
     let size = le32(entry, 8)? as usize;
     let offset = le32(entry, 12)? as usize;
     let end = offset.checked_add(size).ok_or("icon image range overflows")?;
@@ -472,9 +473,17 @@ mod tests {
     dib[12..14].copy_from_slice(&1_u16.to_le_bytes());
     dib[14..16].copy_from_slice(&32_u16.to_le_bytes());
     bytes.extend_from_slice(&dib);
-    let icon = parse_ico(&bytes).unwrap();
-    assert_eq!((le16(&icon.group, 18).unwrap(), icon.images), (1, vec![dib]));
-    assert!(parse_ico(&bytes[..bytes.len() - 1]).is_err());
+    for planes in [0_u16, 1] {
+      bytes[10..12].copy_from_slice(&planes.to_le_bytes());
+      let icon = parse_ico(&bytes).unwrap();
+      assert_eq!((le16(&icon.group, 18).unwrap(), icon.images), (1, vec![dib.clone()]));
+      assert!(parse_ico(&bytes[..bytes.len() - 1]).is_err());
+    }
+    bytes[10..12].copy_from_slice(&2_u16.to_le_bytes());
+    assert!(parse_ico(&bytes).is_err());
+    bytes[10..12].copy_from_slice(&0_u16.to_le_bytes());
+    bytes[34..36].copy_from_slice(&0_u16.to_le_bytes());
+    assert!(parse_ico(&bytes).is_err(), "DIB image planes must still equal one");
   }
 
   #[test]

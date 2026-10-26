@@ -9,10 +9,10 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { createServer } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import apiChecks from './example-api-check.mjs'
-import transparentChecks from './example-transparent-check.mjs'
+import apiChecks from './api.mjs'
+import transparentChecks from './transparent.mjs'
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const artifacts = path.join(root, 'target', 'example-checks')
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const labelExpression = 'window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label'
@@ -628,7 +628,14 @@ async function check(name) {
   }
   const pages = async () => (await targets()).filter((target) => /^(tauri:|https?:|file:|data:)/.test(target.url))
   async function session(target) {
-    if (!sessions.has(target.id)) sessions.set(target.id, await Session.connect(target))
+    if (!sessions.has(target.id)) {
+      const page = await Session.connect(target)
+      sessions.set(target.id, page)
+      if (name === 'streaming') {
+        await page.call('Network.enable')
+        await page.call('Media.enable')
+      }
+    }
     return sessions.get(target.id)
   }
   const test = {
@@ -671,6 +678,16 @@ async function check(name) {
     report.rendererErrors = [...sessions.values()].flatMap((page) => page.events
       .filter((event) => event.method === 'Runtime.exceptionThrown' || (event.method === 'Runtime.consoleAPICalled' && event.params.type === 'error'))
       .map((event) => ({ target: page.target.url, ...event })))
+    if (name === 'streaming') {
+      report.streamingDiagnostics = await Promise.all([...sessions.values()].map(async (page) => ({
+        target: page.target.url,
+        video: await page.evaluate(`(() => {
+          const video = document.querySelector('video')
+          return video && { src: video.currentSrc, sources: [...video.querySelectorAll('source')].map(source => ({ src: source.src, type: source.type })), ready: video.readyState, network: video.networkState, paused: video.paused, time: video.currentTime, error: video.error && { code: video.error.code, message: video.error.message } }
+        })()`).catch((error) => ({ diagnosticError: error.message })),
+        events: page.events.filter((event) => event.method.startsWith('Media.') || ['Network.requestWillBeSent', 'Network.responseReceived', 'Network.loadingFailed'].includes(event.method)),
+      })))
+    }
     for (const page of sessions.values()) {
       try { await test.shot(page, `failure-${report.frames.length + 1}`, false) } catch {}
     }

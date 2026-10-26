@@ -97,14 +97,37 @@ The bundled bridge uses sandboxed, isolated renderers and main-frame IPC. Standa
 
 ## Checks
 
-From the repository root:
+From the repository root, with Node.js 24+, Rust and pnpm installed:
 
 ```bash
-cargo test --manifest-path electron-rs/Cargo.toml --locked
+pnpm run test:bridge:regressions
 node --check electron-rs/assets/main.cjs
 node --check electron-rs/assets/preload.cjs
 ```
 
-The crate's tests cover staged assets/resource mapping, metadata validation and pipelined handshake/event/RPC cleanup. They do not establish three-platform desktop behavior or release-signing correctness. For the Tauri adapter and desktop checks, see the [root README](../README.md).
+The crate's unit tests cover staged assets/resource mapping, metadata validation and pipelined handshake/event/RPC cleanup. Its [integration tests](tests/) keep protocol/IPC, downloads, child layout and webview policy with the code they exercise. Rust owns the assertions; small Node VM fixtures execute the production JavaScript with timer/native doubles. These regressions need no Electron process, display or source submodules.
+
+The separate [real bridge tests](tests/bridge.rs) are ignored by default. Run preparation first:
+
+```bash
+pnpm run test:bridge:prepare
+```
+
+This uses the actual pinned Electron release, exercises builder/resource mapping, branding, asset repair, repeated preparation and Node mode, and keeps a private distribution under `target/electron-bridge/<platform>-<arch>`. Acquisition may download Electron. On Linux, configure the staged sandbox **after preparation**, adjusting the architecture if needed:
+
+```bash
+sudo chown root:root target/electron-bridge/linux-x64/chrome-sandbox
+sudo chmod 4755 target/electron-bridge/linux-x64/chrome-sandbox
+```
+
+Then run with a desktop available:
+
+```bash
+pnpm run test:bridge
+# Linux with Xvfb and openbox installed:
+xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' sh -c 'openbox & sleep 1; pnpm run test:bridge'
+```
+
+The real test checks handshake, events/subscriptions/callbacks, Node success/failure, loaded-page preload and binary protocol IPC, native window/child webview operations and shutdown. It has bounded waits and removes only its own staging output; the uniquely named Electron profile under the user's app-data directory remains. Run preparation and execution serially because they share one staging path. These tests cover named public API paths and RPCs; they do not establish every native effect, three-platform execution or release-signing correctness. CI invokes both steps on Windows, macOS and Linux. For the Tauri adapter and example checks, see the [root README](../README.md#examples-and-checks).
 
 [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE-2.0).

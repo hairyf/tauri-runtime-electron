@@ -13,6 +13,15 @@
   },
   "scripts": {
     "example": "node scripts/example.mjs",
-    "check": "node scripts/example-check.mjs"
+    "test": "pnpm run test:bridge:regressions && pnpm run test:adapter && pnpm run test:checks",
+    "test:bridge:regressions": "cargo test --manifest-path electron-rs/Cargo.toml --locked",
+    "test:bridge:prepare": "cargo test --manifest-path electron-rs/Cargo.toml --locked --test bridge prepare_bridge -- --ignored --exact --test-threads=1 --nocapture",
+    "test:bridge": "cargo test --manifest-path electron-rs/Cargo.toml --locked --test bridge real_bridge -- --ignored --exact --test-threads=1 --nocapture",
+    "test:adapter": "cargo test --locked --lib --test build_config --test window_api --test coverage",
+    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs",
+    "test:runtime": "cargo test --locked -- --nocapture --test-threads=1",
+    "test:examples": "node tests/checks/examples.mjs",
+    "test:coverage": "node tests/checks/coverage.mjs --check",
+    "check": "node tests/checks/examples.mjs"
   }
 }

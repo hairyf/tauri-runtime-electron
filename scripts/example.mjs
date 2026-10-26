@@ -98,7 +98,14 @@ function acquireLock() {
     let owner
     try { owner = JSON.parse(readFileSync(lock, 'utf8')) } catch { /* Unknown owner: do not overwrite. */ }
     const active = alive(owner?.pid) || alive(owner?.childPid)
-    throw new Error(`${path.relative(root, lock)} ${active ? 'is in use' : 'has an unverified/stale owner'} (runner=${owner?.pid ?? '?'}, child=${owner?.childPid ?? '?'}). Confirm its process tree has exited before removing that lock; no processes were stopped.`)
+    // A hard-killed runner leaves its record behind; both recorded processes
+    // being gone is proof that nobody holds the copy, so take the lock over.
+    if (active || !Number.isSafeInteger(owner?.pid) || owner.pid <= 0) {
+      throw new Error(`${path.relative(root, lock)} ${active ? 'is in use' : 'has an unverified owner'} (runner=${owner?.pid ?? '?'}, child=${owner?.childPid ?? '?'}). Confirm its process tree has exited before removing that lock; no processes were stopped.`)
+    }
+    console.log(`[example] removing stale ${path.relative(root, lock)} (runner=${owner.pid}, child=${owner.childPid ?? '?'} exited)`)
+    rmSync(lock, { force: true })
+    lockFd = openSync(lock, 'wx')
   }
   record()
 }
@@ -323,6 +330,35 @@ tauri-utils = { path = "../../../crates/tauri-utils" }
     // Upstream reads this flag without tracking it. Invalidate an earlier build
     // made without the workspace config, then keep future Cargo caching correct.
     patch(path.join(app, 'build.rs'), 'fn main() {', 'fn main() {\n  println!("cargo:rerun-if-env-changed=__TAURI_WORKSPACE__");')
+    // Tauri 2 hands on_new_window a native WebView2/WKWebView/GTK opener. This
+    // runtime rejects such a handler at creation instead of fabricating one,
+    // which would fail the setup hook, so drop the demo window and its counter.
+    patch(entry, `        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let app_ = app.handle().clone();
+        let created_window_count = AtomicU64::new(0);
+`, '        // Electron cannot supply the native opener `on_new_window` requires.\n')
+    patch(entry, `          .menu(tauri::menu::Menu::default(app.handle())?)
+          .on_new_window(move |url, features| {
+            println!("new window requested: {url:?} {features:?}");
+
+            let number = created_window_count.fetch_add(1, Ordering::Relaxed);
+
+            let builder = WebviewWindowBuilder::new(
+              &app_,
+              format!("new-{number}"),
+              tauri::WebviewUrl::External("about:blank".parse().unwrap()),
+            )
+            .window_features(features)
+            .on_document_title_changed(|window, title| {
+              window.set_title(&title).unwrap();
+            })
+            .title(url.as_str());
+
+            let window = builder.build().unwrap();
+            tauri::webview::NewWindowResponse::Create { window }
+          });
+`, '          .menu(tauri::menu::Menu::default(app.handle())?);\n')
   }
   await ensureFrontend(config)
   if (name === 'streaming') {
