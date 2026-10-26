@@ -7,7 +7,6 @@ use crate::runtime::{
   position_payload, size_payload,
 };
 use serde_json::{json, Value};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tauri_runtime::{
   Result, UserEvent, WebviewDispatch,
@@ -75,7 +74,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     f: F,
   ) -> tauri_runtime::WebviewEventId {
     let id = self.context.next_webview_event_id();
-    self.context.add_webview_event_handler(self.id, id, Rc::new(f));
+    self.context.add_webview_event_handler(self.id, id, f);
     id
   }
 
@@ -124,16 +123,18 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
       .lock()
       .unwrap()
       .replace(script.clone());
+    // Fire and forget: Tauri evaluates scripts from its event loop (channel
+    // sends, event emitters), so a page that is busy for longer than
+    // `IPC_TIMEOUT` must not block window events and IPC handling behind it.
     self
       .context
       .ipc
-      .call(
+      .post(
         "webview.eval",
         json!({ "webviewId": self.id, "script": script }),
         IPC_TIMEOUT,
       )
-      .map(|_| ())
-      .map_err(create_webview_err)
+      .map_err(|error| tauri_runtime::Error::CreateWebview(Box::new(error)))
   }
 
   fn eval_script_with_callback<S: Into<String>>(
@@ -156,7 +157,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
         callback(value.to_string());
         Ok(())
       }
-      Err(e) => Err(create_webview_err(e)),
+      Err(e) => Err(create_webview_err(e.to_string())),
     }
   }
 
@@ -195,6 +196,8 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn close(&self) -> Result<()> {
+    // The main page can veto its window close. Cleanup follows webview.closed
+    // for children and window.closed for the main page.
     self.webview_call("webview.close", json!({})).map(|_| ())
   }
 
@@ -325,7 +328,7 @@ impl ElectronWebviewDispatcher {
       .context
       .ipc
       .call(method, params, IPC_TIMEOUT)
-      .map_err(create_webview_err)
+      .map_err(|error| tauri_runtime::Error::CreateWebview(Box::new(error)))
   }
 }
 

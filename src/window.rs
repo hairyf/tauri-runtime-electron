@@ -7,12 +7,12 @@ use crate::{
   runtime::{
     ElectronRuntime, Message, RuntimeContext, IPC_TIMEOUT, create_webview_impl,
     create_window_err, create_window_impl, position_payload, rect_position, rect_size,
-    size_payload,
+    size_payload, size_constraints_payload,
   },
   window_builder::ElectronWindowBuilder,
 };
 use serde_json::{json, Value};
-use std::{cell::RefCell, rc::Rc, sync::Weak};
+use std::{cell::RefCell, sync::Weak};
 use electron_rs::Electron as ElectronProcess;
 
 pub use tauri_utils::{config::{Color, WindowEffectsConfig}, WindowEffect as Effect, WindowEffectState as EffectState};
@@ -26,7 +26,7 @@ pub use tauri::window::EffectsBuilder;
 use tauri_runtime::{
   Icon, ProgressBarState, ProgressBarStatus, Result, UserAttentionType, UserEvent, WindowDispatch,
   WindowEventId,
-  dpi::{PhysicalPosition, PhysicalSize, PixelUnit, Position, Size},
+  dpi::{PhysicalPosition, PhysicalSize, Position, Size},
   monitor::Monitor,
   webview::{DetachedWebview, PendingWebview},
   window::{CursorIcon, DetachedWindow, PendingWindow, RawWindow, WindowEvent, WindowId, WindowSizeConstraints},
@@ -50,7 +50,7 @@ impl EffectsTarget {
       .ok_or_else(|| std::io::Error::other("Electron runtime has exited"))?
       .call("window.backgroundMaterial", json!({ "windowId": self.serial, "material": material }), IPC_TIMEOUT)
       .map(|_| ())
-      .map_err(std::io::Error::other)
+      .map_err(|error| std::io::Error::other(error.to_string()))
   }
 }
 
@@ -128,7 +128,7 @@ impl ElectronWindowDispatcher {
       .context
       .ipc
       .call(method, params, IPC_TIMEOUT)
-      .map_err(create_window_err)
+      .map_err(|error| create_window_err(error.to_string()))
   }
 
   /// Queries the live Electron window geometry and state.
@@ -149,7 +149,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, f: F) -> WindowEventId {
     let id = self.context.next_window_event_id();
-    self.context.add_window_event_handler(self.id, id, Rc::new(f));
+    self.context.add_window_event_handler(self.id, id, f);
     id
   }
 
@@ -200,8 +200,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(self.geometry()?["resizable"].as_bool().unwrap_or(true))
   }
 
-  // Electron's getters exist on macOS and Windows only; elsewhere the flag is
-  // always true, which is what the setter already cannot change.
+  // Electron's main process tracks requested values on Linux too.
   fn is_maximizable(&self) -> Result<bool> {
     Ok(self.geometry()?["maximizable"].as_bool().unwrap_or(true))
   }
@@ -306,9 +305,11 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
     #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
     {
-      let handle = self
-        .context
-        .native_handle(self.id)
+      #[cfg(windows)]
+      let handle = self.context.menu_owner_window(self.id)
+        .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
+      #[cfg(not(windows))]
+      let handle = self.context.native_handle(self.id)
         .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
       let handle = std::num::NonZeroIsize::new(handle)
         .ok_or(raw_window_handle::HandleError::Unavailable)?;
@@ -478,14 +479,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_size(&self, size: Size) -> Result<()> {
     #[cfg(windows)]
     {
-      let scale = <Self as WindowDispatch<T>>::scale_factor(self)?;
-      if !scale.is_finite() || scale <= 0.0 {
-        return Err(create_window_err("invalid window scale factor".into()));
-      }
-      let size = size.to_physical::<u32>(scale);
-      if size.width == 0 || size.height == 0 || size.width > i32::MAX as u32 || size.height > i32::MAX as u32 {
-        return Err(create_window_err("invalid or overflowing window size".into()));
-      }
+      let size = imp::constrained_client_size(size, &self.geometry()?)?;
       imp::set_client_size(self.context.native_handle(self.id)?, size)
     }
     #[cfg(not(windows))]
@@ -493,11 +487,11 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_min_size(&self, size: Option<Size>) -> Result<()> {
-    self.window_call("window.minSize", size.map(size_payload).unwrap_or(json!(null)))
+    self.window_call("window.minSize", size.map(size_payload).unwrap_or(json!({})))
   }
 
   fn set_max_size(&self, size: Option<Size>) -> Result<()> {
-    self.window_call("window.maxSize", size.map(size_payload).unwrap_or(json!(null)))
+    self.window_call("window.maxSize", size.map(size_payload).unwrap_or(json!({})))
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
@@ -545,19 +539,23 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     self.window_call("window.skipTaskbar", json!({ "skip": skip }))
   }
 
-  // Electron has no cursor control API; the renderer sets `cursor` in CSS.
-  fn set_cursor_grab(&self, _grab: bool) -> Result<()> {
-    crate::runtime::unsupported("WindowDispatch::set_cursor_grab", "Electron has no cursor API");
-    Ok(())
+  fn set_cursor_grab(&self, grab: bool) -> Result<()> {
+    #[cfg(windows)]
+    return imp::clip_cursor(self.context.native_handle(self.id)?, grab);
+    #[cfg(not(windows))]
+    {
+      let _ = grab;
+      crate::runtime::unsupported("WindowDispatch::set_cursor_grab", "Electron has no native pointer confinement API on this platform");
+      Ok(())
+    }
   }
 
   fn set_cursor_visible(&self, visible: bool) -> Result<()> {
-    let cursor = if visible { "default" } else { "none" };
-    self.window_call("window.cursor", json!({ "cursor": cursor }))
+    self.window_call("window.setCursorVisible", json!({ "visible": visible }))
   }
 
   fn set_cursor_icon(&self, icon: CursorIcon) -> Result<()> {
-    self.window_call("window.cursor", json!({ "cursor": css_cursor(icon) }))
+    self.window_call("window.setCursorIcon", json!({ "cursor": css_cursor(icon) }))
   }
 
   fn set_cursor_position<Pos: Into<Position>>(&self, position: Pos) -> Result<()> {
@@ -655,28 +653,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_size_constraints(&self, constraints: WindowSizeConstraints) -> Result<()> {
-    let scale = self.geometry()?["scaleFactor"]
-      .as_f64()
-      .unwrap_or(1.0)
-      .max(1.0);
-    let dip = |unit: Option<PixelUnit>| -> Option<f64> {
-      unit.map(|unit| match unit {
-        PixelUnit::Physical(unit) => unit.0 as f64 / scale,
-        PixelUnit::Logical(unit) => unit.0,
-      })
-    };
-    let min_width = dip(constraints.min_width).unwrap_or(0.0);
-    let min_height = dip(constraints.min_height).unwrap_or(0.0);
-    let max_width = dip(constraints.max_width).unwrap_or(0.0);
-    let max_height = dip(constraints.max_height).unwrap_or(0.0);
-    self.window_call(
-      "window.minSize",
-      json!({ "width": min_width, "height": min_height, "physical": false }),
-    )?;
-    self.window_call(
-      "window.maxSize",
-      json!({ "width": max_width, "height": max_height, "physical": false }),
-    )
+    self.window_call("window.sizeConstraints", json!({
+      "constraints": size_constraints_payload(constraints),
+    }))
   }
 
   fn set_theme(&self, theme: Option<Theme>) -> Result<()> {
@@ -732,7 +711,7 @@ fn color_css(color: tauri_utils::config::Color) -> String {
 
 /// Win32 tweaks that Electron has no API for but the window still supports.
 #[cfg(windows)]
-mod imp {
+pub(crate) mod imp {
   use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
   use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindow, IsZoomed,
@@ -749,6 +728,186 @@ mod imp {
 
   fn hwnd(handle: isize) -> HWND {
     HWND(handle as *mut std::ffi::c_void)
+  }
+
+  pub(crate) fn set_theme(handle: isize, dark: bool) -> tauri_runtime::Result<()> {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    let dark = windows::core::BOOL::from(dark);
+    // SAFETY: DWM copies this BOOL synchronously for the borrowed Electron HWND.
+    unsafe {
+      DwmSetWindowAttribute(hwnd(handle), DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const _ as *const std::ffi::c_void, std::mem::size_of_val(&dark) as u32)
+    }.map_err(|error| super::create_window_err(error.to_string()))
+  }
+
+  /// Muda needs an HWND owned by this UI thread to install its menu subclass.
+  #[derive(Debug)]
+  pub(crate) struct MenuOwner {
+    pub(crate) handle: isize,
+    pub(crate) mirrored: serde_json::Value,
+  }
+
+  thread_local! {
+    static MENU_ACTIONS: std::cell::RefCell<Vec<(isize, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
+  }
+
+  unsafe extern "system" fn menu_owner_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::{Foundation::LRESULT, UI::WindowsAndMessaging::{
+      DefWindowProcW, SIZE_MAXIMIZED, SIZE_MINIMIZED, SWP_SHOWWINDOW, WINDOWPOS,
+      WM_CLOSE, WM_SIZE, WM_WINDOWPOSCHANGING,
+    }};
+    let action = match message {
+      WM_CLOSE => Some("window.close"),
+      WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => Some("window.minimize"),
+      WM_SIZE if wparam.0 == SIZE_MAXIMIZED as usize => Some("window.maximize"),
+      _ => None,
+    };
+    if let Some(action) = action {
+      MENU_ACTIONS.with(|actions| actions.borrow_mut().push((window.0 as isize, action)));
+    }
+    if message == WM_CLOSE { return LRESULT(0); }
+    if message == WM_WINDOWPOSCHANGING {
+      // Predefined muda items call ShowWindow on the proxy; mirror the action
+      // while keeping its HWND invisible and unable to steal focus.
+      if let Some(position) = unsafe { (lparam.0 as *mut WINDOWPOS).as_mut() } {
+        position.flags = (position.flags & !SWP_SHOWWINDOW) | SWP_NOACTIVATE;
+      }
+    }
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+  }
+
+  impl MenuOwner {
+    pub(crate) fn new() -> Option<Self> {
+      use windows::Win32::{Foundation::HINSTANCE, System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{CreateWindowExW, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_POPUP}};
+      static CLASS: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+      let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.ok()?.0);
+      let class = windows::core::w!("TauriElectronMenuOwner");
+      if *CLASS.get_or_init(|| unsafe { RegisterClassW(&WNDCLASSW {
+        lpfnWndProc: Some(menu_owner_proc), hInstance: instance, lpszClassName: class,
+        ..Default::default()
+      }) }) == 0 { return None; }
+      let window = unsafe { CreateWindowExW(WINDOW_EX_STYLE(0), class, windows::core::w!(""),
+        WS_POPUP, 0, 0, 1, 1, None, None, Some(instance), None) }.ok()?;
+      Some(Self { handle: window.0 as isize, mirrored: serde_json::Value::Null })
+    }
+  }
+
+  #[test]
+  fn predefined_menu_actions_keep_proxy_hidden_and_repeatable() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      DestroyWindow, IsWindowVisible, SendMessageW, ShowWindow, SW_MINIMIZE, WM_CLOSE,
+    };
+    let owner = MenuOwner::new().unwrap();
+    let _ = take_menu_actions();
+    for command in [SW_MINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_MAXIMIZE] {
+      unsafe { let _ = ShowWindow(hwnd(owner.handle), command); }
+      let method = if command == SW_MINIMIZE { "window.minimize" } else { "window.maximize" };
+      assert_eq!(take_menu_actions(), [(owner.handle, method)]);
+      assert!(!unsafe { IsWindowVisible(hwnd(owner.handle)) }.as_bool());
+    }
+    unsafe { SendMessageW(hwnd(owner.handle), WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))); }
+    assert_eq!(take_menu_actions(), [(owner.handle, "window.close")]);
+    assert!(unsafe { IsWindow(Some(hwnd(owner.handle))) }.as_bool());
+    // No muda object references this test proxy.
+    unsafe { DestroyWindow(hwnd(owner.handle)) }.unwrap();
+  }
+
+  // ponytail: retain closed menu HWNDs until process exit because muda still
+  // retains their associations; destroy after a future menu-lifetime detach hook.
+
+  pub(crate) fn take_menu_actions() -> Vec<(isize, &'static str)> {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    let actions = MENU_ACTIONS.with(|actions| std::mem::take(&mut *actions.borrow_mut()));
+    for (owner, action) in &actions {
+      if *action != "window.close" {
+        unsafe {
+          let _ = ShowWindow(hwnd(*owner), SW_SHOWNOACTIVATE);
+          let _ = SetWindowPos(hwnd(*owner), None, 0, 0, 1, 1, SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+      }
+    }
+    actions
+  }
+
+  pub(crate) fn menu_snapshot(handle: isize) -> std::result::Result<serde_json::Value, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      GetMenu, GetMenuItemCount, GetMenuItemInfoW, GetMenuStringW, HMENU,
+      MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFT_SEPARATOR, MF_BYPOSITION,
+      MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_SUBMENU,
+    };
+    fn items(menu: HMENU, depth: usize) -> std::result::Result<serde_json::Value, String> {
+      if depth > 64 { return Err("menu nesting exceeds 64 levels".into()); }
+      let count = unsafe { GetMenuItemCount(Some(menu)) };
+      if count < 0 { return Err("could not read native menu".into()); }
+      let mut result = Vec::new();
+      for index in 0..count as u32 {
+        let mut info = MENUITEMINFOW {
+          cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+          fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_SUBMENU,
+          ..Default::default()
+        };
+        // SAFETY: read muda's live menu on the UI thread that owns its proxy.
+        unsafe { GetMenuItemInfoW(menu, index, true, &mut info) }.map_err(|error| error.to_string())?;
+        if info.fType.0 & MFT_SEPARATOR.0 != 0 {
+          result.push(serde_json::json!({ "type": "separator" }));
+          continue;
+        }
+        let length = unsafe { GetMenuStringW(menu, index, None, MF_BYPOSITION) };
+        let mut text = vec![0; length.max(0) as usize + 1];
+        let length = unsafe { GetMenuStringW(menu, index, Some(&mut text), MF_BYPOSITION) };
+        let text = String::from_utf16_lossy(&text[..length.max(0) as usize]);
+        let (label, accelerator) = text.split_once('\t').unwrap_or((&text, ""));
+        let mut item = serde_json::json!({
+          "commandId": info.wID, "label": label, "accelerator": accelerator,
+          "enabled": info.fState.0 & MFS_DISABLED.0 == 0,
+          "checked": info.fState.0 & MFS_CHECKED.0 != 0,
+        });
+        if !info.hSubMenu.0.is_null() { item["submenu"] = items(info.hSubMenu, depth + 1)?; }
+        result.push(item);
+      }
+      Ok(serde_json::Value::Array(result))
+    }
+    let menu = unsafe { GetMenu(hwnd(handle)) };
+    if menu.0.is_null() { Ok(serde_json::Value::Null) } else { items(menu, 0) }
+  }
+
+  pub(crate) fn dispatch_menu_command(handle: isize, command: u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_COMMAND};
+    // SAFETY: the runtime validates this against the current native menu before
+    // invoking muda. No RefCell borrow spans its potentially reentrant callback.
+    unsafe { SendMessageW(hwnd(handle), WM_COMMAND, Some(WPARAM(command as usize)), Some(LPARAM(0))); }
+  }
+
+  pub(crate) fn clip_cursor(handle: isize, grab: bool) -> tauri_runtime::Result<()> {
+    use windows::Win32::{Graphics::Gdi::ClientToScreen, UI::WindowsAndMessaging::ClipCursor};
+    // SAFETY: only copies the live client rectangle and applies an OS clip.
+    unsafe {
+      if !grab { return ClipCursor(None).map_err(|error| super::create_window_err(error.to_string())); }
+      let mut rect = RECT::default();
+      GetClientRect(hwnd(handle), &mut rect).map_err(|error| super::create_window_err(error.to_string()))?;
+      let mut top_left = POINT { x: rect.left, y: rect.top };
+      let mut bottom_right = POINT { x: rect.right, y: rect.bottom };
+      if !ClientToScreen(hwnd(handle), &mut top_left).as_bool()
+        || !ClientToScreen(hwnd(handle), &mut bottom_right).as_bool() {
+        return Err(super::create_window_err("could not locate cursor confinement area".into()));
+      }
+      ClipCursor(Some(&RECT { left: top_left.x, top: top_left.y, right: bottom_right.x, bottom: bottom_right.y }))
+        .map_err(|error| super::create_window_err(error.to_string()))
+    }
+  }
+
+  pub(crate) fn set_owner(handle: isize, owner: isize) -> tauri_runtime::Result<()> {
+    use windows::Win32::{Foundation::{GetLastError, SetLastError, WIN32_ERROR}, UI::WindowsAndMessaging::GWLP_HWNDPARENT};
+    // SAFETY: HWND ownership changes do not transfer memory; zero may also be a
+    // successful previous owner, so only GetLastError determines failure.
+    unsafe {
+      SetLastError(WIN32_ERROR(0));
+      SetWindowLongPtrW(hwnd(handle), GWLP_HWNDPARENT, owner);
+      let error = GetLastError();
+      if error.0 != 0 { return Err(super::create_window_err(std::io::Error::from_raw_os_error(error.0 as i32).to_string())); }
+    }
+    Ok(())
   }
 
   pub(super) fn is_maximized(handle: isize) -> tauri_runtime::Result<bool> {
@@ -777,6 +936,36 @@ mod imp {
         Err(tauri_runtime::Error::FailedToSendMessage)
       }
     }
+  }
+
+  pub(super) fn constrained_client_size(
+    size: tauri_runtime::dpi::Size,
+    geometry: &serde_json::Value,
+  ) -> tauri_runtime::Result<tauri_runtime::dpi::PhysicalSize<u32>> {
+    let scale = geometry["scaleFactor"].as_f64().unwrap_or_default();
+    if !scale.is_finite() || scale <= 0.0 {
+      return Err(super::create_window_err("invalid window scale factor".into()));
+    }
+    let size = size.to_physical::<u32>(scale);
+    if size.width == 0 || size.height == 0 || size.width > i32::MAX as u32 || size.height > i32::MAX as u32 {
+      return Err(super::create_window_err("invalid or overflowing window size".into()));
+    }
+    let limit = |key: &str| -> tauri_runtime::Result<u32> {
+      let value = geometry["contentConstraints"][key].as_f64()
+        .map(|value| (value * scale).round())
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(i32::MAX))
+        .ok_or_else(|| super::create_window_err("invalid or overflowing window size constraint".into()))?;
+      Ok(value as u32)
+    };
+    let clamp = |value: u32, minimum: &str, maximum: &str| -> tauri_runtime::Result<u32> {
+      let minimum = limit(minimum)?;
+      let maximum = limit(maximum)?;
+      Ok(if maximum > 0 { value.min(maximum) } else { value }.max(minimum))
+    };
+    Ok(tauri_runtime::dpi::PhysicalSize::new(
+      clamp(size.width, "minWidth", "maxWidth")?,
+      clamp(size.height, "minHeight", "maxHeight")?,
+    ))
   }
 
   fn outer_size_for_client(
@@ -816,6 +1005,24 @@ mod imp {
   }
 
   #[test]
+  fn native_client_size_honors_current_content_constraints() {
+    use tauri_runtime::dpi::{LogicalSize, PhysicalSize, Size};
+    use serde_json::json;
+    let mut geometry = json!({ "scaleFactor": 1.25, "contentConstraints": {
+      "minWidth": 300, "minHeight": 320, "maxWidth": 800, "maxHeight": 640,
+    }});
+    let physical = Size::Physical(PhysicalSize::new(1200, 100));
+    assert_eq!(constrained_client_size(physical, &geometry).unwrap(), PhysicalSize::new(1000, 400));
+    assert_eq!(constrained_client_size(Size::Logical(LogicalSize::new(400.0, 400.0)), &geometry).unwrap(), PhysicalSize::new(500, 500));
+    geometry["contentConstraints"] = json!({ "minWidth": 0, "minHeight": 0, "maxWidth": 0, "maxHeight": 0 });
+    assert_eq!(constrained_client_size(physical, &geometry).unwrap(), PhysicalSize::new(1200, 100));
+    geometry["contentConstraints"]["minHeight"] = json!(-1);
+    assert!(constrained_client_size(physical, &geometry).is_err());
+    geometry["scaleFactor"] = json!(0);
+    assert!(constrained_client_size(physical, &geometry).is_err());
+  }
+
+  #[test]
   fn client_size_keeps_live_native_insets() {
     use tauri_runtime::dpi::PhysicalSize;
     let outer = RECT { left: -1000, top: -200, right: 222, bottom: 758 };
@@ -827,7 +1034,7 @@ mod imp {
     assert_eq!(outer_size_for_client(PhysicalSize::new(1440, 1200), client, outer), None);
   }
 
-  pub(super) fn send_to_bottom(handle: isize) {
+  pub(crate) fn send_to_bottom(handle: isize) {
     // SAFETY: z-order only, no geometry or focus change.
     unsafe {
       let _ = SetWindowPos(

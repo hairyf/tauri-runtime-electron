@@ -101,11 +101,11 @@ Calls use normal Tauri IPC/ACL. Only Acrylic, Mica and Tabbed on Windows 11 22H2
 
 See the [method coverage](docs/coverage.md) for platform details. It describes implementation paths, not verified capabilities.
 
-- Tauri native menus, callbacks, accelerators and popup attachment are unsupported. Cross-process IDs do not provide local WebView2, GTK or AppKit objects: `with_webview` errors without calling the callback; macOS native window handles and WKWebView data-store operations are unavailable.
+- Windows attached Tauri menus are mirrored to Electron; commands and accelerators dispatch through a Rust UI-thread menu owner. Menu changes synchronize during the event pump. Native menu integration on macOS/Linux and popup placement remain unverified. Cross-process IDs do not provide local WebView2, GTK or AppKit objects: `with_webview` errors without calling the callback; macOS native window handles and WKWebView data-store operations are unavailable.
 - A configured `new_window_handler` fails creation; page `window.open` is denied without opening an external browser. Accepted navigation resumes the original request, preserving POST data and redirects. A subframe veto affects only that frame; Chromium may show an error page there.
 - Initialization scripts keep their frame scope; IPC is main-frame-only. `convertFileSrc` still needs `protocol-asset` and an `assetProtocol` scope. Matching resolved `data_directory` paths share a session; incognito webviews have separate in-memory sessions.
 - Downloads stay private until complete and first approved by the host, then publish without overwriting. Publication failures retain the staged file and report its path; denial, timeout and destruction clean it up. Exit vetoes/codes are respected: `run_return` returns the code, while `run` exits the Rust process.
-- macOS transparent/hidden titles and runtime title-bar-style changes are unsupported. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
+- Configured title-bar styles and hidden titles map to Electron window options; runtime title-bar-style changes remain unsupported. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
 
 ## Examples and checks
 
@@ -117,14 +117,29 @@ pnpm example                         # list examples
 pnpm example helloworld
 pnpm example transparent
 pnpm example commands --prepare-only
-pnpm check helloworld state
-node scripts/coverage.mjs --check
+pnpm test
 cargo check --locked --all-targets --all-features
-cargo test --manifest-path electron-rs/Cargo.toml --locked
 ```
 
-The [example runner](scripts/example.mjs) adapts copies under `target/example/tauri`, preserving framework sources and original pages/commands/CSP/ACL/Isolation. Run examples serially; `--prepare-only` keeps the generated app. The [checker](scripts/example-check.mjs) saves assertions, logs and original screenshots under `target/example-checks/<name>/`; missing platform/device prerequisites are `blocked`, and both `blocked` and `failed` exit nonzero. Visual review remains `pending` until screenshots are inspected and recorded in `visual-review.json`.
+Tests follow code ownership:
 
-The root `cargo test` includes [window smoke](tests/runtime_smoke.rs) and [exit lifecycle](tests/runtime_lifecycle.rs) checks that need a desktop (Linux can use `xvfb-run`), cover named subsets and report skips. CI configuration is not proof of a passing run or three-platform/native-device validation. Development file arguments do not verify installed file associations. See [acceptance guidance](docs/acceptance.md).
+- [electron-rs tests](electron-rs/tests/) own acquisition, metadata and bridge behavior. Protocol/IPC, downloads, child layout and webview policy stay here, with Rust assertions over small Node VM fixtures executing the production JavaScript against native doubles.
+- [Root tests](tests/) own the Tauri adapter, library window API and examples. JavaScript checks live in [tests/checks](tests/checks/), and [tests/common](tests/common/mod.rs) supplies the root Rust helper. Module unit tests stay beside their implementation under [src](src/).
+- [scripts](scripts/) contains environment/native helpers and the example launch entry. It does not own test assertions.
+
+[package.json](package.json) provides the shared entry points used by CI:
+
+| Command | Scope and prerequisites |
+| --- | --- |
+| `pnpm test` | Bridge regressions, adapter unit/build/API/document tests and effects/evidence checks. No desktop is needed; the root build script still prepares Electron and the coverage check reads the Tauri submodule. |
+| `pnpm run test:bridge:prepare` | Stage a private real Electron distribution under `target/electron-bridge`, exercise builder/resource/branding/Node operations and keep it for the next command. |
+| `pnpm run test:bridge` | Use that prepared distribution for handshake, subscriptions, loaded-page preload/protocol IPC, native window/child webview RPCs and shutdown. Requires a desktop; see the [bridge setup](electron-rs/README.md#checks) for Linux sandbox permissions. |
+| `pnpm run test:runtime` | All root Cargo tests, including acquisition, [window smoke](tests/runtime_smoke.rs) and [exit lifecycle](tests/runtime_lifecycle.rs). Requires a desktop; Linux uses Xvfb and a window manager. |
+| `pnpm run test:examples helloworld state` | Build and check the selected original examples serially; `pnpm check` is an alias. Requires a desktop and example dependencies. |
+| `pnpm run test:coverage` | Check that the generated method-coverage document is current; regenerate with `node tests/checks/coverage.mjs --write`. |
+
+The [example runner](scripts/example.mjs) adapts copies under `target/example/tauri`, preserving framework sources and original pages/commands/CSP/ACL/Isolation. Run examples serially; `--prepare-only` keeps the generated app. The [checker](tests/checks/examples.mjs) saves assertions, logs and original screenshots under `target/example-checks/<name>/`; missing platform/device prerequisites are `blocked`, and both `blocked` and `failed` exit nonzero. Visual review remains `pending` until screenshots are inspected and recorded in `visual-review.json`.
+
+The real bridge tests are explicitly ignored by default and run separately in CI. Desktop tests cover named subsets and report platform skips; the coverage test checks generated documentation. CI configuration is not proof of a passing run or three-platform/native-device validation. Development file arguments do not verify installed file associations. See [acceptance guidance](docs/acceptance.md).
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE-2.0).

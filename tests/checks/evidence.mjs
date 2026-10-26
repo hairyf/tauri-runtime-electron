@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events'
 import { win32 as path } from 'node:path'
 import vm from 'node:vm'
 
-const source = readFileSync(new URL('./example-check.mjs', import.meta.url), 'utf8')
+const source = readFileSync(new URL('./examples.mjs', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
 const nativeStart = source.indexOf('function nativeBlocked(')
 const nativeEnd = source.indexOf('\nfunction nativeWindow(')
 assert.ok(nativeStart >= 0 && nativeEnd > nativeStart)
@@ -71,4 +71,35 @@ assert.throws(() => vm.runInNewContext(cleanup, cleanupContext), /redirected dir
 cleanupContext.directory = 'D:\\repo\\other'
 assert.throws(() => vm.runInNewContext(cleanup, cleanupContext), /inside target\/example-checks/)
 assert.equal(removed.length, 4)
-console.log('native timeout diagnostics, failed observation, and scoped evidence cleanup passed')
+const sessionStart = source.indexOf('  async function session(target) {')
+const sessionEnd = source.indexOf('  const test = {', sessionStart)
+assert.ok(sessionStart >= 0 && sessionEnd > sessionStart)
+for (const name of ['streaming', 'helloworld']) {
+  const calls = []
+  await vm.runInNewContext(`${source.slice(sessionStart, sessionEnd)}\n(async () => { await session({ id: 'page' }); await session({ id: 'page' }) })()`, {
+    name, sessions: new Map(), Session: { connect: async () => ({ call: async method => calls.push(method) }) },
+  })
+  assert.deepEqual(calls, name === 'streaming' ? ['Network.enable', 'Media.enable'] : [])
+}
+const diagnosticsStart = source.indexOf("    if (name === 'streaming') {\n      report.streamingDiagnostics")
+const diagnosticsEnd = source.indexOf('    for (const page of sessions.values()) {', diagnosticsStart)
+assert.ok(diagnosticsStart >= 0 && diagnosticsEnd > diagnosticsStart)
+const events = [
+  { method: 'Media.playerErrorsRaised', params: { errors: [{ errorType: 'pipeline_error' }] } },
+  { method: 'Network.loadingFailed', params: { errorText: 'net::ERR_FAILED' } },
+  { method: 'Runtime.consoleAPICalled' },
+]
+const report = { error: 'original streaming timeout' }
+await vm.runInNewContext(`(async () => { ${source.slice(diagnosticsStart, diagnosticsEnd)} })()`, {
+  name: 'streaming', report, Promise,
+  sessions: new Map([
+    ['live', { target: { url: 'tauri://localhost/' }, evaluate: async () => ({ src: 'stream://localhost/video.mp4', ready: 0, network: 2 }), events }],
+    ['closed', { target: { url: 'tauri://localhost/closed' }, evaluate: async () => { throw new Error('target closed') }, events: [] }],
+  ]),
+})
+assert.equal(report.error, 'original streaming timeout')
+assert.equal(report.streamingDiagnostics[0].video.src, 'stream://localhost/video.mp4')
+assert.equal(report.streamingDiagnostics[0].video.network, 2)
+assert.deepEqual(report.streamingDiagnostics[0].events, events.slice(0, 2))
+assert.equal(report.streamingDiagnostics[1].video.diagnosticError, 'target closed')
+console.log('native timeout diagnostics, scoped evidence cleanup, and streaming failure evidence passed')

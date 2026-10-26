@@ -21,8 +21,8 @@ env:
   GIT_CONFIG_VALUE_0: main
 
 jobs:
-  node-regressions:
-    name: Node regressions (${{ matrix.os }})
+  regressions:
+    name: Bridge and script regressions (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,30 +35,25 @@ jobs:
         with:
           node-version: '24'
 
-      # Production scripts run in a VM with native objects replaced by doubles.
-      # No package install, source submodules, Electron process or GUI is needed.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+          run_install: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Rust owns expectations; Node executes production JavaScript against
+      # native doubles. This job needs no source submodules, Electron or GUI.
       - name: Check Electron script syntax
         run: |
           node --check electron-rs/assets/main.cjs
           node --check electron-rs/assets/preload.cjs
 
-      - name: Check protocols and authenticated IPC
-        run: node scripts/protocol-check.mjs
+      - name: Test Electron bridge regressions
+        run: pnpm run test:bridge:regressions
 
-      - name: Check native child layout and dispatch
-        run: node scripts/webview-layout-check.mjs
-
-      - name: Check download lifecycle
-        run: node scripts/download-check.mjs
-
-      - name: Check generic webview policy and initialization
-        run: node scripts/webview-policy-check.mjs
-
-      - name: Check library window API and effects queue
-        run: node scripts/window-api-check.mjs
-
-      - name: Check native evidence failure diagnostics
-        run: node scripts/example-evidence-check.mjs
+      - name: Check example effects and evidence diagnostics
+        run: pnpm run test:checks
 
   build:
     name: ${{ matrix.os }}
@@ -77,10 +72,14 @@ jobs:
         with:
           node-version: '24'
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+          run_install: false
+
       - uses: dtolnay/rust-toolchain@stable
 
-      # `tauri-runtime` 2.x links against the Linux webview stack even though the
-      # window itself is Electron's, so its system libraries must be present.
+      # `tauri-runtime` 2.x exposes Linux webview types even with Electron windows.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -94,64 +93,85 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            electron-rs/target
             ~/.cache/electron
             ~/AppData/Local/electron/Cache
           key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.os }}-cargo-
 
-      # The build script downloads this platform's Electron release, so the
-      # steps below also prove that acquisition works on every target.
       - name: Check
         run: cargo check --locked --all-targets --all-features
 
-      - name: Test independent Electron glue
-        run: cargo test --manifest-path electron-rs/Cargo.toml --locked
+      # This private distribution is separate from the Tauri adapter's runtime.
+      # Prepare before chmod: branding replaces the distribution and its modes.
+      - name: Prepare real Electron bridge
+        run: pnpm run test:bridge:prepare
 
-      # The smoke test opens a real Electron window and checks its named desktop
-      # subset, reporting platform skips. Official-example GUI checks are separate.
-      # Linux has no display on the runners, hence the virtual one.
-      # Chromium refuses to start unless its sandbox helper is setuid root, which
-      # a downloaded release archive cannot carry.
-      - name: Fix the Chromium sandbox helper
+      - name: Configure the bridge Chromium sandbox
         if: runner.os == 'Linux'
         run: |
-          sudo chown root:root target/electron/*/chrome-sandbox
-          sudo chmod 4755 target/electron/*/chrome-sandbox
+          sudo chown root:root target/electron-bridge/linux-x64/chrome-sandbox
+          sudo chmod 4755 target/electron-bridge/linux-x64/chrome-sandbox
 
-      - name: Test
+      - name: Test real Electron bridge
+        if: runner.os != 'Linux'
+        run: pnpm run test:bridge
+
+      - name: Test real Electron bridge under a virtual display
+        if: runner.os == 'Linux'
+        run: >
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
+          sh -c 'openbox & sleep 1; pnpm run test:bridge'
+
+      # A build/rebrand replaces the adapter's distribution too. Reapply the
+      # sandbox owner/mode after every Cargo build and before each executable.
+      - name: Configure the runtime Chromium sandbox runner
+        if: runner.os == 'Linux'
+        run: |
+          cat > "$RUNNER_TEMP/electron-runner" <<'SH'
+          #!/bin/sh
+          set -eu
+          helper="$GITHUB_WORKSPACE/target/electron/linux-x64/chrome-sandbox"
+          sudo chown root:root "$helper"
+          sudo chmod 4755 "$helper"
+          exec "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/electron-runner"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$RUNNER_TEMP/electron-runner" >> "$GITHUB_ENV"
+
+      - name: Test runtime and adapter
         if: runner.os != 'Linux'
         env:
           TAURI_RUNTIME_ELECTRON_TRACE: '1'
-        run: cargo test -- --nocapture
+        run: pnpm run test:runtime
 
-      # Maximizing and resizing are window-manager operations, and a bare X
-      # server has none, so openbox runs inside the virtual display.
-      - name: Test under a virtual display
+      # Maximizing and resizing need a window manager as well as an X server.
+      - name: Test runtime and adapter under a virtual display
         if: runner.os == 'Linux'
         env:
           TAURI_RUNTIME_ELECTRON_TRACE: '1'
         run: >
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
-          sh -c 'openbox & sleep 1; cargo test -- --nocapture'
+          sh -c 'openbox & sleep 1; pnpm run test:runtime'
 
       - name: Build
-        run: cargo build --lib
+        run: cargo build --locked --lib
 
       # One checker runs all six sequentially in the shared workspace.
       # Functional assertions leave visualReview pending for human review.
       - name: Check official examples
         if: runner.os != 'Linux'
-        run: node scripts/example-check.mjs helloworld state resources commands isolation streaming
+        run: pnpm run test:examples helloworld state resources commands isolation streaming
 
       - name: Check official examples under a virtual display
         if: runner.os == 'Linux'
         run: >
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
-          sh -c 'openbox & sleep 1; node scripts/example-check.mjs helloworld state resources commands isolation streaming'
+          sh -c 'openbox & sleep 1; pnpm run test:examples helloworld state resources commands isolation streaming'
 
       - name: Check transparent window example
         if: runner.os == 'Windows'
-        run: node scripts/example-check.mjs transparent
+        run: pnpm run test:examples transparent
 
       - name: Upload example evidence
         if: always()
@@ -161,9 +181,7 @@ jobs:
           path: target/example-checks/
           if-no-files-found: warn
 
-  # The docs are generated from the checked-out `source/tauri` tree, so this job
-  # fails whenever the implementation and docs/coverage.md disagree. That is what
-  # keeps stubs and panics visible in the PR diff instead of only in the source.
+  # Generated from the checked-out `source/tauri` tree; keep the document current.
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -172,8 +190,17 @@ jobs:
         with:
           submodules: true
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+          run_install: false
+
       - name: Check docs/coverage.md is current
-        run: node scripts/coverage.mjs --check
+        run: pnpm run test:coverage
 
       - name: Summarize coverage
         if: always()
@@ -181,6 +208,6 @@ jobs:
           {
             echo '### tauri-runtime coverage'
             echo '```'
-            node scripts/coverage.mjs
+            node tests/checks/coverage.mjs
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
