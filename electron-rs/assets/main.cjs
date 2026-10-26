@@ -533,6 +533,8 @@ function browserWindowOptions(config, params) {
     transparent: config.transparent ?? false,
     show: config.visible ?? true,
     fullscreen: config.fullscreen ?? false,
+    // Explicit fullscreen:false disables AppKit fullscreen unless this is set.
+    fullscreenable: true,
     maximizable: config.maximizable ?? true,
     minimizable: config.minimizable ?? true,
     closable: config.closable ?? true,
@@ -1773,7 +1775,7 @@ function handle(method, params) {
     case 'window.trafficLight': {
       const window = findWindow(params.windowId)
       if (typeof window.setWindowButtonPosition === 'function') {
-        window.setWindowButtonPosition({ x: params.x, y: params.y })
+        window.setWindowButtonPosition({ x: toDip(window, params, 'x'), y: toDip(window, params, 'y') })
       }
       return null
     }

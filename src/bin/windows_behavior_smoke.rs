@@ -38,21 +38,28 @@ mod win {
   use windows::{
     core::PCWSTR,
     Win32::{
-      Foundation::{HWND, LPARAM, WPARAM},
+      Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
       Graphics::{
         Dwm::DwmIsCompositionEnabled,
         Gdi::{
-          GetDC, GetDIBits, GetObjectW, ReleaseDC, DeleteObject, BITMAP, BITMAPINFO,
-          BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+          ClientToScreen, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, MonitorFromWindow,
+          ReleaseDC, DeleteObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+          DIB_RGB_COLORS, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         },
       },
+      UI::HiDpi::{
+        GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+        DPI_AWARENESS_PER_MONITOR_AWARE,
+      },
       UI::WindowsAndMessaging::{
-        FindWindowW, GetClassNameW, GetIconInfo, GetParent, GetWindow,
-        GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowThreadProcessId,
-        IsWindow, IsWindowVisible, SendMessageTimeoutW, GWL_EXSTYLE, GWL_STYLE,
+        ClipCursor, FindWindowExW, FindWindowW, GetClassNameW, GetClientRect, GetClipCursor,
+        GetIconInfo, GetParent, GetPhysicalCursorPos, GetWindow, GetWindowDisplayAffinity,
+        GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+        SendMessageTimeoutW, SetPhysicalCursorPos, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
         GW_OWNER, HICON, ICONINFO, ICON_BIG, ICON_SMALL, SMTO_ABORTIFHUNG,
-        SMTO_ERRORONEXIT, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_GETICON, WS_CHILD,
-        WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+        SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_GETICON, WS_CHILD, WS_EX_APPWINDOW,
+        WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
       },
     },
   };
@@ -112,6 +119,10 @@ mod win {
   }
 
   fn create(handle: &ElectronRuntimeHandle, prefix: &str, builder: ElectronWindowBuilder) -> Check<NativeWindow> {
+    create_native(handle, prefix, builder, None)
+  }
+
+  fn create_native(handle: &ElectronRuntimeHandle, prefix: &str, builder: ElectronWindowBuilder, parent: Option<HWND>) -> Check<NativeWindow> {
     let label = format!("windows-behavior-{}", SERIAL.fetch_add(1, Ordering::SeqCst));
     let title = format!("{prefix}-{label}");
     let pending = api(PendingWindow::<(), ElectronRuntime>::new(
@@ -125,9 +136,17 @@ mod win {
     let hwnd = loop {
       // SAFETY: the NUL-terminated title lives through the OS lookup; no proxy
       // handle, dispatcher getter or process-local object pointer is involved.
-      if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) } {
-        break hwnd
-      }
+      let found = unsafe {
+        if let Some(parent) = parent {
+          FindWindowExW(Some(parent), None, PCWSTR::null(), PCWSTR(title.as_ptr()))
+            // Discover an incorrectly owned top-level window too, so the
+            // relationship assertions diagnose a parent-to-owner regression.
+            .or_else(|_| FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())))
+        } else {
+          FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()))
+        }
+      };
+      if let Ok(hwnd) = found { break hwnd }
       if start.elapsed() >= WAIT {
         let _ = WindowDispatch::<()>::destroy(&detached.dispatcher);
         return Err("UNKNOWN: FindWindowW could not discover the unique Electron title on this desktop".into())
@@ -244,6 +263,214 @@ mod win {
     wait(|| Ok(!unsafe { IsWindow(Some(second.hwnd)) }.as_bool()), "OS destroys second owned HWND with its final owner")
   }
 
+  fn physical_desktop() -> Check {
+    // Geometry and ClipCursor must use physical coordinates in both processes.
+    let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+    if awareness == DPI_AWARENESS_PER_MONITOR_AWARE { Ok(()) }
+    else { Err("UNKNOWN: native observer thread is not per-monitor DPI aware".into()) }
+  }
+
+  fn frame(hwnd: HWND) -> Check<RECT> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }
+      .map_err(|error| format!("UNKNOWN: GetWindowRect: {error}"))?;
+    Ok(rect)
+  }
+
+  fn client_rect(hwnd: HWND) -> Check<RECT> {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut rect) }
+      .map_err(|error| format!("UNKNOWN: GetClientRect: {error}"))?;
+    let mut first = POINT { x: rect.left, y: rect.top };
+    let mut last = POINT { x: rect.right, y: rect.bottom };
+    // SAFETY: HWND is independently discovered; Win32 only copies these points.
+    if !unsafe { ClientToScreen(hwnd, &mut first) }.as_bool()
+      || !unsafe { ClientToScreen(hwnd, &mut last) }.as_bool() {
+      return Err("UNKNOWN: native client-to-screen coordinates unavailable".into())
+    }
+    Ok(RECT { left: first.x, top: first.y, right: last.x, bottom: last.y })
+  }
+
+  fn work_area(hwnd: HWND) -> Check<RECT> {
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+      return Err("UNKNOWN: monitor work area unavailable".into())
+    }
+    Ok(info.rcWork)
+  }
+
+  fn move_native(hwnd: HWND, x: i32, y: i32) -> Check {
+    // Independent native stimulus, not a dispatcher position setter or cache.
+    unsafe { SetWindowPos(hwnd, None, x, y, 0, 0,
+      SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) }
+      .map_err(|error| format!("UNKNOWN: external SetWindowPos denied: {error}"))?;
+    wait(|| { let actual = frame(hwnd)?; Ok(actual.left == x && actual.top == y) },
+      "external SetWindowPos must move the real HWND")
+      .map_err(|error| format!("UNKNOWN: independent native movement stimulus unavailable: {error}"))
+  }
+
+  fn parent_checks(handle: &ElectronRuntimeHandle, prefix: &str) -> Check {
+    physical_desktop()?;
+    let a = create(handle, prefix, ElectronWindowBuilder::new())?;
+    let b = create(handle, prefix, ElectronWindowBuilder::new())?;
+    let first = create_native(handle, prefix,
+      ElectronWindowBuilder::new().parent(b.hwnd).parent(a.hwnd), Some(a.hwnd))?;
+    let second = create_native(handle, prefix,
+      ElectronWindowBuilder::new().parent(a.hwnd).parent(b.hwnd), Some(b.hwnd))?;
+    let owned = create(handle, prefix, ElectronWindowBuilder::new().owner(a.hwnd))?;
+    for (child, parent) in [(&first, &a), (&second, &b)] {
+      require(child.pid == parent.pid, "parent and child must belong to the external Electron process")?;
+      let (native_parent, owner, style) = unsafe {
+        (GetParent(child.hwnd).ok(), GetWindow(child.hwnd, GW_OWNER).ok(),
+          GetWindowLongPtrW(child.hwnd, GWL_STYLE) as u32)
+      };
+      require(native_parent == Some(parent.hwnd) && owner.is_none()
+        && style & WS_CHILD.0 != 0 && style & WS_POPUP.0 == 0,
+        format!("parent() must create a true child: GetParent={native_parent:?}, GW_OWNER={owner:?}, style={style:#x}"))?;
+      // SetWindowPos on a child is parent-client relative. Keep the entire
+      // native child frame inside that independently measured client rectangle.
+      unsafe { SetWindowPos(child.hwnd, None, 17, 19, 180, 100,
+        SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE) }
+        .map_err(|error| format!("UNKNOWN: place native child in parent client area: {error}"))?;
+      wait(|| {
+        let outer = frame(child.hwnd)?;
+        let client = client_rect(parent.hwnd)?;
+        Ok(outer.left - client.left == 17 && outer.top - client.top == 19
+          && outer.right <= client.right && outer.bottom <= client.bottom)
+      }, "child frame must occupy the requested parent-client offset")
+        .map_err(|error| format!("UNKNOWN: independent child-placement stimulus unavailable: {error}"))?;
+    }
+    require(unsafe { GetWindow(owned.hwnd, GW_OWNER) }.ok() == Some(a.hwnd)
+      && unsafe { GetWindowLongPtrW(owned.hwnd, GWL_STYLE) } as u32 & WS_CHILD.0 == 0,
+      "owner control must be a native owned top-level window, not a child")?;
+    let owned_before = frame(owned.hwnd)?;
+    let second_before = frame(second.hwnd)?;
+    for (parent, child) in [(&a, &first), (&b, &second)] {
+      let before = frame(parent.hwnd)?;
+      let local = frame(child.hwnd)?;
+      let client = client_rect(parent.hwnd)?;
+      let work = work_area(parent.hwnd)?;
+      let x = work.left + 40;
+      let y = work.top + 40;
+      if work.right - work.left < before.right - before.left + 100
+        || work.bottom - work.top < before.bottom - before.top + 100 {
+        return Err("UNKNOWN: monitor work area cannot hold the native movement probe".into())
+      }
+      let x = if x == before.left { x + 37 } else { x };
+      let y = if y == before.top { y + 29 } else { y };
+      move_native(parent.hwnd, x, y)?;
+      wait(|| {
+        let moved = frame(child.hwnd)?;
+        let origin = client_rect(parent.hwnd)?;
+        Ok(moved.left == local.left + x - before.left && moved.top == local.top + y - before.top
+          && moved.left - origin.left == local.left - client.left
+          && moved.top - origin.top == local.top - client.top)
+      }, "moving only the real parent must carry its child at the same client offset")?;
+      require(frame(owned.hwnd)? == owned_before, "moving the parent must not translate the owner control")?;
+      if parent.hwnd == a.hwnd {
+        require(frame(second.hwnd)? == second_before, "child of the opposite final parent must not move")?;
+      }
+    }
+    api(WindowDispatch::<()>::destroy(&a.dispatcher), "destroy first native parent")?;
+    wait(|| Ok(!unsafe { IsWindow(Some(first.hwnd)) }.as_bool()
+      && !unsafe { IsWindow(Some(owned.hwnd)) }.as_bool()), "parent destruction must remove its child and owned control")?;
+    require(unsafe { IsWindow(Some(b.hwnd)) }.as_bool() && unsafe { IsWindow(Some(second.hwnd)) }.as_bool(),
+      "the opposite parent and child must survive")?;
+    api(WindowDispatch::<()>::destroy(&b.dispatcher), "destroy opposite native parent")?;
+    wait(|| Ok(!unsafe { IsWindow(Some(second.hwnd)) }.as_bool()), "opposite parent destruction removes its child")
+  }
+
+  fn clip_rect() -> Check<RECT> {
+    let mut rect = RECT::default();
+    unsafe { GetClipCursor(&mut rect) }.map_err(|error| format!("UNKNOWN: GetClipCursor: {error}"))?;
+    Ok(rect)
+  }
+
+  fn pointer() -> Check<POINT> {
+    let mut point = POINT::default();
+    unsafe { GetPhysicalCursorPos(&mut point) }
+      .map_err(|error| format!("UNKNOWN: GetPhysicalCursorPos: {error}"))?;
+    Ok(point)
+  }
+
+  struct CursorRestore { clip: RECT, point: POINT, released: Option<RECT>, changed: bool }
+  impl CursorRestore {
+    fn restore(&mut self) -> Check {
+      if !self.changed { return Ok(()) }
+      // Preserve an unrestricted desktop as None, rather than leaving a fixed
+      // full-screen clip behind. Restore first even on an early error or panic.
+      let clip = if self.released == Some(self.clip) { None } else { Some(&self.clip as *const RECT) };
+      unsafe { ClipCursor(clip) }
+        .map_err(|error| format!("FAIL: restore original cursor confinement: {error}"))?;
+      if pointer()? != self.point {
+        unsafe { SetPhysicalCursorPos(self.point.x, self.point.y) }
+          .map_err(|error| format!("FAIL: restore original physical pointer: {error}"))?;
+      }
+      require(clip_rect()? == self.clip && pointer()? == self.point, "original cursor clip and position must be restored")?;
+      self.changed = false;
+      Ok(())
+    }
+  }
+  impl Drop for CursorRestore {
+    fn drop(&mut self) {
+      if let Err(error) = self.restore() { eprintln!("{error}"); }
+    }
+  }
+
+  fn cursor_grab_checks(handle: &ElectronRuntimeHandle, prefix: &str) -> Check {
+    physical_desktop()?;
+    let window = create(handle, prefix, ElectronWindowBuilder::new())?;
+    let mut restore = CursorRestore { clip: clip_rect()?, point: pointer()?, released: None, changed: false };
+    let result = (|| {
+      unsafe { ClipCursor(None) }.map_err(|error| format!("UNKNOWN: desktop forbids releasing the native clip: {error}"))?;
+      restore.changed = true;
+      let released = clip_rect()?;
+      restore.released = Some(released);
+      let work = work_area(window.hwnd)?;
+      let outer = frame(window.hwnd)?;
+      if work.right - work.left < outer.right - outer.left + 160
+        || work.bottom - work.top < outer.bottom - outer.top + 140 {
+        return Err("UNKNOWN: monitor work area cannot hold two distinct cursor boundary probes".into())
+      }
+      for offset in [40, 80] {
+        move_native(window.hwnd, work.left + offset, work.top + offset)?;
+        let target = client_rect(window.hwnd)?;
+        if target.left <= released.left + 4 || target.top <= released.top + 4
+          || target.right >= released.right - 4 || target.bottom >= released.bottom - 4 {
+          return Err("UNKNOWN: native client rectangle has no unrestricted outside boundary points".into())
+        }
+        require(clip_rect()? == released && released != target, "grab must start from a distinct unrestricted desktop clip")?;
+        api(WindowDispatch::<()>::set_cursor_grab(&window.dispatcher, true), "set_cursor_grab true")?;
+        require(clip_rect()? == target, format!("GetClipCursor must equal external client screen bounds {target:?}"))?;
+        let attempts = [
+          (POINT { x: target.left - 3, y: target.top - 3 }, POINT { x: target.left, y: target.top }),
+          (POINT { x: target.right + 3, y: target.bottom + 3 }, POINT { x: target.right - 1, y: target.bottom - 1 }),
+        ];
+        for (outside, boundary) in attempts {
+          unsafe { SetPhysicalCursorPos(outside.x, outside.y) }
+            .map_err(|error| format!("UNKNOWN: native pointer boundary stimulus denied: {error}"))?;
+          if pointer()? != boundary {
+            return Err("UNKNOWN: physical pointer boundary observation unstable (desktop or human input interference)".into())
+          }
+          require(clip_rect()? == target, "native clip must remain installed during outside-pointer attempts")?;
+        }
+        api(WindowDispatch::<()>::set_cursor_grab(&window.dispatcher, false), "set_cursor_grab false")?;
+        require(clip_rect()? == released, "false must release the real desktop clip, not just cached state")?;
+        for (outside, _) in attempts {
+          unsafe { SetPhysicalCursorPos(outside.x, outside.y) }
+            .map_err(|error| format!("UNKNOWN: unconfined pointer stimulus denied: {error}"))?;
+          if pointer()? != outside {
+            return Err("UNKNOWN: physical pointer cannot be stably observed outside after release".into())
+          }
+        }
+      }
+      Ok(())
+    })();
+    restore.restore()?;
+    result
+  }
+
   fn builder_icon_checks(handle: &ElectronRuntimeHandle, prefix: &str) -> Check {
     // WindowConfig has no icon field; opposite repeated setters must beat both
     // the earlier icon and any application-default resource supplied at creation.
@@ -310,12 +537,13 @@ mod win {
   fn checks(handle: &ElectronRuntimeHandle, prefix: &str) -> bool {
     let mut passed = true;
     passed &= check("WindowBuilder::owner", "owner", "two fresh opposite final owner setters produce exact external GW_OWNER without WS_CHILD; each owned HWND is destroyed only with its final owner", || owner_checks(handle, prefix));
+    passed &= check("WindowBuilder::parent", "parent", "opposite fresh final parents create external WS_CHILD/non-WS_POPUP HWNDs with exact GetParent and no GW_OWNER; parent-client offsets follow native parent movement unlike an owner control, and destruction removes only the final parent's children", || parent_checks(handle, prefix));
+    passed &= check("WindowDispatch::set_cursor_grab", "cursor_grab", "at two distinct native client screen rectangles GetClipCursor matches grab bounds, outside physical pointer attempts clamp to opposite edges, false releases the clip and permits outside positions; original clip and pointer are restored", || cursor_grab_checks(handle, prefix));
     passed &= check("WindowBuilder::icon", "builder_icons", "two fresh opposite icon replacements expose the final RGB color in every native ICON_SMALL and ICON_BIG resource pixel", || builder_icon_checks(handle, prefix));
     passed &= check("WindowDispatch::set_icon", "dispatch_icons", "native WM_GETICON resource pixels change blue to red to blue in both small and big slots after opposite set_icon calls", || dispatch_icon_checks(handle, prefix));
     passed &= check("WindowBuilder::content_protected", "builder_protection", "two fresh content_protected setters override opposite WindowConfig values with native WDA_EXCLUDEFROMCAPTURE and WDA_NONE", || builder_protection_checks(handle, prefix));
     passed &= check("WindowDispatch::set_content_protected", "dispatch_protection", "external GetWindowDisplayAffinity changes WDA_NONE to WDA_EXCLUDEFROMCAPTURE to WDA_NONE after opposite dispatcher setters", || dispatch_protection_checks(handle, prefix));
     for (member, reason) in [
-      ("WindowBuilder::parent", "not asserted: ownership is not proof of the required WS_CHILD/parent-client contract"),
       ("WindowBuilder::window_classname", "not asserted: current creation bridge does not apply a custom native class; logged GetClassNameW is diagnostic only"),
       ("WindowBuilder::no_redirection_bitmap", "not asserted: current creation bridge does not apply this native style; a default bit is not setter evidence"),
       ("WindowBuilder::skip_taskbar", "not asserted: Electron and Tao use ITaskbarList; APPWINDOW/TOOLWINDOW observations alone cannot prove an actual shell tab"),

@@ -64,8 +64,83 @@ mod imp {
   }
 }
 
+#[cfg(target_os = "linux")]
+mod imp {
+  use std::{
+    ffi::{c_char, c_int, c_uint, c_ulong, c_void},
+    sync::Mutex,
+  };
+  use tauri_runtime::dpi::PhysicalPosition;
+
+  #[link(name = "X11")]
+  extern "C" {
+    fn XOpenDisplay(name: *const c_char) -> *mut c_void;
+    fn XDefaultRootWindow(display: *mut c_void) -> c_ulong;
+    fn XWarpPointer(
+      display: *mut c_void,
+      src_window: c_ulong,
+      dest_window: c_ulong,
+      src_x: c_int,
+      src_y: c_int,
+      src_width: c_uint,
+      src_height: c_uint,
+      dest_x: c_int,
+      dest_y: c_int,
+    ) -> c_int;
+    fn XSync(display: *mut c_void, discard: c_int) -> c_int;
+    fn XCloseDisplay(display: *mut c_void) -> c_int;
+  }
+
+  // Xlib needs serialization unless XInitThreads ran before any Xlib calls.
+  // ponytail: serialize short-lived connections; reuse one if warp throughput matters.
+  static XLIB: Mutex<()> = Mutex::new(());
+
+  pub(super) fn warp(position: PhysicalPosition<i32>, _scale: f64) -> Result<(), String> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+      || std::env::var("XDG_SESSION_TYPE")
+        .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
+    {
+      return Err("global cursor warping is not supported on Wayland".into());
+    }
+    // XWarpPointer takes C ints, but the X11 protocol encodes coordinates as INT16.
+    if i16::try_from(position.x).is_err() || i16::try_from(position.y).is_err() {
+      return Err("X11 cursor position exceeds signed 16-bit screen coordinates".into());
+    }
+    let _guard = XLIB
+      .lock()
+      .map_err(|_| "X11 cursor lock poisoned".to_string())?;
+    // SAFETY: null selects DISPLAY. This call owns the returned connection and
+    // never shares it with another thread or a toolkit.
+    let display = unsafe { XOpenDisplay(std::ptr::null()) };
+    if display.is_null() {
+      return Err("XOpenDisplay could not open DISPLAY; an X11 display is required".into());
+    }
+    // SAFETY: display is live and exclusively owned, and the root belongs to it.
+    // A zero source window is X11 None, so the destination is an absolute root
+    // position. No fallible Rust operations intervene before closing display.
+    unsafe {
+      let root = XDefaultRootWindow(display);
+      XWarpPointer(display, 0, root, 0, 0, 0, 0, position.x, position.y);
+      // XWarpPointer's return value is not a server status; wait for processing.
+      XSync(display, 0);
+      XCloseDisplay(display);
+    }
+    Ok(())
+  }
+
+  #[test]
+  #[ignore = "run with DISPLAY, WAYLAND_DISPLAY and XDG_SESSION_TYPE unset"]
+  fn warp_without_display_returns_error() {
+    assert!(std::env::var_os("DISPLAY").is_none());
+    assert!(warp(PhysicalPosition::new(0, 0), 1.0)
+      .unwrap_err()
+      .contains("XOpenDisplay"));
+  }
+}
+
 #[cfg(all(
   unix,
+  not(target_os = "linux"),
   not(target_os = "macos"),
   not(target_os = "ios"),
   not(target_os = "android")

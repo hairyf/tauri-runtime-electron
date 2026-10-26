@@ -57,10 +57,14 @@ static int unknown(NSString *reason) {
   fwrite(data.bytes, 1, data.length, stdout);
   return 77;
 }
-static id ax(AXUIElementRef element, CFStringRef key) {
+static id axRead(AXUIElementRef element, CFStringRef key, AXError *error) {
   CFTypeRef value = NULL;
-  if (!element || AXUIElementCopyAttributeValue(element, key, &value) != kAXErrorSuccess) return nil;
-  return CFBridgingRelease(value);
+  *error = element ? AXUIElementCopyAttributeValue(element, key, &value) : kAXErrorInvalidUIElement;
+  return *error == kAXErrorSuccess ? CFBridgingRelease(value) : nil;
+}
+static id ax(AXUIElementRef element, CFStringRef key) {
+  AXError error;
+  return axRead(element, key, &error);
 }
 static NSArray *frame(AXUIElementRef element) {
   id p = ax(element, kAXPositionAttribute), s = ax(element, kAXSizeAttribute);
@@ -79,9 +83,11 @@ static AXUIElementRef webArea(AXUIElementRef element, int depth, int *budget) {
   }
   return NULL;
 }
-static void dockItems(AXUIElementRef element, NSString *bundle, int depth, int *budget, int *urls, int *matches) {
-  if (depth > 8 || --*budget <= 0) return;
-  id url = ax(element, CFSTR("AXURL"));
+static BOOL dockItems(AXUIElementRef element, NSString *bundle, int depth, int *budget, int *urls, int *matches) {
+  if (depth > 8 || --*budget <= 0) return NO;
+  AXError error;
+  id url = axRead(element, CFSTR("AXURL"), &error);
+  if (error != kAXErrorSuccess && error != kAXErrorNoValue && error != kAXErrorAttributeUnsupported) return NO;
   NSString *path = nil;
   if ([url isKindOfClass:[NSURL class]]) path = [url path];
   else if ([url isKindOfClass:[NSString class]]) path = [[NSURL URLWithString:url] path];
@@ -89,9 +95,11 @@ static void dockItems(AXUIElementRef element, NSString *bundle, int depth, int *
     ++*urls;
     if ([[path stringByResolvingSymlinksInPath] isEqual:bundle]) ++*matches;
   }
-  id children = ax(element, kAXChildrenAttribute);
-  if ([children isKindOfClass:[NSArray class]]) for (id child in children)
-    dockItems((__bridge AXUIElementRef)child, bundle, depth + 1, budget, urls, matches);
+  id children = axRead(element, kAXChildrenAttribute, &error);
+  if (error != kAXErrorSuccess && error != kAXErrorNoValue && error != kAXErrorAttributeUnsupported) return NO;
+  if (children && ![children isKindOfClass:[NSArray class]]) return NO;
+  for (id child in children) if (!dockItems((__bridge AXUIElementRef)child, bundle, depth + 1, budget, urls, matches)) return NO;
+  return YES;
 }
 int main(int argc, const char **argv) {
   @autoreleasepool {
@@ -103,62 +111,109 @@ int main(int argc, const char **argv) {
       BOOL accepted = [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
       return accepted ? 0 : unknown(@"system refused foreground activation");
     }
-    if (!AXIsProcessTrusted()) return unknown(@"Accessibility permission is unavailable for the native observer");
-    NSRunningApplication *dock = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"].firstObject;
-    if (!dock) return unknown(@"no login-session Dock process");
-    AXUIElementRef dockAX = AXUIElementCreateApplication(dock.processIdentifier);
-    AXUIElementSetMessagingTimeout(dockAX, 2.0);
-    NSString *bundle = app.bundleURL.path.stringByResolvingSymlinksInPath;
-    int budget = 1500, urls = 0, matches = 0;
-    dockItems(dockAX, bundle, 0, &budget, &urls, &matches);
-    CFRelease(dockAX);
-    if (!urls || !bundle) return unknown(@"Dock Accessibility URLs cannot be inspected");
-    NSArray *cg = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
-    if (!cg) return unknown(@"CGWindowList is unavailable");
-    NSMutableArray *rectangles = [NSMutableArray array];
-    for (NSDictionary *entry in cg) {
-      if ([entry[(__bridge NSString *)kCGWindowOwnerPID] intValue] != pid || [entry[(__bridge NSString *)kCGWindowLayer] intValue] != 0) continue;
-      CGRect rect;
-      if (CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)entry[(__bridge NSString *)kCGWindowBounds], &rect) && rect.size.width > 20 && rect.size.height > 20)
-        [rectangles addObject:@[@(rect.origin.x), @(rect.origin.y), @(rect.size.width), @(rect.size.height)]];
-    }
     AXUIElementRef application = AXUIElementCreateApplication(pid);
     AXUIElementSetMessagingTimeout(application, 2.0);
-    id windows = ax(application, kAXWindowsAttribute);
-    NSMutableArray *observed = [NSMutableArray array];
-    if ([windows isKindOfClass:[NSArray class]]) for (id window in windows) {
-      AXUIElementRef w = (__bridge AXUIElementRef)window;
-      NSString *title = ax(w, kAXTitleAttribute);
-      NSArray *rect = frame(w);
-      if (!title || !rect) continue;
-      NSMutableArray *buttons = [NSMutableArray array];
-      CFStringRef keys[] = { kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute };
-      for (int i = 0; i < 3; ++i) {
-        id button = ax(w, keys[i]);
-        [buttons addObject:button ? (frame((__bridge AXUIElementRef)button) ?: (id)[NSNull null]) : (id)[NSNull null]];
+    if (!strcmp(argv[1], "manual")) {
+      AXError error;
+      id previous = axRead(application, CFSTR("AXManualAccessibility"), &error);
+      AXError enabled = AXUIElementSetAttributeValue(application, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+      NSDictionary *result = @{@"previous":error == kAXErrorSuccess && [previous isKindOfClass:[NSNumber class]] ? previous : (id)[NSNull null], @"setError":@(enabled)};
+      NSData *data = [NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
+      fwrite(data.bytes, 1, data.length, stdout);
+      CFRelease(application);
+      return 0;
+    }
+    if (!strcmp(argv[1], "restore-manual") && argc == 4) {
+      AXError error = AXUIElementSetAttributeValue(application, CFSTR("AXManualAccessibility"), atoi(argv[3]) ? kCFBooleanTrue : kCFBooleanFalse);
+      CFRelease(application);
+      return error == kAXErrorSuccess ? 0 : unknown(@"could not restore AXManualAccessibility");
+    }
+    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+    NSMutableDictionary *result = [@{@"pid":@(app.processIdentifier), @"executable":app.executableURL.path ?: @"",
+      @"policy":@(app.activationPolicy), @"hidden":@(app.hidden), @"active":@(app.active),
+      @"frontPID":front ? @(front.processIdentifier) : (id)[NSNull null],
+      @"cgWindows":[NSNull null], @"cgError":[NSNull null], @"windows":[NSNull null], @"axError":[NSNull null],
+      @"dockMatches":[NSNull null], @"dockError":[NSNull null]} mutableCopy];
+    NSArray *cg = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    NSMutableArray *rectangles = [NSMutableArray array];
+    if (!cg) result[@"cgError"] = @"CGWindowList is unavailable";
+    else {
+      for (NSDictionary *entry in cg) {
+        if ([entry[(__bridge NSString *)kCGWindowOwnerPID] intValue] != pid || [entry[(__bridge NSString *)kCGWindowLayer] intValue] != 0) continue;
+        CGRect rect;
+        NSNumber *number = entry[(__bridge NSString *)kCGWindowNumber];
+        if (!number || !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)entry[(__bridge NSString *)kCGWindowBounds], &rect)) {
+          result[@"cgError"] = @"CG window identity or bounds unavailable";
+          continue;
+        }
+        if (rect.size.width > 20 && rect.size.height > 20)
+          [rectangles addObject:@{@"id":number, @"frame":@[@(rect.origin.x), @(rect.origin.y), @(rect.size.width), @(rect.size.height)]}];
       }
-      id titleElement = ax(w, kAXTitleUIElementAttribute);
-      NSArray *titleRect = titleElement ? frame((__bridge AXUIElementRef)titleElement) : nil;
-      NSString *titleText = titleElement ? (ax((__bridge AXUIElementRef)titleElement, kAXValueAttribute) ?: ax((__bridge AXUIElementRef)titleElement, kAXTitleAttribute)) : nil;
-      budget = 1500;
-      AXUIElementRef area = webArea(w, 0, &budget);
-      NSArray *content = area ? frame(area) : nil;
-      if (area) CFRelease(area);
-      BOOL onScreen = NO;
-      for (NSArray *candidate in rectangles) {
-        BOOL equal = YES;
-        for (int i = 0; i < 4; ++i) if (fabs([rect[i] doubleValue] - [candidate[i] doubleValue]) > 2.0) equal = NO;
-        if (equal) onScreen = YES;
+      if (result[@"cgError"] == [NSNull null]) result[@"cgWindows"] = rectangles;
+    }
+    if (!AXIsProcessTrusted()) {
+      result[@"axError"] = @"Accessibility permission is unavailable for the native observer";
+      result[@"dockError"] = result[@"axError"];
+    } else {
+      NSRunningApplication *dock = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"].firstObject;
+      NSString *bundle = app.bundleURL.path.stringByResolvingSymlinksInPath;
+      if (!dock || !bundle) result[@"dockError"] = @"Dock process or target bundle URL unavailable";
+      else {
+        AXUIElementRef dockAX = AXUIElementCreateApplication(dock.processIdentifier);
+        AXUIElementSetMessagingTimeout(dockAX, 2.0);
+        int budget = 1500, urls = 0, matches = 0;
+        BOOL complete = dockItems(dockAX, bundle, 0, &budget, &urls, &matches);
+        CFRelease(dockAX);
+        if (complete && urls) result[@"dockMatches"] = @(matches);
+        else result[@"dockError"] = @"Dock AX traversal incomplete, failed or URL attributes unavailable";
       }
-      [observed addObject:@{@"title":title, @"frame":rect, @"buttons":buttons,
-        @"content":content ?: (id)[NSNull null], @"onScreen":@(onScreen),
-        @"titleFrame":titleRect ?: (id)[NSNull null], @"titleText":titleText ?: (id)[NSNull null]}];
+      AXError windowsError;
+      id windows = axRead(application, kAXWindowsAttribute, &windowsError);
+      if (windowsError != kAXErrorSuccess || ![windows isKindOfClass:[NSArray class]]) {
+        result[@"axError"] = [NSString stringWithFormat:@"AXWindows unavailable (%d)", windowsError];
+      } else {
+        NSMutableArray *observed = [NSMutableArray array];
+        for (id window in windows) {
+          AXUIElementRef w = (__bridge AXUIElementRef)window;
+          NSString *title = ax(w, kAXTitleAttribute);
+          NSArray *rect = frame(w);
+          if (![title isKindOfClass:[NSString class]] || !rect) {
+            result[@"axError"] = @"AX window title or frame unavailable";
+            continue;
+          }
+          NSMutableArray *buttons = [NSMutableArray array];
+          CFStringRef keys[] = { kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute };
+          for (int i = 0; i < 3; ++i) {
+            id button = ax(w, keys[i]);
+            [buttons addObject:button ? (frame((__bridge AXUIElementRef)button) ?: (id)[NSNull null]) : (id)[NSNull null]];
+          }
+          AXError titleError;
+          id titleElement = axRead(w, kAXTitleUIElementAttribute, &titleError);
+          NSArray *titleRect = titleElement ? frame((__bridge AXUIElementRef)titleElement) : nil;
+          NSString *titleText = titleElement ? (ax((__bridge AXUIElementRef)titleElement, kAXValueAttribute) ?: ax((__bridge AXUIElementRef)titleElement, kAXTitleAttribute)) : nil;
+          NSString *titleStatus = titleElement ? @"present" : ((titleError == kAXErrorNoValue || titleError == kAXErrorSuccess) ? @"absent" : @"unavailable");
+          int budget = 1500;
+          AXUIElementRef area = webArea(w, 0, &budget);
+          NSArray *content = area ? frame(area) : nil;
+          if (area) CFRelease(area);
+          id onScreen = [NSNull null];
+          if (result[@"cgError"] == [NSNull null]) {
+            onScreen = @NO;
+            for (NSDictionary *candidate in rectangles) {
+              BOOL equal = YES;
+              for (int i = 0; i < 4; ++i) if (fabs([rect[i] doubleValue] - [candidate[@"frame"][i] doubleValue]) > 2.0) equal = NO;
+              if (equal) onScreen = @YES;
+            }
+          }
+          [observed addObject:@{@"title":title, @"frame":rect, @"buttons":buttons,
+            @"content":content ?: (id)[NSNull null], @"onScreen":onScreen,
+            @"titleFrame":titleRect ?: (id)[NSNull null], @"titleText":titleText ?: (id)[NSNull null],
+            @"titleStatus":titleStatus, @"titleError":@(titleError)}];
+        }
+        result[@"windows"] = observed;
+      }
     }
     CFRelease(application);
-    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
-    NSDictionary *result = @{@"pid":@(app.processIdentifier), @"executable":app.executableURL.path ?: @"",
-      @"policy":@(app.activationPolicy), @"hidden":@(app.hidden), @"active":@(app.active),
-      @"frontPID":@(front.processIdentifier), @"dockMatches":@(matches), @"cgWindowCount":@(rectangles.count), @"windows":observed};
     NSData *data = [NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
     if (!data) return unknown(@"native observations were not JSON serializable");
     fwrite(data.bytes, 1, data.length, stdout);
@@ -195,15 +250,18 @@ int main(int argc, const char **argv) {
     Ok(stdout)
   }
 
-  struct Observer { root: PathBuf, binary: PathBuf, pid: u32 }
+  struct Observer { root: PathBuf, binary: PathBuf, pid: u32, manual_previous: Option<bool> }
   impl Drop for Observer {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+    fn drop(&mut self) {
+      if let Err(error) = self.restore_manual() { eprintln!("{error}"); }
+      let _ = fs::remove_dir_all(&self.root);
+    }
   }
   impl Observer {
     fn new() -> Check<Self> {
       let root = std::env::temp_dir().join(format!("electron-macos-observer-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
       fs::create_dir(&root).map_err(|error| format!("UNKNOWN: create observer temp directory: {error}"))?;
-      let observer = Self { binary: root.join("observer"), root, pid: 0 };
+      let observer = Self { binary: root.join("observer"), root, pid: 0, manual_previous: None };
       let source = observer.root.join("observer.m");
       fs::write(&source, OBSERVER).map_err(|error| format!("UNKNOWN: write observer: {error}"))?;
       output(Command::new("/usr/bin/clang").args(["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices"])
@@ -226,6 +284,20 @@ int main(int argc, const char **argv) {
       if candidates.len() != 1 { return Err(format!("UNKNOWN: expected one direct Electron app child, observed {candidates:?}")) }
       self.pid = candidates[0];
       if self.pid == std::process::id() { return Err("UNKNOWN: observer selected the Rust process".into()) }
+      match output(Command::new(&self.binary).arg("manual").arg(self.pid.to_string()), WAIT) {
+        Ok(bytes) => {
+          let value: Value = serde_json::from_slice(&bytes).map_err(|error| format!("UNKNOWN: AXManualAccessibility JSON: {error}"))?;
+          self.manual_previous = value["previous"].as_bool();
+          eprintln!("native AXManualAccessibility setup: {value}");
+        }
+        Err(error) => eprintln!("{error}"),
+      }
+      Ok(())
+    }
+    fn restore_manual(&mut self) -> Check {
+      if let Some(previous) = self.manual_previous.take() {
+        output(Command::new(&self.binary).arg("restore-manual").arg(self.pid.to_string()).arg(if previous { "1" } else { "0" }), WAIT)?;
+      }
       Ok(())
     }
     fn sample(&self) -> Check<Value> {
@@ -235,10 +307,21 @@ int main(int argc, const char **argv) {
       Ok(value)
     }
     fn wait(&self, description: &str, check: impl Fn(&Value) -> bool) -> Check<Value> {
+      self.wait_for(description, &[], check)
+    }
+    fn wait_for(&self, description: &str, fields: &[&str], check: impl Fn(&Value) -> bool) -> Check<Value> {
       let started = Instant::now();
       loop {
         let got = self.sample()?;
+        for field in fields {
+          if got[*field].is_null() {
+            return Err(format!("UNKNOWN: {description}: {field} unavailable; external observation: {got}"));
+          }
+        }
         if check(&got) { return Ok(got) }
+        if fields.contains(&"windows") && !got["axError"].is_null() {
+          return Err(format!("UNKNOWN: {description}: incomplete AX observation: {got}"));
+        }
         if started.elapsed() >= WAIT { return Err(format!("FAIL: {description}; actual external system observation: {got}")) }
         thread::sleep(Duration::from_millis(100));
       }
@@ -258,14 +341,28 @@ int main(int argc, const char **argv) {
   fn require(condition: bool, message: &str) -> Check {
     if condition { Ok(()) } else { Err(format!("FAIL: {message}")) }
   }
-  fn evidence(member: &str, test: &str, assertion: &str) {
-    println!("[runtime-evidence] {}", json!({"member":member, "test":format!("macos_behavior_smoke::{test}"), "assertion":assertion, "kind":"behavior", "status":"pass"}));
+  fn report(member: &str, test: &str, assertion: &str, status: &str) {
+    println!("[runtime-evidence] {}", json!({"member":member, "test":format!("macos_behavior_smoke::{test}"), "assertion":assertion, "kind":"behavior", "status":status}));
+  }
+  fn record(member: &str, test: &str, assertion: &str, result: Check, failures: &mut Vec<String>) {
+    match result {
+      Ok(()) => report(member, test, assertion, "pass"),
+      Err(error) => {
+        let status = if error.starts_with("UNKNOWN:") { "unknown" } else { "fail" };
+        report(member, test, &error, status);
+        if status == "fail" { failures.push(format!("{member}: {error}")); }
+      }
+    }
   }
   fn native_window<'a>(snapshot: &'a Value, title: &str) -> Option<&'a Value> {
     snapshot["windows"].as_array()?.iter().find(|window| window["title"] == title)
   }
-  fn visible_pair(snapshot: &Value) -> bool {
-    ["macos-app-one", "macos-app-two"].iter().all(|title| native_window(snapshot, title).is_some_and(|window| window["onScreen"] == true))
+  fn cg_ids(snapshot: &Value) -> Check<Vec<u64>> {
+    let windows = snapshot["cgWindows"].as_array().ok_or_else(|| format!("UNKNOWN: CGWindowList unavailable: {snapshot}"))?;
+    let mut ids = windows.iter().map(|window| window["id"].as_u64().ok_or("UNKNOWN: CGWindowNumber unavailable".to_owned())).collect::<Check<Vec<_>>>()?;
+    ids.sort_unstable();
+    require(ids.windows(2).all(|pair| pair[0] != pair[1]), "CGWindowNumbers must identify distinct native windows")?;
+    Ok(ids)
   }
   // Native-only creation is safe before the Rust event pump starts. Renderer
   // callbacks are queued on that pump and must be awaited only from the worker.
@@ -280,10 +377,16 @@ int main(int argc, const char **argv) {
   fn create(handle: &ElectronRuntimeHandle, label: &str, builder: ElectronWindowBuilder) -> Check<Window> {
     let window = create_native(handle, label, builder)?;
     let (tx, rx) = mpsc::channel();
-    WebviewDispatch::<()>::eval_script_with_callback(&window.webview.as_ref().unwrap().webview.dispatcher,
-      "new Promise(resolve => { const ready = () => { document.body.textContent = 'native AX layout proof'; document.body.style.margin = '0'; resolve(true); }; if (document.body) ready(); else document.addEventListener('DOMContentLoaded', ready, {once:true}); })",
-      move |value| { let _ = tx.send(value); }).map_err(|error| error.to_string())?;
-    require(rx.recv_timeout(WAIT).map_err(|error| error.to_string())? == "true", "real page must initialize before AX layout inspection")?;
+    let ready = (|| {
+      WebviewDispatch::<()>::eval_script_with_callback(&window.webview.as_ref().unwrap().webview.dispatcher,
+        "new Promise(resolve => { const ready = () => { document.body.textContent = 'native AX layout proof'; document.body.style.margin = '0'; resolve(true); }; if (document.body) ready(); else document.addEventListener('DOMContentLoaded', ready, {once:true}); })",
+        move |value| { let _ = tx.send(value); }).map_err(|error| error.to_string())?;
+      require(rx.recv_timeout(WAIT).map_err(|error| error.to_string())? == "true", "real page must initialize before AX layout inspection")
+    })();
+    if let Err(error) = ready {
+      let _ = WindowDispatch::<()>::destroy(&window.dispatcher);
+      return Err(error);
+    }
     Ok(window)
   }
   fn builder(title: &str) -> ElectronWindowBuilder {
@@ -298,45 +401,72 @@ int main(int argc, const char **argv) {
       set(policy)?;
       observer.wait("activation policy must change in the external Electron process", |state| state["policy"] == value)?;
     }
-    evidence(member, "activation_policy", "external NSRunningApplication for the verified Electron PID reports Accessory, Prohibited and Regular after each distinct mutation");
+    let _ = member;
     Ok(())
   }
   fn dock(observer: &Observer, member: &str, mut set: impl FnMut(bool) -> Check) -> Check {
-    observer.wait("baseline Electron Dock item", |state| state["dockMatches"].as_u64().is_some_and(|count| count > 0))?;
+    observer.wait_for("baseline Electron Dock item", &["dockMatches"], |state| state["dockMatches"].as_u64().is_some_and(|count| count > 0))?;
+    // Electron and Tao both ignore Dock hide within one second of Dock show.
+    thread::sleep(Duration::from_millis(1100));
+    observer.wait_for("stable Electron Dock item before hide", &["dockMatches"], |state| state["dockMatches"].as_u64().is_some_and(|count| count > 0))?;
     set(false)?;
-    observer.wait("Electron's bundle URL must disappear from the real Dock AX tree", |state| state["dockMatches"] == 0)?;
+    observer.wait_for("Electron's bundle URL must disappear from the real Dock AX tree", &["dockMatches"], |state| state["dockMatches"] == 0)?;
     set(true)?;
-    observer.wait("Electron's bundle URL must return to the real Dock AX tree", |state| state["dockMatches"].as_u64().is_some_and(|count| count > 0))?;
-    evidence(member, "dock_visibility", "external Dock Accessibility items matched by Electron bundle URL disappear when hidden and reappear when shown");
+    observer.wait_for("Electron's bundle URL must return to the real Dock AX tree", &["dockMatches"], |state| state["dockMatches"].as_u64().is_some_and(|count| count > 0))?;
+    let _ = member;
     Ok(())
   }
-  fn hide_show(observer: &Observer, first: &Window, hide_member: &str, show_member: &str, hide: impl FnOnce() -> Check, mut show: impl FnMut() -> Check) -> Check {
-    show()?;
-    WindowDispatch::<()>::set_focus(&first.dispatcher).map_err(|error| error.to_string())?;
-    observer.wait("both app windows visible and Electron foreground before hide", |state| state["active"] == true && visible_pair(state))?;
-    hide()?;
-    observer.wait("all-app hide must remove both real windows and foreground ownership", |state| state["hidden"] == true && state["active"] == false && state["cgWindowCount"] == 0)?;
-    evidence(hide_member, "app_hide", "NSRunningApplication isHidden becomes true and isActive false, and CGWindowList no longer lists either of the two real Electron windows");
-    let finder = observer.finder()?;
-    show()?;
-    observer.wait("all-app show must restore both windows without stealing focus", |state| state["hidden"] == false && state["active"] == false && state["frontPID"].as_u64() == Some(u64::from(finder)) && visible_pair(state))?;
-    evidence(show_member, "app_show", "both Electron windows return in external AX/CG observations and isHidden becomes false while Finder retains foreground ownership");
-    Ok(())
+  fn hide_show(observer: &Observer, first: &Window, hide_member: &str, show_member: &str, hide: impl FnOnce() -> Check, mut show: impl FnMut() -> Check, failures: &mut Vec<String>) {
+    let mut ids = Vec::new();
+    let hidden = (|| {
+      show()?;
+      WindowDispatch::<()>::set_focus(&first.dispatcher).map_err(|error| error.to_string())?;
+      let baseline = observer.wait_for("two distinct Electron CG windows visible and app foreground before hide", &["cgWindows"], |state| state["active"] == true && cg_ids(state).is_ok_and(|ids| ids.len() == 2))?;
+      ids = cg_ids(&baseline)?;
+      hide()?;
+      observer.wait_for("all-app hide must remove both baseline CG window IDs and foreground ownership", &["cgWindows"], |state| state["hidden"] == true && state["active"] == false && cg_ids(state).is_ok_and(|now| ids.iter().all(|id| !now.contains(id))))?;
+      Ok(())
+    })();
+    let can_show = hidden.is_ok();
+    record(hide_member, "app_hide", "NSRunningApplication becomes hidden/inactive and both positively observed Electron CGWindowNumbers disappear", hidden, failures);
+    let shown = (|| {
+      if !can_show { return Err("UNKNOWN: app.show requires an independently observed hidden baseline; app.hide result is reported separately".into()) }
+      let finder = observer.finder()?;
+      show()?;
+      observer.wait_for("all-app show restores exactly the same two CG window IDs without stealing Finder focus", &["cgWindows", "frontPID"], |state| state["hidden"] == false && state["active"] == false && state["frontPID"].as_u64() == Some(u64::from(finder)) && cg_ids(state).is_ok_and(|now| now == ids))?;
+      Ok(())
+    })();
+    record(show_member, "app_show", "the same two Electron CGWindowNumbers return, isHidden clears and Finder retains foreground ownership", shown, failures);
   }
-  fn runtime_checks(runtime: &mut ElectronRuntime, handle: &ElectronRuntimeHandle, observer: &Observer, first: &Window) -> Check {
-    policy(observer, "Runtime::set_activation_policy", |value| { <ElectronRuntime as Runtime<()>>::set_activation_policy(runtime, value); Ok(()) })?;
-    dock(observer, "Runtime::set_dock_visibility", |value| { <ElectronRuntime as Runtime<()>>::set_dock_visibility(runtime, value); Ok(()) })?;
+  fn restore_app(handle: &ElectronRuntimeHandle, failures: &mut Vec<String>) {
+    let result = <ElectronRuntimeHandle as RuntimeHandle<()>>::set_activation_policy(handle, ActivationPolicy::Regular)
+      .and_then(|_| <ElectronRuntimeHandle as RuntimeHandle<()>>::set_dock_visibility(handle, true))
+      .and_then(|_| <ElectronRuntimeHandle as RuntimeHandle<()>>::show(handle));
+    if let Err(error) = result { failures.push(format!("FAIL: restore app prerequisites: {error}")); }
+  }
+  fn runtime_checks(runtime: &mut ElectronRuntime, handle: &ElectronRuntimeHandle, observer: &Observer, first: &Window, failures: &mut Vec<String>) {
+    let result = policy(observer, "Runtime::set_activation_policy", |value| { <ElectronRuntime as Runtime<()>>::set_activation_policy(runtime, value); Ok(()) });
+    record("Runtime::set_activation_policy", "activation_policy", "external NSRunningApplication reports Accessory, Prohibited and Regular after each mutation", result, failures);
+    restore_app(handle, failures);
+    let result = dock(observer, "Runtime::set_dock_visibility", |value| { <ElectronRuntime as Runtime<()>>::set_dock_visibility(runtime, value); Ok(()) });
+    record("Runtime::set_dock_visibility", "dock_visibility", "complete external Dock AX traversal observes the Electron bundle disappear and reappear after a stable positive baseline", result, failures);
+    restore_app(handle, failures);
     hide_show(observer, first, "Runtime::hide", "Runtime::show",
       || { <ElectronRuntime as Runtime<()>>::hide(runtime); Ok(()) },
-      || { <ElectronRuntime as Runtime<()>>::show(runtime); Ok(()) })?;
-    <ElectronRuntimeHandle as RuntimeHandle<()>>::set_activation_policy(handle, ActivationPolicy::Regular).map_err(|error| error.to_string())
+      || { <ElectronRuntime as Runtime<()>>::show(runtime); Ok(()) }, failures);
+    restore_app(handle, failures);
   }
-  fn handle_checks(handle: &ElectronRuntimeHandle, observer: &Observer, first: &Window) -> Check {
-    policy(observer, "RuntimeHandle::set_activation_policy", |value| <ElectronRuntimeHandle as RuntimeHandle<()>>::set_activation_policy(handle, value).map_err(|error| error.to_string()))?;
-    dock(observer, "RuntimeHandle::set_dock_visibility", |value| <ElectronRuntimeHandle as RuntimeHandle<()>>::set_dock_visibility(handle, value).map_err(|error| error.to_string()))?;
+  fn handle_checks(handle: &ElectronRuntimeHandle, observer: &Observer, first: &Window, failures: &mut Vec<String>) {
+    let result = policy(observer, "RuntimeHandle::set_activation_policy", |value| <ElectronRuntimeHandle as RuntimeHandle<()>>::set_activation_policy(handle, value).map_err(|error| error.to_string()));
+    record("RuntimeHandle::set_activation_policy", "activation_policy", "external NSRunningApplication reports Accessory, Prohibited and Regular after each mutation", result, failures);
+    restore_app(handle, failures);
+    let result = dock(observer, "RuntimeHandle::set_dock_visibility", |value| <ElectronRuntimeHandle as RuntimeHandle<()>>::set_dock_visibility(handle, value).map_err(|error| error.to_string()));
+    record("RuntimeHandle::set_dock_visibility", "dock_visibility", "complete external Dock AX traversal observes the Electron bundle disappear and reappear after a stable positive baseline", result, failures);
+    restore_app(handle, failures);
     hide_show(observer, first, "RuntimeHandle::hide", "RuntimeHandle::show",
       || <ElectronRuntimeHandle as RuntimeHandle<()>>::hide(handle).map_err(|error| error.to_string()),
-      || <ElectronRuntimeHandle as RuntimeHandle<()>>::show(handle).map_err(|error| error.to_string()))
+      || <ElectronRuntimeHandle as RuntimeHandle<()>>::show(handle).map_err(|error| error.to_string()), failures);
+    restore_app(handle, failures);
   }
 
   fn numbers(value: &Value) -> Check<[f64;4]> {
@@ -346,12 +476,8 @@ int main(int argc, const char **argv) {
     Ok(result)
   }
   fn caption(observer: &Observer, title: &str) -> Check<Value> {
-    let snapshot = observer.wait("new titlebar window must exist in the external AX/CG tree", |state| native_window(state, title).is_some_and(|window| window["onScreen"] == true))?;
-    let window = native_window(&snapshot, title).unwrap().clone();
-    numbers(&window["frame"])?;
-    numbers(&window["content"])?;
-    for index in 0..3 { numbers(&window["buttons"][index])?; }
-    Ok(window)
+    let snapshot = observer.wait_for("new titlebar window must exist in the external AX/CG tree", &["windows", "cgWindows"], |state| native_window(state, title).is_some_and(|window| window["onScreen"] == true))?;
+    Ok(native_window(&snapshot, title).unwrap().clone())
   }
   fn inset(window: &Value) -> Check<f64> { Ok(numbers(&window["content"])?[1] - numbers(&window["frame"])?[1]) }
   fn controls_shift(before: &Value, after: &Value, x: f64, y: f64) -> Check {
@@ -366,50 +492,83 @@ int main(int argc, const char **argv) {
     }
     Ok(())
   }
-  fn titlebars(handle: &ElectronRuntimeHandle, observer: &Observer) -> Check {
-    let visible = create(handle, "title-visible", builder("title-visible").title_bar_style(TitleBarStyle::Visible).hidden_title(false))?;
-    let normal = caption(observer, "title-visible")?;
-    if normal["titleText"] != "title-visible" || normal["titleFrame"].is_null() {
-      return Err(format!("UNKNOWN: standard native window exposes no observable title UI element: {normal}"))
+  fn titlebars(handle: &ElectronRuntimeHandle, observer: &Observer, failures: &mut Vec<String>) {
+    for (case, member, assertion) in [
+      ("title_bar_style", "WindowBuilder::title_bar_style", "Visible/Transparent retain native AXWebArea caption inset; Overlay extends beneath the caption, with all three native controls retained"),
+      ("hidden_title", "WindowBuilder::hidden_title", "a readable visible-title baseline changes to confirmed absent/hidden native title text without moving controls or changing content inset"),
+      ("builder_traffic_light_position", "WindowBuilder::traffic_light_position", "two fresh Overlay windows' three native AX control frames differ by the requested 26x16 logical delta"),
+      ("dispatch_traffic_light_position", "WindowDispatch::set_traffic_light_position", "logical and physical requests move all three native AX control frames by distinct correct logical deltas"),
+    ] {
+      let mut cleanup = Vec::new();
+      let mut make = |title: &str, builder| -> Check<Window> {
+        let window = create(handle, title, builder)?;
+        cleanup.push(window.dispatcher.clone());
+        Ok(window)
+      };
+      let mut result = (|| {
+        match case {
+          "title_bar_style" => {
+            let _normal = make("title-visible", builder("title-visible").title_bar_style(TitleBarStyle::Visible).hidden_title(false))?;
+            let normal = caption(observer, "title-visible")?;
+            let _transparent = make("title-transparent", builder("title-transparent").title_bar_style(TitleBarStyle::Transparent).hidden_title(false))?;
+            let transparent = caption(observer, "title-transparent")?;
+            let _overlay = make("title-overlay", builder("title-overlay").title_bar_style(TitleBarStyle::Overlay).hidden_title(false))?;
+            let overlay = caption(observer, "title-overlay")?;
+            for state in [&normal, &transparent, &overlay] {
+              for index in 0..3 { numbers(&state["buttons"][index])?; }
+            }
+            require(inset(&normal)? >= 16.0, "Visible titlebar must keep real web content below the titlebar")?;
+            require((inset(&transparent)? - inset(&normal)?).abs() <= 2.0, "Transparent titlebar must retain normal content inset, unlike Overlay")?;
+            require(inset(&overlay)?.abs() <= 2.0, "Overlay must place the actual AXWebArea underneath the titlebar")?;
+          }
+          "hidden_title" => {
+            let _visible = make("title-visible", builder("title-visible").title_bar_style(TitleBarStyle::Visible).hidden_title(false))?;
+            let normal = caption(observer, "title-visible")?;
+            if normal["titleStatus"] != "present" || normal["titleText"].is_null() || normal["titleFrame"].is_null() {
+              return Err(format!("UNKNOWN: visible native title baseline unavailable: {normal}"));
+            }
+            require(normal["titleText"] == "title-visible", "visible native title must match the requested title")?;
+            let _hidden = make("title-hidden", builder("title-hidden").title_bar_style(TitleBarStyle::Visible).hidden_title(true))?;
+            let hidden = caption(observer, "title-hidden")?;
+            if hidden["titleStatus"] == "unavailable" || (hidden["titleStatus"] == "present" && (hidden["titleText"].is_null() || hidden["titleFrame"].is_null())) {
+              return Err(format!("UNKNOWN: hidden-title AX query unavailable, not proof of absence: {hidden}"));
+            }
+            require(hidden["titleStatus"] == "absent" || hidden["titleText"] == "", "hidden_title(true) must remove the actual native title text")?;
+            require((inset(&hidden)? - inset(&normal)?).abs() <= 2.0, "hiding title text must preserve Visible content layout")?;
+            controls_shift(&normal, &hidden, 0.0, 0.0)?;
+          }
+          "builder_traffic_light_position" => {
+            let _a = make("buttons-a", builder("buttons-a").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(12.0,14.0)))?;
+            let a = caption(observer, "buttons-a")?;
+            let _b = make("buttons-b", builder("buttons-b").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(38.0,30.0)))?;
+            let b = caption(observer, "buttons-b")?;
+            controls_shift(&a, &b, 26.0, 16.0)?;
+          }
+          "dispatch_traffic_light_position" => {
+            let moved = make("buttons-dispatch", builder("buttons-dispatch").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(12.0,14.0)))?;
+            let initial = caption(observer, "buttons-dispatch")?;
+            WindowDispatch::<()>::set_traffic_light_position(&moved.dispatcher, LogicalPosition::new(42.0,34.0).into()).map_err(|error| error.to_string())?;
+            let logical = caption(observer, "buttons-dispatch")?;
+            controls_shift(&initial, &logical, 30.0, 20.0)?;
+            let scale = WindowDispatch::<()>::scale_factor(&moved.dispatcher).map_err(|error| error.to_string())?;
+            let point: PhysicalPosition<i32> = LogicalPosition::new(26.0,22.0).to_physical(scale);
+            WindowDispatch::<()>::set_traffic_light_position(&moved.dispatcher, point.into()).map_err(|error| error.to_string())?;
+            let physical = caption(observer, "buttons-dispatch")?;
+            controls_shift(&logical, &physical, -16.0, -12.0)?;
+          }
+          _ => unreachable!(),
+        }
+        Ok(())
+      })();
+      drop(make);
+      for window in cleanup {
+        if let Err(error) = WindowDispatch::<()>::destroy(&window) {
+          failures.push(format!("FAIL: {case} cleanup: {error}"));
+          if result.is_ok() { result = Err(format!("FAIL: {case} cleanup: {error}")); }
+        }
+      }
+      record(member, case, assertion, result, failures);
     }
-    let transparent = create(handle, "title-transparent", builder("title-transparent").title_bar_style(TitleBarStyle::Transparent).hidden_title(false))?;
-    let transparent_state = caption(observer, "title-transparent")?;
-    let overlay = create(handle, "title-overlay", builder("title-overlay").title_bar_style(TitleBarStyle::Overlay).hidden_title(false))?;
-    let overlay_state = caption(observer, "title-overlay")?;
-    require(inset(&normal)? >= 16.0, "Visible titlebar must keep real web content below the titlebar")?;
-    require((inset(&transparent_state)? - inset(&normal)?).abs() <= 2.0, "Transparent titlebar must retain the normal content inset, unlike Overlay")?;
-    require(inset(&overlay_state)?.abs() <= 2.0, "Overlay must place the actual AXWebArea underneath the titlebar")?;
-    evidence("WindowBuilder::title_bar_style", "title_bar_style", "fresh Visible, Transparent and Overlay windows retain three real AX titlebar controls; AXWebArea is inset for Visible/Transparent and extends beneath the Overlay caption");
-
-    let hidden = create(handle, "title-hidden", builder("title-hidden").title_bar_style(TitleBarStyle::Visible).hidden_title(true))?;
-    let hidden_state = caption(observer, "title-hidden")?;
-    require(hidden_state["titleFrame"].is_null() || hidden_state["titleText"] != "title-hidden", "hidden_title(true) must remove the actual title text UI element")?;
-    require((inset(&hidden_state)? - inset(&normal)?).abs() <= 2.0, "hiding only title text must not convert a Visible titlebar to Overlay content layout")?;
-    controls_shift(&normal, &hidden_state, 0.0, 0.0)?;
-    evidence("WindowBuilder::hidden_title", "hidden_title", "fresh hidden_title(false/true) windows differ in the real AX title text element while traffic lights and normal AXWebArea titlebar inset remain unchanged");
-
-    let positioned_a = create(handle, "buttons-a", builder("buttons-a").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(12.0,14.0)))?;
-    let a = caption(observer, "buttons-a")?;
-    let positioned_b = create(handle, "buttons-b", builder("buttons-b").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(38.0,30.0)))?;
-    let b = caption(observer, "buttons-b")?;
-    controls_shift(&a, &b, 26.0, 16.0)?;
-    evidence("WindowBuilder::traffic_light_position", "builder_traffic_light_position", "two fresh Overlay windows with different builder control positions have all three real AX traffic-light frames shifted by the requested 26x16 logical delta");
-
-    let moved = create(handle, "buttons-dispatch", builder("buttons-dispatch").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(12.0,14.0)))?;
-    let initial = caption(observer, "buttons-dispatch")?;
-    WindowDispatch::<()>::set_traffic_light_position(&moved.dispatcher, LogicalPosition::new(42.0,34.0).into()).map_err(|error| error.to_string())?;
-    let logical = caption(observer, "buttons-dispatch")?;
-    controls_shift(&initial, &logical, 30.0, 20.0)?;
-    let scale = WindowDispatch::<()>::scale_factor(&moved.dispatcher).map_err(|error| error.to_string())?;
-    let point: PhysicalPosition<i32> = LogicalPosition::new(26.0,22.0).to_physical(scale);
-    WindowDispatch::<()>::set_traffic_light_position(&moved.dispatcher, point.into()).map_err(|error| error.to_string())?;
-    let physical = caption(observer, "buttons-dispatch")?;
-    controls_shift(&logical, &physical, -16.0, -12.0)?;
-    evidence("WindowDispatch::set_traffic_light_position", "dispatch_traffic_light_position", "logical and physical coordinate dispatches move all three externally observed AX traffic-light frames by distinct correct logical deltas in the same native window");
-    for window in [visible,transparent,overlay,hidden,positioned_a,positioned_b,moved] {
-      WindowDispatch::<()>::destroy(&window.dispatcher).map_err(|error| error.to_string())?;
-    }
-    Ok(())
   }
 
   pub fn run() -> Check {
@@ -430,22 +589,23 @@ int main(int argc, const char **argv) {
     let initial_front = observer.sample()?["frontPID"].as_u64().unwrap_or(0) as u32;
     let first = create_native(&handle, "macos-app-one", builder("macos-app-one").position(100.0,100.0))?;
     let second = create_native(&handle, "macos-app-two", builder("macos-app-two").position(560.0,100.0))?;
-    observer.wait("preflight: actual Electron app, Dock item and two native windows", |state| state["policy"] == 0 && state["dockMatches"].as_u64().is_some_and(|count| count > 0) && visible_pair(state))?;
-    if let Err(error) = runtime_checks(&mut runtime, &handle, &observer, &first) {
-      let _ = <ElectronRuntimeHandle as RuntimeHandle<()>>::request_exit(&handle, 1);
-      let _ = <ElectronRuntime as Runtime<()>>::run_return(runtime, |_| {});
-      let _ = done_tx.send(());
-      return Err(error)
-    }
+    let mut failures = Vec::new();
+    runtime_checks(&mut runtime, &handle, &observer, &first, &mut failures);
     let worker_handle = handle.clone();
     let worker = thread::spawn(move || {
-      let result = handle_checks(&worker_handle, &observer, &first).and_then(|_| titlebars(&worker_handle, &observer));
-      let _ = <ElectronRuntimeHandle as RuntimeHandle<()>>::set_activation_policy(&worker_handle, ActivationPolicy::Regular);
-      let _ = <ElectronRuntimeHandle as RuntimeHandle<()>>::set_dock_visibility(&worker_handle, true);
-      let _ = <ElectronRuntimeHandle as RuntimeHandle<()>>::show(&worker_handle);
-      if initial_front != 0 && initial_front != observer.pid { let _ = observer.activate(initial_front); }
-      let _ = WindowDispatch::<()>::destroy(&first.dispatcher);
-      let _ = WindowDispatch::<()>::destroy(&second.dispatcher);
+      handle_checks(&worker_handle, &observer, &first, &mut failures);
+      titlebars(&worker_handle, &observer, &mut failures);
+      restore_app(&worker_handle, &mut failures);
+      if initial_front != 0 && initial_front != observer.pid {
+        if let Err(error) = observer.activate(initial_front) { eprintln!("{error}"); }
+      }
+      if let Err(error) = observer.restore_manual() { eprintln!("{error}"); }
+      for window in [&first, &second] {
+        if let Err(error) = WindowDispatch::<()>::destroy(&window.dispatcher) {
+          failures.push(format!("FAIL: app window cleanup: {error}"));
+        }
+      }
+      let result = if failures.is_empty() { Ok(()) } else { Err(failures.join("\n")) };
       let _ = <ElectronRuntimeHandle as RuntimeHandle<()>>::request_exit(&worker_handle, i32::from(result.is_err()));
       result
     });
@@ -454,7 +614,7 @@ int main(int argc, const char **argv) {
     let _ = done_tx.send(());
     result?;
     require(status == 0, "real Electron runtime must exit zero")?;
-    println!("macOS external system behavior regressions passed");
+    println!("macOS external system cases completed; member markers retain unavailable observations as unknown");
     Ok(())
   }
 }

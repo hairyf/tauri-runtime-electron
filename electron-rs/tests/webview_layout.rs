@@ -657,6 +657,8 @@ fn macos_center_uses_current_work_area_and_focus_activates_app_before_window() {
         "builder": { "x": 2240, "y": 140, "width": 640, "height": 400, "scale": 2 },
         "centered": { "x": 2320, "y": 170, "width": 480, "height": 340, "scale": 2 },
         "focus": [{ "app": { "steal": true } }, "window"], "nativeCenters": 1,
+        "fullscreen": false, "fullscreenable": true,
+        "trafficLights": [{ "x": 42, "y": 34 }, { "x": 26, "y": 22 }],
     }));
 }
 

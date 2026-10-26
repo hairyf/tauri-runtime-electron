@@ -939,11 +939,16 @@ switch (process.argv[2]) {
     inspect('app').focus = (options) => focus.push({ app: options })
     host.focus = () => focus.push('window')
     await call('window.focus', { windowId: 63 })
+    const trafficLights = []
+    host.setWindowButtonPosition = (position) => trafficLights.push(position)
+    await call('window.trafficLight', { windowId: 63, x: 42, y: 34, physical: false })
+    await call('window.trafficLight', { windowId: 63, x: 52, y: 44, physical: true })
     context.process.platform = 'linux'
     let nativeCenters = 0
     host.center = () => { nativeCenters++ }
     await call('window.center', { windowId: 63 })
-    result = { builder, centered, focus, nativeCenters }
+    result = { builder, centered, focus, nativeCenters,
+      fullscreen: host.options.fullscreen, fullscreenable: host.options.fullscreenable, trafficLights }
     break
   }
   case 'lifecycle': {
