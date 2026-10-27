@@ -1,143 +1,77 @@
 import { EventEmitter } from 'node:events'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import type { DownloadItem, WebContents } from 'electron'
 
-/**
- * 下载领域（骨架）。
- *
- * 原来这一块散在 main.cjs 的 will-download + 三个函数 + commands.cjs 的
- * webview.downloadResponse 里，靠 state.downloadRequests 一张表通信。
- *
- * 关键约束（决定了为什么要有 staging）：
- * - Electron 只允许在 will-download 这个同步回调里 setSavePath；
- * - 真正落盘路径由 Rust 稍后决定，且不能覆盖已有文件；
- * - 决策与完成可能以任意顺序到达，必须两边都齐了才能收尾。
- * 于是先写到临时目录，决策到手后用 COPYFILE_EXCL 发布。
- */
-
 export type DownloadState = 'completed' | 'interrupted' | 'cancelled'
+export interface DownloadInit { id: number; webviewId: number; item: DownloadItem; contents: WebContents; directory: string; provisional: string; suggestedPath: string }
+export interface DownloadDecision { allow: boolean; destination?: string }
+export interface DownloadFinished { webviewId: number; url: string; path: string | null; success: boolean }
+export interface DownloadEvents { finished: [payload: DownloadFinished] }
 
-export interface DownloadInit {
-  id: number
-  webviewId: number
-  item: DownloadItem
-  contents: WebContents
-  /** 决策未到之前的落盘位置（临时目录里的 provisional）。 */
-  directory: string
-  provisional: string
-  /** 默认目标：Rust 没指定 destination 时用它。 */
-  suggestedPath: string
-}
-
-export interface DownloadDecision {
-  allow: boolean
-  destination?: string
-}
-
-export interface DownloadFinished {
-  webviewId: number
-  url: string
-  path: string | null
-  success: boolean
-}
-
-export interface DownloadEvents {
-  finished: [payload: DownloadFinished]
-}
-
-/** 单次下载：只负责状态与落盘，不发事件。 */
 export class Download {
   private allow?: boolean
   private state?: DownloadState
   private finalPath: string
   private published = false
-
-  constructor(private readonly init: DownloadInit) {
-    this.finalPath = init.suggestedPath
-  }
-
-  get id(): number {
-    return this.init.id
-  }
-
-  get webviewId(): number {
-    return this.init.webviewId
-  }
-
-  get url(): string {
-    return this.init.item.getURL()
-  }
-
-  get item(): DownloadItem {
-    return this.init.item
-  }
-
-  get contents(): WebContents {
-    return this.init.contents
-  }
-
-  get allowed(): boolean | undefined {
-    return this.allow
-  }
-
-  get finishedState(): DownloadState | undefined {
-    return this.state
-  }
-
-  get settled(): boolean {
-    return this.allow !== undefined && this.state !== undefined
-  }
-
-  /** 仅第一次决策生效；后续重复应答忽略。 */
+  constructor(private readonly init: DownloadInit) { this.finalPath = init.suggestedPath }
+  get id(): number { return this.init.id }
+  get webviewId(): number { return this.init.webviewId }
+  get url(): string { return this.init.item.getURL() }
+  get item(): DownloadItem { return this.init.item }
+  get contents(): WebContents { return this.init.contents }
+  get allowed(): boolean | undefined { return this.allow }
+  get finishedState(): DownloadState | undefined { return this.state }
+  get settled(): boolean { return this.allow !== undefined && this.state !== undefined }
+  get path(): string { return this.finalPath }
   decide(decision: DownloadDecision): void {
-    // TODO: Implement decide
+    if (this.allow !== undefined) return
+    if (typeof decision.allow !== 'boolean') throw new Error('invalid download decision')
+    const destination = decision.destination ?? this.finalPath
+    this.allow = decision.allow && typeof destination === 'string' && destination.length > 0 && !destination.includes('\0')
+    if (this.allow) this.finalPath = destination
+    if (!this.allow && this.state === undefined) {
+      try { this.init.item.cancel() } catch { /* done event will settle it */ }
+      this.state = 'cancelled'
+    }
   }
-
-  /** 来自 DownloadItem 的 done 事件。 */
-  mark(state: DownloadState): void {
-    // TODO: Implement mark
-  }
-
-  /**
-   * 用 COPYFILE_EXCL 把临时文件挪到最终路径：跨设备可复制，且绝不覆盖已有数据。
-   * 失败时保留临时文件，便于用户手动取回。
-   */
+  mark(state: DownloadState): void { if (this.state === undefined) this.state = state }
   publish(): boolean {
-    // TODO: Implement publish
-    throw new Error('not implemented')
+    if (this.published || !this.allow || this.state !== 'completed') return this.published
+    try { fs.copyFileSync(this.init.provisional, this.finalPath, fs.constants.COPYFILE_EXCL); this.published = true; return true } catch (error) {
+      try { fs.appendFileSync(path.join(os.tmpdir(), 'tauri-runtime-electron.log'), `download.publish failed; staged data retained ${this.init.provisional} ${String(error)}\n`) } catch { /* best effort */ }
+      return false
+    }
   }
-
-  clean(): void {
-    // TODO: Implement clean
-  }
+  clean(): void { try { fs.rmSync(this.init.directory, { recursive: true, force: true }) } catch { /* best effort */ } }
 }
 
-/**
- * request id → Download。收尾条件满足时抛 finished 事件，宿主转成线协议。
- */
 export class Downloads extends EventEmitter<DownloadEvents> {
   private readonly pending = new Map<number, Download>()
-
+  private readonly timers = new Map<number, NodeJS.Timeout>()
   begin(init: DownloadInit): Download {
-    // TODO: Implement begin
-    throw new Error('not implemented')
+    if (this.pending.has(init.id)) throw new Error(`duplicate download ${init.id}`)
+    const download = new Download(init); this.pending.set(init.id, download)
+    const onDestroyed = () => { if (!download.settled) { download.decide({ allow: false }); download.mark('cancelled') }; this.finish(init.id) }
+    init.contents.once('destroyed', onDestroyed)
+    const timer = setTimeout(onDestroyed, 30_000); timer.unref(); this.timers.set(init.id, timer)
+    init.item.once('done', (_event, state) => { if (!this.pending.has(init.id)) download.clean(); else { download.mark(state as DownloadState); this.finish(init.id) } })
+    return download
   }
-
-  get(id: number): Download | undefined {
-    // TODO: Implement get
-    throw new Error('not implemented')
-  }
-
-  /** webview.downloadResponse。 */
+  get(id: number): Download | undefined { return this.pending.get(id) }
   decide(id: number, decision: DownloadDecision): void {
-    // TODO: Implement decide
+    const download = this.pending.get(id); if (!download) return
+    download.decide(decision)
+    const timer = this.timers.get(id); if (timer) { clearTimeout(timer); this.timers.delete(id) }
+    this.finish(id)
   }
-
-  /** DownloadItem 'done' → completed / interrupted。 */
-  mark(id: number, state: DownloadState): void {
-    // TODO: Implement mark
+  mark(id: number, state: DownloadState): void { const download = this.pending.get(id); if (!download) return; download.mark(state); this.finish(id) }
+  private finish(id: number): void {
+    const download = this.pending.get(id); if (!download || !download.settled) return
+    this.pending.delete(id); const timer = this.timers.get(id); if (timer) clearTimeout(timer); this.timers.delete(id)
+    const success = download.publish(); if (success || !download.allowed || download.finishedState !== 'completed') download.clean()
+    this.emit('finished', { webviewId: download.webviewId, url: download.url, path: success ? download.path : null, success })
   }
-
-  dispose(): void {
-    // TODO: Implement dispose
-  }
+  dispose(): void { for (const id of [...this.pending.keys()]) { const download = this.pending.get(id); if (!download) continue; download.decide({ allow: false }); download.mark('cancelled'); this.finish(id) }; for (const timer of this.timers.values()) clearTimeout(timer); this.timers.clear() }
 }

@@ -14,26 +14,29 @@
 //! runtimes that do not have one, while Electron's window needs a native
 //! `before-input-event` hook — see `electron-rs/assets/main.cjs`.
 
-use serde_json::json;
+use crate::rpc;
 use tauri_runtime::Result;
 
 use crate::webview::ElectronWebviewDispatcher;
 
 pub(crate) fn open(webview: &ElectronWebviewDispatcher) -> Result<()> {
   webview
-    .webview_call("webview.openDevtools", json!({}))
+    .webview_call(rpc::WebviewOpenDevtools {
+      webview_id: webview.id,
+    })
     .map(|_| ())
 }
 
 pub(crate) fn close(webview: &ElectronWebviewDispatcher) -> Result<()> {
   webview
-    .webview_call("webview.closeDevtools", json!({}))
+    .webview_call(rpc::WebviewCloseDevtools {
+      webview_id: webview.id,
+    })
     .map(|_| ())
 }
 
 pub(crate) fn is_open(webview: &ElectronWebviewDispatcher) -> Result<bool> {
-  Ok(webview
-    .webview_call("webview.isDevtoolsOpen", json!({}))?
-    .as_bool()
-    .unwrap_or(false))
+  webview.webview_call(rpc::WebviewIsDevtoolsOpen {
+    webview_id: webview.id,
+  })
 }

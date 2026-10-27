@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+use crate::rpc;
 use crate::runtime::{
-  ElectronRuntime, Message, RuntimeContext, IPC_TIMEOUT, create_webview_err,
-  position_payload, size_payload,
+  create_webview_err, position_payload, size_payload, ElectronRuntime, Message, RuntimeContext,
 };
-use serde_json::{json, Value};
+use electron_rs::RpcRequest;
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri_runtime::{
-  Result, UserEvent, WebviewDispatch,
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
   window::WindowId,
+  Result, UserEvent, WebviewDispatch,
 };
 use url::Url;
 
@@ -29,35 +30,42 @@ impl ElectronWebviewDispatcher {
 
   /// Queries the guest's physical-pixel rect from the Electron side.
   fn rectangle(&self) -> Result<tauri_runtime::dpi::Rect> {
-    let bounds = self.webview_call("webview.bounds", json!({}))?;
+    let bounds = self.webview_call(rpc::WebviewBounds {
+      webview_id: self.id,
+    })?;
     Ok(rect_from_value(&bounds["bounds"]))
   }
-
 }
 
 impl ElectronWebviewDispatcher {
   // Tauri 2's `WebviewDispatch` has no history methods (the webview plugin drives
   // them through `eval`), so these stay inherent for direct use.
   pub fn go_back(&self) -> Result<()> {
-    self.webview_call("webview.goBack", json!({})).map(|_| ())
+    self
+      .webview_call(rpc::WebviewGoBack {
+        webview_id: self.id,
+      })
+      .map(|_| ())
   }
 
   pub fn can_go_back(&self) -> Result<bool> {
-    Ok(self
-      .webview_call("webview.canGoBack", json!({}))?
-      .as_bool()
-      .unwrap_or(false))
+    self.webview_call(rpc::WebviewCanGoBack {
+      webview_id: self.id,
+    })
   }
 
   pub fn go_forward(&self) -> Result<()> {
-    self.webview_call("webview.goForward", json!({})).map(|_| ())
+    self
+      .webview_call(rpc::WebviewGoForward {
+        webview_id: self.id,
+      })
+      .map(|_| ())
   }
 
   pub fn can_go_forward(&self) -> Result<bool> {
-    Ok(self
-      .webview_call("webview.canGoForward", json!({}))?
-      .as_bool()
-      .unwrap_or(false))
+    self.webview_call(rpc::WebviewCanGoForward {
+      webview_id: self.id,
+    })
   }
 }
 
@@ -84,7 +92,8 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   /// webview object compatible with Tauri's platform-specific downcasts.
   fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, _f: F) -> Result<()> {
     Err(create_webview_err(
-      "WebviewDispatch::with_webview is unavailable: Electron owns the webview in another process".into(),
+      "WebviewDispatch::with_webview is unavailable: Electron owns the webview in another process"
+        .into(),
     ))
   }
 
@@ -114,7 +123,10 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
 
   fn set_zoom(&self, scale_factor: f64) -> Result<()> {
     self
-      .webview_call("webview.setZoom", json!({ "scaleFactor": scale_factor }))
+      .webview_call(rpc::WebviewSetZoom {
+        webview_id: self.id,
+        scale_factor: scale_factor,
+      })
       .map(|_| ())
   }
 
@@ -131,11 +143,10 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .context
       .ipc
-      .post(
-        "webview.eval",
-        json!({ "webviewId": self.id, "script": script }),
-        IPC_TIMEOUT,
-      )
+      .notify(rpc::EvalScript {
+        webview_id: self.id,
+        script,
+      })
       .map_err(|error| tauri_runtime::Error::CreateWebview(Box::new(error)))
   }
 
@@ -152,18 +163,23 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
       .replace(script.clone());
     self.context.window_for_webview(self.id)?;
     let run_tx = self.context.run_tx.clone();
-    self.context.ipc.call_async(
-      "webview.eval",
-      json!({ "webviewId": self.id, "script": script }),
-      IPC_TIMEOUT,
-      move |result| {
-        // Only a Send channel crosses threads, never the runtime's RefCells.
-        let _ = run_tx.send(Message::Task(Box::new(move || match result {
-          Ok(value) => callback(value.to_string()),
-          Err(error) => eprintln!("[electron] script evaluation failed: {error}"),
-        })));
-      },
-    ).map_err(|error| create_webview_err(error.to_string()))
+    self
+      .context
+      .ipc
+      .dispatch(
+        rpc::EvalScriptCallback {
+          webview_id: self.id,
+          script,
+        },
+        move |result| {
+          // Only a Send channel crosses threads, never the runtime's RefCells.
+          let _ = run_tx.send(Message::Task(Box::new(move || match result {
+            Ok(value) => callback(value.to_string()),
+            Err(error) => eprintln!("[electron] script evaluation failed: {error}"),
+          })));
+        },
+      )
+      .map_err(|error| create_webview_err(error.to_string()))
   }
 
   fn url(&self) -> Result<String> {
@@ -184,40 +200,74 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
 
   fn navigate(&self, url: Url) -> Result<()> {
     self
-      .webview_call("webview.navigate", json!({ "url": url.to_string() }))
+      .webview_call(rpc::WebviewNavigate {
+        webview_id: self.id,
+        url: url.to_string(),
+      })
       .map(|_| ())
   }
 
   fn reload(&self) -> Result<()> {
-    self.webview_call("webview.reload", json!({})).map(|_| ())
+    self
+      .webview_call(rpc::WebviewReload {
+        webview_id: self.id,
+      })
+      .map(|_| ())
   }
 
   fn print(&self) -> Result<()> {
-    self.webview_call("webview.print", json!({})).map(|_| ())
+    self
+      .webview_call(rpc::WebviewPrint {
+        webview_id: self.id,
+      })
+      .map(|_| ())
   }
 
   fn close(&self) -> Result<()> {
     // Native views are owned independently; closing a page leaves its window alive.
-    self.webview_call("webview.close", json!({})).map(|_| ())
+    self
+      .webview_call(rpc::WebviewClose {
+        webview_id: self.id,
+      })
+      .map(|_| ())
   }
 
   fn set_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
-    self.webview_call("webview.setBounds", json!({
-      "position": position_payload(bounds.position),
-      "size": size_payload(bounds.size),
-    })).map(|_| ())
+    self
+      .webview_call(rpc::WebviewSetBounds {
+        webview_id: self.id,
+        position: Some(position_payload(bounds.position)),
+        size: Some(size_payload(bounds.size)),
+      })
+      .map(|_| ())
   }
 
   fn set_size(&self, size: Size) -> Result<()> {
-    self.webview_call("webview.setBounds", json!({ "size": size_payload(size) })).map(|_| ())
+    self
+      .webview_call(rpc::WebviewSetBounds {
+        webview_id: self.id,
+        position: None,
+        size: Some(size_payload(size)),
+      })
+      .map(|_| ())
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
-    self.webview_call("webview.setBounds", json!({ "position": position_payload(position) })).map(|_| ())
+    self
+      .webview_call(rpc::WebviewSetBounds {
+        webview_id: self.id,
+        position: Some(position_payload(position)),
+        size: None,
+      })
+      .map(|_| ())
   }
 
   fn set_focus(&self) -> Result<()> {
-    self.webview_call("webview.focus", json!({})).map(|_| ())
+    self
+      .webview_call(rpc::WebviewFocus {
+        webview_id: self.id,
+      })
+      .map(|_| ())
   }
 
   fn reparent(&self, window_id: WindowId) -> Result<()> {
@@ -225,41 +275,46 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   }
 
   fn cookies(&self) -> Result<Vec<tauri_runtime::Cookie<'static>>> {
-    let cookies = self.webview_call("webview.cookies", json!({}))?;
+    let cookies = self.webview_call(rpc::WebviewCookies {
+      webview_id: self.id,
+      url: None,
+    })?;
     Ok(parse_cookies(&cookies))
   }
 
   fn cookies_for_url(&self, url: Url) -> Result<Vec<tauri_runtime::Cookie<'static>>> {
-    let cookies = self.webview_call("webview.cookies", json!({ "url": url.to_string() }))?;
+    let cookies = self.webview_call(rpc::WebviewCookies {
+      webview_id: self.id,
+      url: Some(url.to_string()),
+    })?;
     Ok(parse_cookies(&cookies))
   }
 
   fn set_cookie(&self, cookie: tauri_runtime::Cookie<'_>) -> Result<()> {
     let url = self.cookie_url(&cookie)?;
     self
-      .webview_call(
-        "webview.setCookie",
-        json!({
-          "url": url,
-          "name": cookie.name(),
-          "value": cookie.value(),
-          "domain": cookie.domain(),
-          "path": cookie.path(),
-          "secure": cookie.secure().unwrap_or(false),
-          "httpOnly": cookie.http_only(),
-          "sameSite": same_site_name(cookie.same_site()),
-        }),
-      )
+      .webview_call(rpc::WebviewSetCookie {
+        webview_id: self.id,
+        url: url,
+        name: cookie.name().to_owned(),
+        value: cookie.value().to_owned(),
+        domain: cookie.domain().map(str::to_owned),
+        path: cookie.path().map(str::to_owned),
+        secure: cookie.secure().unwrap_or(false),
+        http_only: cookie.http_only(),
+        same_site: same_site_name(cookie.same_site()),
+      })
       .map(|_| ())
   }
 
   fn delete_cookie(&self, cookie: tauri_runtime::Cookie<'_>) -> Result<()> {
     let url = self.cookie_url(&cookie)?;
     self
-      .webview_call(
-        "webview.deleteCookie",
-        json!({ "url": url, "name": cookie.name() }),
-      )
+      .webview_call(rpc::WebviewDeleteCookie {
+        webview_id: self.id,
+        url: url,
+        name: cookie.name().to_owned(),
+      })
       .map(|_| ())
   }
 
@@ -267,62 +322,84 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
   /// hosts that want the contents to track the window instead.
   fn set_auto_resize(&self, auto_resize: bool) -> Result<()> {
     self
-      .webview_call("webview.setAutoResize", json!({ "autoResize": auto_resize }))
+      .webview_call(rpc::WebviewSetAutoResize {
+        webview_id: self.id,
+        auto_resize: auto_resize,
+      })
       .map(|_| ())
   }
 
   fn clear_all_browsing_data(&self) -> Result<()> {
     self
-      .webview_call("webview.clearBrowsingData", json!({}))
+      .webview_call(rpc::WebviewClearBrowsingData {
+        webview_id: self.id,
+      })
       .map(|_| ())
   }
 
   fn hide(&self) -> Result<()> {
     self
-      .webview_call("webview.visibility", json!({ "visible": false }))
+      .webview_call(rpc::WebviewVisibility {
+        webview_id: self.id,
+        visible: false,
+      })
       .map(|_| ())
   }
 
   fn show(&self) -> Result<()> {
     self
-      .webview_call("webview.visibility", json!({ "visible": true }))
+      .webview_call(rpc::WebviewVisibility {
+        webview_id: self.id,
+        visible: true,
+      })
       .map(|_| ())
   }
 
   fn set_background_color(&self, color: Option<tauri_utils::config::Color>) -> Result<()> {
     self
-      .webview_call("webview.backgroundColor", json!({ "color": color.map(css_color) }))
+      .webview_call(rpc::WebviewBackgroundColor {
+        webview_id: self.id,
+        color: color.map(css_color),
+      })
       .map(|_| ())
   }
 }
 
 impl ElectronWebviewDispatcher {
   fn current_url(&self) -> Result<String> {
-    self.webview_call("webview.url", json!({}))?.as_str().map(str::to_owned)
-      .ok_or_else(|| create_webview_err("Electron returned no webview URL".into()))
+    self.webview_call(rpc::WebviewUrl {
+      webview_id: self.id,
+    })
   }
 
   /// Use the committed page, not the builder URL or a requested navigation.
   fn cookie_url(&self, cookie: &tauri_runtime::Cookie<'_>) -> Result<String> {
     let raw = match cookie.domain() {
-      Some(domain) => format!("{}://{}/", if cookie.secure().unwrap_or(false) { "https" } else { "http" }, domain.trim_start_matches('.')),
+      Some(domain) => format!(
+        "{}://{}/",
+        if cookie.secure().unwrap_or(false) {
+          "https"
+        } else {
+          "http"
+        },
+        domain.trim_start_matches('.')
+      ),
       None => self.current_url()?,
     };
     let mut url = Url::parse(&raw).map_err(|error| create_webview_err(error.to_string()))?;
-    if let Some(path) = cookie.path() { url.set_path(path); }
+    if let Some(path) = cookie.path() {
+      url.set_path(path);
+    }
     Ok(url.into())
   }
 }
 
 impl ElectronWebviewDispatcher {
-  pub(crate) fn webview_call(&self, method: &str, mut params: Value) -> Result<Value> {
-    if let Some(map) = params.as_object_mut() {
-      map.insert("webviewId".into(), json!(self.id));
-    }
+  pub(crate) fn webview_call<R: RpcRequest>(&self, request: R) -> Result<R::Response> {
     self
       .context
       .ipc
-      .call(method, params, IPC_TIMEOUT)
+      .call(request)
       .map_err(|error| tauri_runtime::Error::CreateWebview(Box::new(error)))
   }
 }
@@ -340,11 +417,8 @@ fn rect_from_value(value: &Value) -> tauri_runtime::dpi::Rect {
   tauri_runtime::dpi::Rect { position, size }
 }
 
-fn parse_cookies(value: &Value) -> Vec<tauri_runtime::Cookie<'static>> {
-  value
-    .as_array()
-    .map(|cookies| cookies.iter().filter_map(cookie_from_value).collect())
-    .unwrap_or_default()
+fn parse_cookies(value: &[Value]) -> Vec<tauri_runtime::Cookie<'static>> {
+  value.iter().filter_map(cookie_from_value).collect()
 }
 
 fn cookie_from_value(value: &Value) -> Option<tauri_runtime::Cookie<'static>> {

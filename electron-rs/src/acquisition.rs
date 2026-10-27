@@ -468,7 +468,7 @@ pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<Pat
   let actual = digest(&archive)?;
   if !actual.eq_ignore_ascii_case(&expected) {
     let _ = fs::remove_file(&archive);
-    return Err(format!("checksum mismatch for {name}: {actual} != {expected}").into());
+    return Err(Error::ChecksumMismatch { expected, actual });
   }
 
   let parent = dist.parent().ok_or("cache path has no parent")?;

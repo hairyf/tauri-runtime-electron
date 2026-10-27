@@ -1,5 +1,9 @@
 import { contextBridge, ipcRenderer, webFrame } from 'electron'
 
+declare global {
+  interface Window { ipc: { postMessage(data: unknown): void; fetch(request: unknown): Promise<any> } }
+}
+
 if (process.isMainFrame) {
   contextBridge.exposeInMainWorld('ipc', {
     postMessage: (data: any) => ipcRenderer.send('tauri-ipc', String(data)),

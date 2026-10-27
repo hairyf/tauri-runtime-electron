@@ -4,6 +4,7 @@
 //! launch the prepared [`Electron`]; launching never downloads or patches files.
 
 mod acquisition;
+mod error;
 mod ipc;
 mod metadata;
 #[cfg(windows)]
@@ -11,63 +12,9 @@ mod pe;
 
 use std::{fs, io, path::{Path, PathBuf}, process::{Command, Output}};
 use acquisition::DistributionTarget;
-pub use ipc::{Electron, Event};
+pub use ipc::{Electron, Event, RpcRequest};
 
-/// An Electron preparation or IPC failure, retaining its underlying cause.
-#[derive(Debug)]
-pub struct Error {
-  message: String,
-  source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl Error {
-  pub(crate) fn with_source(message: impl Into<String>, source: impl std::error::Error + Send + Sync + 'static) -> Self {
-    Self { message: message.into(), source: Some(Box::new(source)) }
-  }
-
-  pub(crate) fn context(self, message: impl Into<String>) -> Self {
-    Self::with_source(message, self)
-  }
-}
-
-impl std::fmt::Display for Error {
-  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter.write_str(&self.message)?;
-    if let Some(source) = &self.source { write!(formatter, ": {source}")?; }
-    Ok(())
-  }
-}
-
-impl std::error::Error for Error {
-  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-    self.source.as_deref().map(|source| source as &(dyn std::error::Error + 'static))
-  }
-}
-
-impl From<String> for Error {
-  fn from(message: String) -> Self { Self { message, source: None } }
-}
-
-impl From<&str> for Error {
-  fn from(message: &str) -> Self { message.to_owned().into() }
-}
-
-impl From<io::Error> for Error {
-  fn from(source: io::Error) -> Self { Self::with_source("I/O operation failed", source) }
-}
-
-impl From<serde_json::Error> for Error {
-  fn from(source: serde_json::Error) -> Self { Self::with_source("invalid JSON", source) }
-}
-
-impl From<std::string::FromUtf16Error> for Error {
-  fn from(source: std::string::FromUtf16Error) -> Self { Self::with_source("invalid UTF-16", source) }
-}
-
-#[cfg(windows)]
-impl From<windows::core::Error> for Error {
-  fn from(source: windows::core::Error) -> Self { Self::with_source("Windows operation failed", source) }
-}
+pub use error::{ElectronError, Error};
 
 /// The output published by one successful build, with paths resolved once.
 #[derive(Debug)]
@@ -123,6 +70,15 @@ impl ElectronBuilder {
   pub fn resources_dir(mut self, path: impl Into<PathBuf>) -> Self { self.resources = Some(path.into()); self }
   /// Override `target/electron/<platform>-<arch>`.
   pub fn output(mut self, path: impl Into<PathBuf>) -> Self { self.output = Some(path.into()); self }
+  /// Set the display name applied to the private distribution.
+  pub fn app_name(mut self, name: impl Into<String>) -> Self { self.metadata.app_name = Some(name.into()); self }
+  /// Set the application identifier used by desktop integration.
+  pub fn identifier(mut self, identifier: impl Into<String>) -> Self { self.metadata.identifier = Some(identifier.into()); self }
+  /// Set a Windows `.ico` or macOS `.icns` application icon.
+  pub fn icon(mut self, path: impl Into<PathBuf>) -> Self { self.metadata.icon = Some(path.into()); self }
+  /// Reuse Windows icon/version resources from this executable.
+  pub fn host_executable(mut self, path: impl Into<PathBuf>) -> Self { self.metadata.host_executable = Some(path.into()); self }
+  /// Replace all branding settings; individual fluent setters can override them.
   pub fn metadata(mut self, metadata: Metadata) -> Self { self.metadata = metadata; self }
 
   /// Prepare and publish a private distribution and its embedded scripts.
@@ -276,14 +232,8 @@ fn validate_version(version: &str) -> Result<(), Error> {
   Ok(())
 }
 
-const ASSETS: [(&str, &[u8]); 6] = [
-  ("main.cjs", include_bytes!("../assets/main.cjs")),
-  ("internal.cjs", include_bytes!("../assets/internal.cjs")),
-  ("commands.cjs", include_bytes!("../assets/commands.cjs")),
-  ("ipc.cjs", include_bytes!("../assets/ipc.cjs")),
-  ("preload.cjs", include_bytes!("../assets/preload.cjs")),
-  ("appkit.mm", include_bytes!("../assets/appkit.mm")),
-];
+// Generated at Cargo build time from the complete tsdown output tree.
+include!(concat!(env!("OUT_DIR"), "/assets.rs"));
 
 fn assets_match(dir: &Path, target: &DistributionTarget) -> bool {
   (target.platform != "darwin" || fs::symlink_metadata(dir.join("appkit.node")).is_ok_and(|metadata| metadata.is_file()))
@@ -297,10 +247,21 @@ fn assets_match(dir: &Path, target: &DistributionTarget) -> bool {
 fn write_assets(dir: &Path) -> Result<(), Error> {
   for (name, bytes) in ASSETS {
     let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+      let relative = parent.strip_prefix(dir).map_err(|error| Error::with_source("asset outside distribution", error))?;
+      let mut directory = dir.to_path_buf();
+      for component in relative.components() {
+        directory.push(component);
+        if fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_symlink()) {
+          fs::remove_file(&directory).map_err(|error| Error::with_source(format!("remove asset directory link {}", directory.display()), error))?;
+        }
+        fs::create_dir_all(&directory).map_err(|error| Error::with_source(format!("create {}", directory.display()), error))?;
+      }
+    }
     if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_symlink()) {
       fs::remove_file(&path).map_err(|error| Error::with_source(format!("remove script link {}", path.display()), error))?;
     }
-    if fs::read(&path).ok().as_deref() != Some(bytes) {
+    if fs::read(&path).ok().as_deref() != Some(*bytes) {
       fs::write(&path, bytes).map_err(|error| Error::with_source(format!("write {}", path.display()), error))?;
     }
   }
@@ -370,8 +331,8 @@ mod tests {
     assert_eq!(marker["electronVersion"], DEFAULT_VERSION);
     fs::write(output.join("main.cjs"), b"stale").unwrap();
     fs::remove_file(output.join("preload.cjs")).unwrap();
-    fs::write(output.join("commands.cjs"), b"stale commands").unwrap();
-    fs::remove_file(output.join("internal.cjs")).unwrap();
+    fs::write(output.join("runtime/commands.cjs"), b"stale commands").unwrap();
+    fs::remove_file(output.join("socket/ipc.cjs")).unwrap();
     if target.platform == "darwin" {
       assert!(output.join("appkit.node").is_file());
       fs::remove_file(output.join("appkit.node")).unwrap();
@@ -379,7 +340,7 @@ mod tests {
     builder.build().unwrap();
     assert!(assets_match(&output, &target));
     for (name, bytes) in ASSETS {
-      assert_eq!(fs::read(output.join(name)).unwrap(), bytes, "staged asset {name}");
+      assert_eq!(fs::read(output.join(name)).unwrap(), *bytes, "staged asset {name}");
     }
     assert_eq!(find_binary(root.join("runtime")).unwrap(), builder.binary().unwrap());
     assert!(find_binary(root.join("missing")).is_err());

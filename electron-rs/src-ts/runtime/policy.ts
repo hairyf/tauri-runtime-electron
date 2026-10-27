@@ -1,133 +1,86 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import type { BrowserWindowConstructorOptions, Session, WebContents } from 'electron'
 import type { DownloadDecision, Downloads } from './downloads'
 import type { Webview, Webviews } from './webview'
 import type { Window, Windows } from './window'
 
-/**
- * 策略桥（骨架）—— 唯一允许把决策权交给 Rust 的地方。
- *
- * 四种策略的 Electron API 形状完全不同，这也是它们过去被摊在 main.cjs 里的原因：
- *
- * | 策略       | 触发点                        | 能否阻塞 |
- * | navigation | webRequest.onBeforeRequest    | 否（异步回调） |
- * | download   | session 'will-download'       | 否，但 setSavePath 必须在同步阶段完成 |
- * | permission | setPermissionRequestHandler   | 否（callback 可延迟） |
- * | popup      | setWindowOpenHandler          | **是**（必须当场返回 action） |
- *
- * 只有 popup 走 `transport.request()`（PolicyBridge，刻意不等同于 transport.ts 的
- * 传输层）。它同时也解释了 ipc 为什么要 Worker 线程：
- * 阻塞期间 Rust 会嵌套下发 window.create，那条命令必须还能被执行。
- *
- * 因为没有第二条阻塞入口，internal.cjs 里的 synchronousMethods 白名单可以消失：
- * 能阻塞的只有下面 attach() 里那一次调用，是类型层面固定的。
- */
+export type PermissionKind = 'geolocation' | 'notifications' | 'clipboard-read' | 'display-capture' | 'midi' | 'sensors' | 'camera' | 'microphone'
+export interface PolicyBridge { send(event: string, params: Record<string, unknown>): void; request<T>(event: string, params: Record<string, unknown>, timeout?: number): T }
+export interface PopupDetails { request: number; webviewId: number; url: string; frameName: string; features: string; disposition: string; position: { x: number; y: number } | null; size: { width: number; height: number } | null }
+export interface NewWindowResponse { action: 'allow' | 'deny'; windowId?: number }
+export interface PopupPlan { window: Window; options: BrowserWindowConstructorOptions; attach(contents: WebContents): void }
+export interface PolicyHost { readonly transport: PolicyBridge; readonly downloads: Downloads; readonly webviews: Webviews; readonly windows: Windows; readonly popups: Map<number, PopupPlan> }
+interface NavigationEntry { finish(allow: boolean, retired?: boolean): void; timer: NodeJS.Timeout; onDestroyed(): void; nativeId: number; contents: WebContents }
 
-export type PermissionKind =
-  | 'geolocation'
-  | 'notifications'
-  | 'clipboard-read'
-  | 'display-capture'
-  | 'midi'
-  | 'sensors'
-  | 'camera'
-  | 'microphone'
-
-/** 与 IPC 的接触面。刻意窄：只有 popup 允许 request()。 */
-export interface PolicyBridge {
-  send(event: string, params: Record<string, unknown>): void
-  /** 同步阻塞：仅 webview.newWindow 使用。 */
-  request<T>(event: string, params: Record<string, unknown>, timeout?: number): T
-}
-
-/** window.open 的入参，字段与 Electron 的 handler details 对齐。 */
-export interface PopupDetails {
-  request: number
-  webviewId: number
-  url: string
-  frameName: string
-  features: string
-  disposition: string
-  position: { x: number; y: number } | null
-  size: { width: number; height: number } | null
-}
-
-export interface NewWindowResponse {
-  action: 'allow' | 'deny'
-  windowId?: number
-}
-
-/**
- * Rust 在阻塞期间嵌套建好的原生窗口（走 window.create + newWindowRequest）。
- * attach() 把 Chromium 刚创建的 guest WebContents 塞进这个既有窗口。
- */
-export interface PopupPlan {
-  window: Window
-  options: BrowserWindowConstructorOptions
-  attach(contents: WebContents): void
-}
-
-export interface PolicyHost {
-  readonly transport: PolicyBridge
-  readonly downloads: Downloads
-  /** Electron 只给 WebContents；策略用 webviews.forContents 反查 Tauri 的 webviewId 与策略。 */
-  readonly webviews: Webviews
-  readonly windows: Windows
-  /** 阻塞期间建好的 popup，按 request id 存；由 factory 写入、策略取出。 */
-  readonly popups: Map<number, PopupPlan>
-}
-
-interface NavigationEntry {
-  finish(allow: boolean, retired?: boolean): void
-  timer: NodeJS.Timeout
-  onDestroyed(): void
+const popupGeometry = (features: string): Pick<PopupDetails, 'position' | 'size'> => {
+  const values = Object.fromEntries(String(features ?? '').split(',').map((entry) => entry.trim().split('=')))
+  const number = (...keys: string[]) => { const raw = keys.map((key) => values[key]).find((value) => value !== undefined); const n = Number.parseInt(raw, 10); return Number.isFinite(n) ? n : undefined }
+  const x = number('left', 'x'); const y = number('top', 'y'); const width = number('width', 'innerWidth'); const height = number('height', 'innerHeight')
+  return { position: x === undefined && y === undefined ? null : { x: x ?? 0, y: y ?? 0 }, size: width === undefined && height === undefined ? null : { width: width ?? 800, height: height ?? 600 } }
 }
 
 export class Policies {
-  /** 同一个 session 可能被多个窗口共享，重复安装会叠加 handler。 */
-  private readonly sessions = new WeakSet<Session>()
-  private readonly navigations = new Map<number, NavigationEntry>()
-  private readonly permissions = new Map<number, (allow: boolean) => void>()
-  private nextNavigationRequest = 0
-  private nextPermissionRequest = 0
-  private disposed = false
-
+  private readonly sessions = new WeakSet<Session>(); private readonly navigations = new Map<number, NavigationEntry>(); private readonly nativeNavigations = new WeakMap<Session, Map<number, NavigationEntry>>(); private readonly permissions = new Map<number, (allow: boolean) => void>(); private nextNavigationRequest = 0; private nextDownloadRequest = 0; private nextPermissionRequest = 0; private nextPopupRequest = 0; private disposed = false
+  private popup?: { request: number; opener: Webview }
   constructor(private readonly host: PolicyHost) {}
-
-  /** 安装 session 级的三条策略（导航 / 下载 / 权限）。幂等。 */
+  get activePopup(): { request: number; opener: Webview } | undefined { return this.popup }
   install(session: Session): void {
-    // TODO: Implement install
+    if (this.disposed || this.sessions.has(session)) return; this.sessions.add(session)
+    const nativeNavigations = new Map<number, NavigationEntry>()
+    this.nativeNavigations.set(session, nativeNavigations)
+    const retire = (details: { id: number }) => nativeNavigations.get(details.id)?.finish(false, true)
+    session.webRequest.onCompleted(retire); session.webRequest.onErrorOccurred(retire)
+    session.webRequest.onBeforeRequest((details, callback) => {
+      const contentsId = details.webContents?.id ?? details.webContentsId
+      const webview = contentsId === undefined ? undefined : this.host.webviews.forContents(contentsId)
+      const contents = webview?.contents
+      if (!contents || !['mainFrame', 'subFrame'].includes(details.resourceType) || !webview?.webviewPolicy?.navigation) { callback({}); return }
+      const id = ++this.nextNavigationRequest
+      const entry: NavigationEntry = { nativeId: details.id, contents, timer: undefined as unknown as NodeJS.Timeout, onDestroyed: () => finish(false) , finish: (allow, retired = false) => {
+        if (!this.navigations.delete(id)) return; nativeNavigations.delete(details.id); clearTimeout(entry.timer); contents.removeListener('destroyed', entry.onDestroyed); if (retired || this.disposed) return
+        try { if (!allow && details.resourceType === 'mainFrame' && !contents.isDestroyed()) contents.stop() } finally { callback({ cancel: !allow }) }
+      } }
+      const finish = (allow: boolean) => entry.finish(allow)
+      entry.onDestroyed = () => finish(false); entry.timer = setTimeout(entry.onDestroyed, 15_000); entry.timer.unref(); this.navigations.set(id, entry); nativeNavigations.set(details.id, entry); contents.once('destroyed', entry.onDestroyed)
+      this.host.transport.send('webview.navigationRequested', { id, webviewId: webview.id, url: details.url })
+    })
+    session.on('will-download', (event, item, contents) => {
+      const webview = contents ? this.host.webviews.forContents(contents.id) : undefined
+      if (!webview?.webviewPolicy?.download) return
+      const id = ++this.nextDownloadRequest
+      const suggestedPath = item.getSavePath() || path.join(os.tmpdir(), item.getFilename())
+      let directory: string
+      try { directory = fs.mkdtempSync(path.join(os.tmpdir(), 'electron-download-')); const provisional = path.join(directory, 'download'); item.setSavePath(provisional); const download = this.host.downloads.begin({ id, webviewId: webview.id, item, contents, directory, provisional, suggestedPath }); this.host.transport.send('download.requested', { id, webviewId: webview.id, url: item.getURL(), destination: suggestedPath }); void download } catch { event.preventDefault(); this.host.transport.send('download.finished', { webviewId: webview.id, url: item.getURL(), path: null, success: false }) }
+    })
+    session.setPermissionRequestHandler((contents, permission, callback, details) => {
+      const webview = this.host.webviews.forContents(contents.id); const kind = permissionKind(permission, details as { mediaTypes?: string[] })
+      if (!webview?.webviewPolicy?.permission || !kind) { callback(false); return }
+      const id = ++this.nextPermissionRequest; this.permissions.set(id, callback); this.host.transport.send('permission.requested', { id, webviewId: webview.id, kind })
+    })
   }
-
-  /** 安装页面级的 popup 策略。每个 WebContents 都要装一次。 */
   attach(webview: Webview): void {
-    // TODO: Implement attach
+    const contents = webview.contents
+    contents.setWindowOpenHandler((details) => {
+      const request = this.nextPopupRequest++
+      const previous = this.popup; this.popup = { request, opener: webview }
+      try {
+        const response = this.host.transport.request<NewWindowResponse>('webview.newWindow', { request, webviewId: webview.id, url: details.url, frameName: details.frameName, features: details.features ?? '', disposition: details.disposition, ...popupGeometry(details.features ?? '') })
+        if (response.action !== 'allow' || !Number.isSafeInteger(response.windowId)) return { action: 'deny' as const }
+        const selected = this.host.popups.get(request)
+        if (!selected || selected.window.id !== response.windowId || selected.window.destroyed) throw new Error('missing native popup destination')
+        return { action: 'allow' as const, outlivesOpener: true, overrideBrowserWindowOptions: selected.options, createWindow: (options: BrowserWindowConstructorOptions) => { const guest = (options as BrowserWindowConstructorOptions & { webContents: WebContents }).webContents; this.host.popups.delete(request); selected.attach(guest); return guest } }
+      } catch { const abandoned = this.host.popups.get(request); if (abandoned) { this.host.popups.delete(request); abandoned.window.destroy() }; return { action: 'deny' as const } } finally { this.popup = previous }
+    })
   }
-
-  /** webview.navigationResponse */
-  answerNavigation(id: number, allow: boolean): void {
-    // TODO: Implement answerNavigation
-  }
-
-  /** webview.downloadResponse */
-  answerDownload(id: number, decision: DownloadDecision): void {
-    // TODO: Implement answerDownload
-  }
-
-  /** webview.permissionResponse；'default' 表示交回 Electron（其默认是拒绝）。 */
-  answerPermission(id: number, response: 'allow' | 'deny' | 'default'): void {
-    // TODO: Implement answerPermission
-  }
-
-  dispose(): void {
-    // TODO: Implement dispose
-  }
+  answerNavigation(id: number, allow: boolean): void { if (typeof allow !== 'boolean') throw new Error('invalid navigation decision'); this.navigations.get(id)?.finish(allow) }
+  answerDownload(id: number, decision: DownloadDecision): void { this.host.downloads.decide(id, decision) }
+  answerPermission(id: number, response: 'allow' | 'deny' | 'default'): void { const callback = this.permissions.get(id); if (!callback) return; this.permissions.delete(id); callback(response === 'allow') }
+  dispose(): void { this.disposed = true; for (const entry of this.navigations.values()) entry.finish(false); this.permissions.forEach((callback) => callback(false)); this.permissions.clear(); this.host.downloads.dispose() }
 }
 
-/** Electron 的权限名 → Tauri 能命名的种类。media 还要看 mediaTypes。 */
-export function permissionKind(
-  permission: string,
-  details?: { mediaTypes?: string[] },
-): PermissionKind | undefined {
-  // TODO: Implement permissionKind
-  throw new Error('not implemented')
+export function permissionKind(permission: string, details?: { mediaTypes?: string[] }): PermissionKind | undefined {
+  if (permission === 'media') return details?.mediaTypes?.includes('video') ? 'camera' : 'microphone'
+  return ({ geolocation: 'geolocation', notifications: 'notifications', 'clipboard-read': 'clipboard-read', 'display-capture': 'display-capture', midi: 'midi', midiSysex: 'midi', sensors: 'sensors' } as Record<string, PermissionKind>)[permission]
 }

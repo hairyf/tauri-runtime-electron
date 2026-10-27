@@ -3,11 +3,10 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
-import { MessageChannel, receiveMessageOnPort } from 'node:worker_threads'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { runtimeModules } from './runtime-modules.mjs'
+import { createRuntime, runtimeModules } from './runtime-modules.mjs'
 
 const require = createRequire(import.meta.url)
 let nextId = 0
@@ -18,28 +17,6 @@ const transport = new EventEmitter()
 transport.setEncoding = () => {}
 transport.write = () => {}
 transport.destroy = () => { transport.destroyed = true; transport.emit('close') }
-// Run both production IPC branches, with only the native Worker/socket replaced.
-// Message framing and main-thread queueing still come from ipc.cjs itself.
-const ipcSource = readFileSync(new URL('../../assets/ipc.cjs', import.meta.url), 'utf8')
-class SocketWorker extends EventEmitter {
-  constructor(_filename, { workerData }) {
-    super()
-    this.channel = workerData.channel
-    vm.runInNewContext(ipcSource, {
-      require: (name) => name === 'node:worker_threads' ? { isMainThread: false, workerData }
-        : name === 'node:net' ? { connect: () => transport } : require(name),
-      process: new EventEmitter(),
-    })
-  }
-  terminate() { this.channel.close(); return Promise.resolve(0) }
-}
-const ipcModule = { exports: {} }
-vm.runInNewContext(ipcSource, {
-  require: (name) => name === 'node:worker_threads'
-    ? { Worker: SocketWorker, MessageChannel, receiveMessageOnPort, isMainThread: true } : require(name),
-  module: ipcModule, __filename: fileURLToPath(new URL('../../assets/ipc.cjs', import.meta.url)),
-  setImmediate: (callback) => tasks.push(callback), performance,
-})
 const allContents = []
 const allWindows = []
 const faults = { viewConstructor: false, applyWebviewConfig: false, attach: false, show: false, windowConfig: false }
@@ -251,30 +228,66 @@ const appkit = {
   isMaximizable(handle) { return this.window(handle).nativeMaximizable !== false },
   setTrafficLightPosition(handle, x, y) { (this.window(handle).nativeInsets ??= []).push({ x, y }) },
 }
+const electron = {
+  app: { on() {}, quit() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
+  Menu: { setApplicationMenu() {}, buildFromTemplate: (template) => ({ template }) },
+  nativeTheme, screen,
+  session: { defaultSession: { on() {}, setPermissionRequestHandler() {}, webRequest: { onCompleted() {}, onErrorOccurred() {}, onBeforeRequest() {} } } },
+  BaseWindow: Window, WebContentsView: View,
+  ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} },
+}
 const context = vm.createContext({
-  require: (name) => name === 'electron' ? {
-    app: { on() {}, quit() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
-    Menu: { setApplicationMenu() {}, buildFromTemplate: (template) => ({ template }) },
-    nativeTheme, screen,
-    session: { defaultSession: { on() {}, setPermissionRequestHandler() {}, webRequest: { onCompleted() {}, onErrorOccurred() {}, onBeforeRequest() {} } } },
-    BaseWindow: Window, WebContentsView: View,
-    ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} },
-  } : name === 'node:net' ? { connect: () => transport }
+  require: (name) => name === 'electron' ? electron
+    : name === 'node:net' ? { connect: () => transport }
     : name === 'node:fs' ? { appendFileSync() {}, readFileSync(fd) { assert.equal(fd, 0); return '0123456789abcdef'.repeat(4) + '\n' } }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' }
-      : name.endsWith('appkit.node') ? appkit
-      : name === './ipc.cjs' ? ipcModule.exports : require(name),
-  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
-  Buffer, URL, console,
+      : name.endsWith('appkit.node') ? appkit : require(name),
+  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform:
+    ['backgrounds', 'linux-state', 'linux-focus'].includes(process.argv[2]) ? 'linux'
+      : ['macos-center-focus', 'lifecycle', 'restore'].includes(process.argv[2]) ? 'darwin' : 'win32' },
+  Buffer, URL, Error, console,
   setTimeout(callback, delay) { const timer = { callback, delay }; timers.add(timer); return timer },
   clearTimeout: (timer) => timers.delete(timer),
   setImmediate: (callback) => tasks.push(callback),
-  __dirname: fileURLToPath(new URL('../../assets/', import.meta.url)),
 })
-context.require = runtimeModules(context, context.require)
-vm.runInContext(readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8'), context)
-const inspect = (expression) => vm.runInContext(expression, context)
-const call = (method, params) => context.handle(method, params)
+let ipc
+if (process.argv[2] === 'rpc') {
+  // Execute both production IPC endpoints in separate VMs; only native worker/channel APIs are doubles.
+  let spawnWorker
+  class MessageChannel {
+    constructor() {
+      const port1 = new EventEmitter()
+      const port2 = new EventEmitter()
+      port1.close = port2.close = () => {}
+      port1.postMessage = (message) => port2.emit('message', message)
+      port2.postMessage = (message) => port1.emit('message', message)
+      Object.assign(this, { port1, port2 })
+    }
+  }
+  class Worker extends EventEmitter {
+    constructor(_filename, options) { super(); spawnWorker(options.workerData) }
+    terminate() { return Promise.resolve() }
+  }
+  const mainLoad = runtimeModules(context, (name) => name === 'node:worker_threads'
+    ? { MessageChannel, Worker, isMainThread: true, receiveMessageOnPort: () => undefined } : require(name))
+  const { IPC } = mainLoad('./socket/ipc.cjs')
+  spawnWorker = (workerData) => {
+    const workerContext = vm.createContext({ process: new EventEmitter(), Buffer, Atomics, Int32Array })
+    runtimeModules(workerContext, (name) => name === 'node:worker_threads'
+      ? { isMainThread: false, workerData } : name === 'node:net' ? { connect: () => transport } : require(name))('./socket/ipc.cjs')
+  }
+  transport.write = (line) => context.send?.(JSON.parse(line))
+  ipc = new IPC(1)
+}
+const runtime = createRuntime(context, electron, { ipc, request: () => ({ action: 'deny' }), require: (name) => context.require(name) })
+context.handle = runtime.handle
+context.mainContents = (native) => runtime.webviews.main(runtime.windows.all().find((window) => window.native === native))?.contents
+context.openDevtools = (contents) => runtime.webviews.all().find((webview) => webview.contents === contents)?.openDevtools()
+const inspect = (expression) => {
+  context.state = runtime.state
+  return vm.runInNewContext(expression, { state: runtime.state, readDisplay: (display) => runtime.load('./runtime/display.cjs').readDisplay({ screen, platform: context.process.platform }, display) })
+}
+const call = (method, params) => runtime.handle(method, params)
 const errorFrom = async (action) => { try { await action(); return null } catch (error) { return error.message } }
 const settle = async () => {
   await Promise.resolve()
@@ -329,15 +342,17 @@ switch (process.argv[2]) {
     // never runtime-evidence for a real monitor/API implementation.
     screen.dipToScreenRect = (_window, rect) => rect.x < 1920 ? { ...rect }
       : { x: 1920 + (rect.x - 1920) * 2, y: rect.y * 2, width: rect.width * 2, height: rect.height * 2 }
+    let queryCall = call
     const query = async (points) => Promise.all(points.map(async ([x, y]) =>
-      (await call('window.displayForPoint', { x, y }))?.name ?? null))
+      (await queryCall('window.displayForPoint', { x, y }))?.name ?? null))
     const physical = await query([[0, 0], [1919, 1079], [1920, 0], [4479, 1439],
       [4480, 0], [1920, 1440], [-1, 0], [900, 1080]])
     const secondary = await call('window.displayForPoint', { x: 4000, y: 1000 })
     const invalid = await errorFrom(() => call('window.displayForPoint', { x: NaN, y: 0 }))
     const logical = {}
     for (const platform of ['darwin', 'linux']) {
-      context.process.platform = platform
+      const platformContext = vm.createContext({ ...context, process: { ...context.process, platform } })
+      queryCall = createRuntime(platformContext, electron, { require: context.require }).handle
       logical[platform] = await query([[0, 0], [1919, 1079], [1920, 0], [3199, 719],
         [3200, 0], [2000, 720], [-1, 0], [900, 1080]])
     }
@@ -384,8 +399,10 @@ switch (process.argv[2]) {
     const host = await createChildren()
     const children = []
     for (const [index, view] of host.children.entries()) {
+      const { session, ...preferences } = view.options.webPreferences
+      assert.equal(session, electron.session.defaultSession, 'native children must use the selected default session')
       children.push({ contentsId: view.webContents.id, url: view.webContents.url,
-        preferences: { ...view.options.webPreferences, preload: path.basename(view.options.webPreferences.preload) },
+        preferences: { ...preferences, preload: path.basename(preferences.preload) },
         owner: inspect(`state.webviewByContents.get(${view.webContents.id})`),
         bounds: (await call('webview.bounds', { webviewId: index + 10 })).bounds })
     }
@@ -474,10 +491,10 @@ switch (process.argv[2]) {
     await call('webview.openDevtools', { webviewId: 10 })
     const after = { opened, openCalls,
       listeners: lifecycleEvents.map((event, index) => contents.listenerCount(event) - initialListeners[index]) }
-    const destroyed = new Contents()
+    const destroyed = host.children[1].webContents
     destroyed.openDevTools = () => {}
-    const interrupted = context.openDevtools(destroyed)
-    destroyed.emit('destroyed')
+    const interrupted = call('webview.openDevtools', { webviewId: 11 })
+    destroyed.close()
     result = { before, after, destroyedError: await errorFrom(() => interrupted),
       destroyedPending: inspect('state.openingDevtools').has(destroyed), timers: timers.size }
     break
@@ -489,6 +506,7 @@ switch (process.argv[2]) {
     contents.openDevTools()
     const replies = []
     context.send = (message) => replies.push(message)
+    context.onRequest = (request) => runtime.ipc.emit('request', request, false)
     const message = (id, method) => ({ id, method, params: { webviewId: 10 } })
     context.onRequest(message(1, 'webview.closeDevtools'))
     const closedSynchronously = contents.devtools
@@ -573,9 +591,11 @@ switch (process.argv[2]) {
     await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
     const changed = main.getBackgroundColor()
     const invalid = await errorFrom(() => call('window.backgroundMaterial', { windowId: 2, material: 'blur' }))
-    context.process.platform = 'linux'
+    const linuxContext = vm.createContext({ ...context, process: { ...context.process, platform: 'linux' } })
+    const linux = createRuntime(linuxContext, electron, { require: context.require })
+    linux.handle('window.create', { windowId: 2 })
     result = { initialClear, materials, cleared, changed, invalid,
-      unsupported: await errorFrom(() => call('window.backgroundMaterial', { windowId: 2, material: 'acrylic' })) }
+      unsupported: await errorFrom(() => linux.handle('window.backgroundMaterial', { windowId: 2, material: 'acrylic' })) }
     break
   }
   case 'backgrounds': {
@@ -830,22 +850,28 @@ switch (process.argv[2]) {
     const mainView = mainViewOf(main)
     await call('webview.create', { windowId: 2, webviewId: 21, url: 'about:blank' })
     const child = inspect('state.childWebviews.get(21).view')
+    const stagePopup = (windowId, webviewId) => {
+      const previous = runtime.ipc.request
+      runtime.ipc.request = (_event, params) => {
+        call('window.create', { windowId, newWindowRequest: params.request, webview: { webviewId, url: 'about:blank' } })
+        return { action: 'allow', windowId }
+      }
+      try {
+        const reply = mainView.webContents.openHandler({ url: 'about:blank', frameName: '', features: '', disposition: 'new-window' })
+        assert.equal(reply.action, 'allow')
+        reply.createWindow({ webContents: new Contents() })
+        return runtime.windows.get(windowId).native
+      } finally {
+        runtime.ipc.request = previous
+      }
+    }
     const roots = {
       mainOptions: main.options.webPreferences.webviewTag,
       mainView: mainView.options.webPreferences.webviewTag,
       child: child.options.webPreferences.webviewTag,
     }
 
-    inspect('state.activePopupRequest = 7')
-    inspect('state.activePopupContents = {session:undefined}')
-    await call('window.create', {
-      windowId: 3, newWindowRequest: 7,
-      webview: { webviewId: 30, url: 'about:blank' },
-    })
-    const staged = inspect('state.pendingPopups.get(7)')
-    inspect('state.pendingPopups.delete(7)')
-    staged.attach(new Contents())
-    const popup = staged.window
+    const popup = stagePopup(3, 30)
     const view = mainViewOf(popup)
     const guest = view.webContents
     Object.assign(roots, {
@@ -880,16 +906,7 @@ switch (process.argv[2]) {
       ],
     })
 
-    inspect('state.activePopupRequest = 8')
-    inspect('state.activePopupContents = {session:undefined}')
-    await call('window.create', {
-      windowId: 4, newWindowRequest: 8,
-      webview: { webviewId: 31, url: 'about:blank' },
-    })
-    const stagedExplicit = inspect('state.pendingPopups.get(8)')
-    inspect('state.pendingPopups.delete(8)')
-    stagedExplicit.attach(new Contents())
-    const popupExplicit = stagedExplicit.window
+    const popupExplicit = stagePopup(4, 31)
     const explicitView = mainViewOf(popupExplicit)
     const explicitGuest = explicitView.webContents
     Object.defineProperty(explicitView, 'webContents', {
@@ -1001,7 +1018,7 @@ switch (process.argv[2]) {
     await call('window.center', { windowId: 63 })
     const centered = host.getBounds()
     const focus = []
-    inspect('app').focus = (options) => focus.push({ app: options })
+    electron.app.focus = (options) => focus.push({ app: options })
     host.focus = () => focus.push('window')
     await call('window.focus', { windowId: 63 })
     assert.equal(host.options.titleBarStyle, 'default', 'AppKit styling must retain Electron constructor frame accounting')
@@ -1047,7 +1064,7 @@ switch (process.argv[2]) {
     finishLoad()
     await navigating
     context.process.platform = 'darwin'
-    const initialFullscreenListeners = ['enter-full-screen', 'leave-full-screen'].map((event) => host.listenerCount(event))
+    const initialFullscreenListeners = new Map(['enter-full-screen', 'leave-full-screen'].map((event) => [event, new Set(host.listeners(event))]))
     const nativeCalls = []
     const simpleCalls = []
     let native = false
@@ -1091,7 +1108,7 @@ switch (process.argv[2]) {
     const closedError = await closing
     result = { initialBounds, resizedBounds, navigation, beforeEnter, beforeLeave, entered, exited, nativeFullscreen,
       nativeCalls, simpleCalls, timeoutDelay: timer.delay, timeoutError, closedError, timers: timers.size,
-      transitionListeners: ['enter-full-screen', 'leave-full-screen'].map((event, index) => host.listenerCount(event) - initialFullscreenListeners[index]) }
+      transitionListeners: ['enter-full-screen', 'leave-full-screen'].map((event) => host.listeners(event).filter((listener) => !initialFullscreenListeners.get(event).has(listener)).length) }
     break
   }
   case 'restore': {

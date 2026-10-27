@@ -1,302 +1,209 @@
 import { EventEmitter } from 'node:events'
 import type { Cookie, Rectangle, WebContents, WebContentsView } from 'electron'
-import type { Window } from './window'
+import { cssColor, type Window } from './window'
 
-/**
- * 页面领域（骨架）。
- *
- * 取代 internal.cjs 里四张平行表：webviews、webviewByContents、childWebviews、mainViews。
- * 一个 Webview 同时持有「归属哪个 Window / 哪个 WebContents / 是不是主视图」，
- * 于是 `findWebview` + `contentsFor` + `state.childWebviews.get(...)` 三连消失了。
- */
-
-/** Rust 侧为该 webview 注册的 out-of-band 策略（原来是 state.handlerPolicy）。 */
-export interface WebviewPolicy {
-  navigation?: boolean
-  download?: boolean
-  permission?: boolean
-}
-
-/** 物理像素坐标，`physical` 为 true 时按 Rust 的物理像素解释。 */
-export interface WebviewBoundsInput {
-  position?: { x: number; y: number }
-  size?: { width: number; height: number }
-  physical?: boolean
-}
-
-export interface WebviewInit {
-  webviewId: number
-  url: string
-  autoResize?: boolean
-  bounds?: WebviewBoundsInput
-  policy?: WebviewPolicy
-  [key: string]: unknown
-}
-
-/** 位置始终相对父窗口，不是屏幕坐标。 */
-export interface WebviewSnapshot {
-  scaleFactor: number
-  bounds: Rectangle
-  contentBounds: Rectangle
-  visible: boolean
-}
-
-export interface CookieFilter {
-  url?: string
-}
-
-export interface CookieInit {
-  url: string
-  name: string
-  value: string
-  domain?: string
-  path?: string
-  secure?: boolean
-  httpOnly?: boolean
-  sameSite?: 'unspecified' | 'no_restriction' | 'lax' | 'strict'
-  expirationDate?: number
-}
-
-/**
- * 领域事件。宿主映射成线协议：
- * navigationCommitted → webview.navigationCommitted、closed → webview.closed …
- */
+export interface WebviewPolicy { navigation?: boolean; download?: boolean; permission?: boolean }
+export interface WebviewBoundsInput { position?: { x: number; y: number; physical?: boolean }; size?: { width: number; height: number; physical?: boolean }; physical?: boolean }
+export interface WebviewInit { webviewId: number; url: string; autoResize?: boolean; bounds?: WebviewBoundsInput; policy?: WebviewPolicy; [key: string]: unknown }
+export interface WebviewSnapshot { scaleFactor: number; bounds: Rectangle; contentBounds: Rectangle; visible: boolean }
+export interface CookieFilter { url?: string }
+export interface CookieInit { url: string; name: string; value: string; domain?: string; path?: string; secure?: boolean; httpOnly?: boolean; sameSite?: 'unspecified' | 'no_restriction' | 'lax' | 'strict'; expirationDate?: number }
 export interface WebviewEvents {
-  navigationCommitted: [url: string]
-  loadStarted: [url: string]
-  loadFinished: [url: string]
-  titleChanged: [title: string]
-  processGone: [details: { reason: string; exitCode: number }]
-  closed: []
+  navigationCommitted: [url: string]; loadStarted: [url: string]; loadFinished: [url: string]
+  titleChanged: [title: string]; processGone: [details: { reason: string; exitCode: number }]; closed: []; reparented: [previous: Window]
 }
+
+type NativeView = WebContentsView & { getVisible?(): boolean; setVisible?(visible: boolean): void }
+type NativeContents = WebContents & { navigationHistory?: { canGoBack(): boolean; goBack(): void; canGoForward(): boolean; goForward(): void } }
 
 export class Webview extends EventEmitter<WebviewEvents> {
-  /** 主视图随父窗口缩放；子 webview 由 Tauri 自己布局。 */
   private main = false
   private autoResize: boolean
   private policy?: WebviewPolicy
-  /** 记录上一次的父子比例基准，父窗口 resize 时按比例重算。 */
   private reference?: { bounds: Rectangle; parent: Rectangle }
-
-  constructor(
-    private readonly owner: Window,
-    readonly id: number,
-    readonly view: WebContentsView,
-    private config: WebviewInit,
-  ) {
-    super()
-    this.autoResize = Boolean(config.autoResize)
-    this.policy = config.policy
+  private attached = false
+  private closed = false
+  private nativePopup = false
+  private openingDevtools?: Promise<void>
+  private readonly nativeContents: WebContents
+  readonly contentsId: number
+  private readonly onResize = () => { if (!this.owner.destroyed) this.resizeWithParent(this.owner.native.getContentBounds()) }
+  constructor(private owner: Window, readonly id: number, readonly view: WebContentsView, private config: WebviewInit) {
+    super(); this.nativeContents = view.webContents; this.contentsId = this.nativeContents.id; this.autoResize = Boolean(config.autoResize); this.policy = config.policy; this.bindEvents()
   }
-
-  get window(): Window {
-    return this.owner
+  get window(): Window { return this.owner }
+  get contents(): WebContents { return this.nativeContents }
+  get isMain(): boolean { return this.main }
+  setMain(main: boolean): void { this.main = main }
+  get webviewPolicy(): WebviewPolicy | undefined { return this.policy }
+  private bindEvents(): void {
+    const c = this.contents
+    c.on('did-navigate', (_e, url) => this.emit('navigationCommitted', url))
+    c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
+    c.on('dom-ready', () => { if (this.attached) this.syncOwnerState() })
+    c.on('did-start-loading', () => this.emit('loadStarted', c.getURL()))
+    c.on('did-finish-load', () => this.emit('loadFinished', c.getURL()))
+    c.on('page-title-updated', (_e, title) => this.emit('titleChanged', title))
+    c.on('render-process-gone', (_e, details) => this.emit('processGone', { reason: details.reason, exitCode: details.exitCode }))
+    c.once('destroyed', () => {
+      const closePopup = this.attached && this.nativePopup && this.main
+      this.finishClose()
+      if (closePopup && !this.owner.destroyed) this.owner.destroy()
+    })
   }
-
-  get contents(): WebContents {
-    // TODO: Implement contents
-    throw new Error('not implemented')
-  }
-
-  get isMain(): boolean {
-    return this.main
-  }
-
-  get webviewPolicy(): WebviewPolicy | undefined {
-    return this.policy
-  }
-
-  // ─── 生命周期 ────────────────────────────────────────────────────────────
-
-  /**
-   * 挂到父窗口并装载。navigate 为 false 时只建视图不导航
-   * （本地协议需要当前这条 Rust 调用先返回）。
-   */
   attach(options: { main?: boolean; navigate?: boolean }): Promise<void> {
-    // TODO: Implement attach
-    throw new Error('not implemented')
+    if (this.attached) this.detach()
+    this.main = Boolean(options.main)
+    this.nativePopup = this.main && options.navigate === false
+    const config = { ...this.owner.configuration, ...Object.fromEntries(Object.entries(this.config).filter(([, value]) => value != null)) }
+    this.view.setBackgroundColor(cssColor(config.backgroundColor) ?? (config.transparent ? '#00000000' : '#ffffff'))
+    if (config.userAgent != null) this.contents.setUserAgent(String(config.userAgent))
+    this.owner.native.contentView.addChildView(this.view)
+    this.attached = true
+    this.owner.native.on('resize', this.onResize)
+    const parent = this.owner.native.getContentBounds()
+    const input = this.config.bounds ?? {}
+    const position = input.position ?? { x: 0, y: 0 }
+    const size = input.size ?? { width: parent.width, height: parent.height }
+    this.setNativeBounds({
+      x: this.toDip(position.x, input.position?.physical ?? input.physical),
+      y: this.toDip(position.y, input.position?.physical ?? input.physical),
+      width: this.toDip(size.width, input.size ? input.size.physical ?? input.physical : false),
+      height: this.toDip(size.height, input.size ? input.size.physical ?? input.physical : false),
+    })
+    this.syncOwnerState()
+    if (options.navigate !== false && this.config.url) this.navigate(this.config.url)
+    return Promise.resolve()
   }
-
-  /** 从父窗口摘掉但不销毁，用于 reparent 的中间态。 */
+  private syncOwnerState(): void { this.owner.syncContents(this.contents) }
   detach(): void {
-    // TODO: Implement detach
+    if (!this.attached) return
+    this.owner.native.removeListener('resize', this.onResize)
+    if (!this.owner.destroyed) this.owner.native.contentView.removeChildView(this.view)
+    this.attached = false
   }
-
-  /** 显式关闭：先把归属摘干净，再销毁 WebContents。 */
-  close(): void {
-    // TODO: Implement close
+  private finishClose(): void {
+    if (this.closed) return
+    this.closed = true
+    this.detach()
+    this.main = false
+    this.emit('closed')
   }
-
-  // ─── 导航 ────────────────────────────────────────────────────────────────
-
-  navigate(url: string): void {
-    // TODO: Implement navigate
-  }
-
-  reload(): void {
-    // TODO: Implement reload
-  }
-
-  goBack(): void {
-    // TODO: Implement goBack
-  }
-
-  canGoBack(): boolean {
-    // TODO: Implement canGoBack
-    throw new Error('not implemented')
-  }
-
-  goForward(): void {
-    // TODO: Implement goForward
-  }
-
-  canGoForward(): boolean {
-    // TODO: Implement canGoForward
-    throw new Error('not implemented')
-  }
-
-  evaluate(script: string): Promise<unknown> {
-    // TODO: Implement evaluate
-    throw new Error('not implemented')
-  }
-
-  // ─── 布局 ────────────────────────────────────────────────────────────────
-
-  snapshot(): WebviewSnapshot {
-    // TODO: Implement snapshot
-    throw new Error('not implemented')
-  }
-
+  close(): void { if (this.closed) return; this.finishClose(); if (!this.contents.isDestroyed()) this.contents.close() }
+  navigate(url: string): void { void this.contents.loadURL(url).catch((error) => console.error('navigate failed', url, error)) }
+  reload(): void { this.contents.reload() }
+  goBack(): void { const h = (this.contents as NativeContents).navigationHistory; if (h?.canGoBack()) h.goBack() }
+  canGoBack(): boolean { return Boolean((this.contents as NativeContents).navigationHistory?.canGoBack()) }
+  goForward(): void { const h = (this.contents as NativeContents).navigationHistory; if (h?.canGoForward()) h.goForward() }
+  canGoForward(): boolean { return Boolean((this.contents as NativeContents).navigationHistory?.canGoForward()) }
+  evaluate(script: string): Promise<unknown> { return this.contents.executeJavaScript(script, true) }
+  snapshot(): WebviewSnapshot { const scaleFactor = this.owner.scale; const contentBounds = this.owner.native.getContentBounds(); const c = this.view as NativeView; return { scaleFactor, bounds: this.physical(this.view.getBounds(), scaleFactor), contentBounds: this.physical(contentBounds, scaleFactor), visible: !this.owner.destroyed && this.owner.native.isVisible() && (c.getVisible?.() ?? true) } }
+  private physical(rect: Rectangle, scale: number): Rectangle { return { x: Math.round(rect.x * scale), y: Math.round(rect.y * scale), width: Math.round(rect.width * scale), height: Math.round(rect.height * scale) } }
+  private setNativeBounds(bounds: Rectangle): void { if (!Object.values(bounds).every(Number.isFinite) || bounds.width < 0 || bounds.height < 0) throw new Error('invalid child webview bounds'); this.view.setBounds(bounds); this.reference = { bounds: { ...bounds }, parent: this.owner.native.getContentBounds() } }
+  private toDip(value: number, physical?: boolean): number { return Math.round(value / (physical ? this.owner.scale : 1)) }
   setBounds(input: WebviewBoundsInput): void {
-    // TODO: Implement setBounds
+    const bounds = { ...this.view.getBounds() }
+    if (input.position) {
+      bounds.x = this.toDip(input.position.x, input.position.physical ?? input.physical)
+      bounds.y = this.toDip(input.position.y, input.position.physical ?? input.physical)
+    }
+    if (input.size) {
+      bounds.width = this.toDip(input.size.width, input.size.physical ?? input.physical)
+      bounds.height = this.toDip(input.size.height, input.size.physical ?? input.physical)
+    }
+    this.setNativeBounds(bounds)
   }
-
-  setAutoResize(autoResize: boolean): void {
-    // TODO: Implement setAutoResize
-  }
-
-  /** 父窗口内容区变化时按比例重算（Tauri 的 position 与 size 都相对父窗口缩放）。 */
+  setAutoResize(autoResize: boolean): void { this.autoResize = autoResize; this.reference = { bounds: this.view.getBounds(), parent: this.owner.native.getContentBounds() } }
   resizeWithParent(parent: Rectangle): void {
-    // TODO: Implement resizeWithParent
+    if (!this.attached || !this.autoResize || !this.reference || parent.width <= 0 || parent.height <= 0) return
+    const r = this.reference
+    if (r.parent.width <= 0 || r.parent.height <= 0) { this.reference = { bounds: this.view.getBounds(), parent }; return }
+    const x = Math.round(r.bounds.x * parent.width / r.parent.width), y = Math.round(r.bounds.y * parent.height / r.parent.height)
+    this.view.setBounds({ x, y, width: Math.round((r.bounds.x + r.bounds.width) * parent.width / r.parent.width) - x, height: Math.round((r.bounds.y + r.bounds.height) * parent.height / r.parent.height) - y })
   }
-
-  setVisible(visible: boolean): void {
-    // TODO: Implement setVisible
+  setVisible(visible: boolean): void { (this.view as NativeView).setVisible?.(visible) }
+  setBackgroundColor(color: string | undefined): void { this.view.setBackgroundColor(color ?? '#00000000') }
+  focus(): void { this.owner.focus(); this.contents.focus() }
+  print(): Promise<void> { this.contents.print({ silent: false }); return Promise.resolve() }
+  openDevtools(): Promise<void> {
+    if (this.openingDevtools) return this.openingDevtools
+    const contents = this.contents
+    if (contents.devToolsWebContents) return Promise.resolve()
+    let finish: (error?: unknown) => void = () => {}
+    const opening = new Promise<void>((resolve, reject) => {
+      let settled = false
+      finish = (error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        contents.removeListener('devtools-opened', opened)
+        contents.removeListener('devtools-closed', closed)
+        contents.removeListener('destroyed', destroyed)
+        this.openingDevtools = undefined
+        if (error) reject(error)
+        else resolve()
+      }
+      const opened = () => finish()
+      const closed = () => finish(new Error('DevTools closed before opening completed'))
+      const destroyed = () => finish(new Error('webview destroyed while opening DevTools'))
+      const timer = setTimeout(() => finish(new Error('DevTools opening timed out')), 10_000)
+      contents.once('devtools-opened', opened)
+      contents.once('devtools-closed', closed)
+      contents.once('destroyed', destroyed)
+    })
+    this.openingDevtools = opening
+    try { contents.openDevTools({ mode: 'detach' }) } catch (error) { finish(error) }
+    return opening
   }
-
-  setBackgroundColor(color: string | undefined): void {
-    // TODO: Implement setBackgroundColor
-  }
-
-  focus(): void {
-    // TODO: Implement focus
-  }
-
-  print(): Promise<void> {
-    // TODO: Implement print
-    throw new Error('not implemented')
-  }
-
-  // ─── 调试与缩放 ──────────────────────────────────────────────────────────
-
-  openDevtools(): void {
-    // TODO: Implement openDevtools
-  }
-
-  closeDevtools(): void {
-    // TODO: Implement closeDevtools
-  }
-
-  isDevtoolsOpen(): boolean {
-    // TODO: Implement isDevtoolsOpen
-    throw new Error('not implemented')
-  }
-
-  setZoom(scaleFactor: number): void {
-    // TODO: Implement setZoom
-  }
-
-  // ─── 存储 ────────────────────────────────────────────────────────────────
-
-  cookies(filter: CookieFilter): Promise<Cookie[]> {
-    // TODO: Implement cookies
-    throw new Error('not implemented')
-  }
-
-  setCookie(cookie: CookieInit): Promise<null> {
-    // TODO: Implement setCookie
-    throw new Error('not implemented')
-  }
-
-  deleteCookie(filter: { url: string; name: string }): Promise<null> {
-    // TODO: Implement deleteCookie
-    throw new Error('not implemented')
-  }
-
-  clearBrowsingData(): Promise<null> {
-    // TODO: Implement clearBrowsingData
-    throw new Error('not implemented')
-  }
-
-  // ─── 归属与策略 ──────────────────────────────────────────────────────────
-
-  /** 换父窗口并保持视觉位置（跨 DPI 时按比例换算）。 */
+  closeDevtools(): void { this.contents.closeDevTools() }
+  isDevtoolsOpen(): boolean { return this.contents.isDevToolsOpened() }
+  setZoom(scaleFactor: number): void { if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) throw new Error('invalid zoom factor'); this.contents.setZoomFactor(scaleFactor) }
+  cookies(filter: CookieFilter): Promise<Cookie[]> { return this.contents.session.cookies.get(filter.url ? { url: filter.url } : {}) }
+  setCookie(cookie: CookieInit): Promise<null> { const { url, name, value, ...rest } = cookie; return this.contents.session.cookies.set({ url, name, value, ...rest }).then(() => null) }
+  deleteCookie(filter: { url: string; name: string }): Promise<null> { return this.contents.session.cookies.remove(filter.url, filter.name).then(() => null) }
+  clearBrowsingData(): Promise<null> { return this.contents.session.clearStorageData().then(() => null) }
   reparent(destination: Window): void {
-    // TODO: Implement reparent
+    if (destination === this.owner) return
+    const previousOwner = this.owner, previous = this.view.getBounds(), reference = this.reference
+    const ratio = previousOwner.scale / destination.scale
+    const bounds = Object.fromEntries(Object.entries(previous).map(([key, value]) => [key, Math.round(value * ratio)])) as unknown as Rectangle
+    previousOwner.native.contentView.removeChildView(this.view)
+    try {
+      destination.native.contentView.addChildView(this.view)
+      this.owner = destination
+      this.setNativeBounds(bounds)
+    } catch (error) {
+      this.owner = previousOwner
+      destination.native.contentView.removeChildView(this.view)
+      previousOwner.native.contentView.addChildView(this.view)
+      this.view.setBounds(previous)
+      this.reference = reference
+      throw error
+    }
+    if (this.attached) {
+      previousOwner.native.removeListener('resize', this.onResize)
+      destination.native.on('resize', this.onResize)
+    }
+    this.syncOwnerState()
+    this.emit('reparented', previousOwner)
   }
-
-  setPolicy(policy: WebviewPolicy | undefined): void {
-    // TODO: Implement setPolicy
-  }
+  setPolicy(policy: WebviewPolicy | undefined): void { this.policy = policy }
 }
 
-/**
- * webviewId → Webview，同时按 contentsId 反查。
- * 反查是给策略回调用的：Electron 只给 WebContents，不给 Tauri id。
- */
 export class Webviews {
-  private readonly byId = new Map<number, Webview>()
-  private readonly byContents = new Map<number, Webview>()
-
+  private readonly byId = new Map<number, Webview>(); private readonly byContents = new Map<number, Webview>()
   add(webview: Webview): void {
-    // TODO: Implement add
+    if (this.byId.has(webview.id)) throw new Error(`duplicate webview ${webview.id}`)
+    this.byId.set(webview.id, webview)
+    this.byContents.set(webview.contentsId, webview)
+    webview.on('reparented', () => webview.setMain(!this.of(webview.window).some((other) => other !== webview && other.isMain)))
   }
-
-  get(id: number): Webview {
-    // TODO: Implement get
-    throw new Error('not implemented')
-  }
-
-  peek(id: number): Webview | undefined {
-    // TODO: Implement peek
-    throw new Error('not implemented')
-  }
-
-  forContents(contentsId: number): Webview | undefined {
-    // TODO: Implement forContents
-    throw new Error('not implemented')
-  }
-
-  of(window: Window): Webview[] {
-    // TODO: Implement of
-    throw new Error('not implemented')
-  }
-
-  main(window: Window): Webview | undefined {
-    // TODO: Implement main
-    throw new Error('not implemented')
-  }
-
-  all(): Webview[] {
-    // TODO: Implement all
-    throw new Error('not implemented')
-  }
-
-  delete(id: number): void {
-    // TODO: Implement delete
-  }
-
-  clear(): void {
-    // TODO: Implement clear
-  }
+  get(id: number): Webview { const result = this.byId.get(id); if (!result || result.window.destroyed || result.contents.isDestroyed()) throw new Error(`unknown webview ${id}`); return result }
+  peek(id: number): Webview | undefined { return this.byId.get(id) }
+  forContents(contentsId: number): Webview | undefined { return this.byContents.get(contentsId) }
+  of(window: Window): Webview[] { return [...this.byId.values()].filter((webview) => webview.window === window) }
+  main(window: Window): Webview | undefined { return this.of(window).find((webview) => webview.isMain) }
+  all(): Webview[] { return [...this.byId.values()] }
+  delete(id: number): void { const webview = this.byId.get(id); if (!webview) return; this.byId.delete(id); this.byContents.delete(webview.contentsId) }
+  clear(): void { this.byId.clear(); this.byContents.clear() }
 }

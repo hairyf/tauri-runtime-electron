@@ -6,13 +6,15 @@ use std::{
   process::{Child, Command, Stdio},
   sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
     Arc, Mutex,
   },
   time::{Duration, Instant},
 };
 
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::oneshot;
 
 use crate::Error;
 
@@ -22,6 +24,51 @@ const EVENT_CAPACITY: usize = 1024;
 pub type Event = Value;
 type RpcResult = Result<Value, Error>;
 
+/// A typed Electron request and its response.
+pub trait RpcRequest: Serialize + Send + 'static {
+  type Response: DeserializeOwned + Send + 'static;
+  const METHOD: &'static str;
+
+  fn method(&self) -> &'static str { Self::METHOD }
+  fn timeout(&self) -> Duration { Duration::from_secs(5) }
+  fn deferred(&self) -> bool { false }
+  fn notification(&self) -> bool { false }
+}
+
+#[cfg(test)]
+struct TestRequest {
+  method: &'static str,
+  params: Value,
+  timeout: Duration,
+  deferred: bool,
+  notification: bool,
+}
+
+#[cfg(test)]
+impl Serialize for TestRequest {
+  fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    self.params.serialize(serializer)
+  }
+}
+
+#[cfg(test)]
+impl RpcRequest for TestRequest {
+  type Response = Value;
+  const METHOD: &'static str = "test";
+  fn method(&self) -> &'static str { self.method }
+  fn timeout(&self) -> Duration { self.timeout }
+  fn deferred(&self) -> bool { self.deferred }
+  fn notification(&self) -> bool { self.notification }
+}
+
+#[cfg(test)]
+fn call(electron: &Electron, method: &'static str, params: Value, timeout: Duration, notification: bool) -> Result<Value, Error> {
+  let request = TestRequest { method, params, timeout, deferred: false, notification };
+  tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(electron.call(request))
+}
+
+type PendingSender = (String, oneshot::Sender<RpcResult>);
+
 struct Subscribers {
   initial: Option<SyncSender<Event>>,
   future: Vec<SyncSender<Event>>,
@@ -30,8 +77,10 @@ struct Subscribers {
 /// A connected Electron process with synchronous RPC and event subscriptions.
 pub struct Electron {
   binary: PathBuf,
-  writer: Mutex<TcpStream>,
-  pending: Mutex<HashMap<u64, Sender<RpcResult>>>,
+  writer: Arc<Mutex<TcpStream>>,
+  writer_order: Arc<tokio::sync::Mutex<()>>,
+  shutdown_stream: TcpStream,
+  pending: Mutex<HashMap<u64, PendingSender>>,
   events: Mutex<Option<Receiver<Event>>>,
   subscribers: Mutex<Subscribers>,
   next_id: AtomicU64,
@@ -39,6 +88,17 @@ pub struct Electron {
   child: Mutex<Option<Child>>,
   /// Version reported by Electron during the handshake.
   pub version: String,
+}
+
+struct PendingGuard<'a> {
+  electron: &'a Electron,
+  id: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+  fn drop(&mut self) {
+    self.electron.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&self.id);
+  }
 }
 
 impl std::fmt::Debug for Electron {
@@ -52,13 +112,26 @@ impl std::fmt::Debug for Electron {
 
 impl Electron {
   /// Launch Electron using its staged main.cjs; port 0 selects a free port.
-  pub fn new(binary: impl AsRef<Path>, port: u16) -> Result<Arc<Self>, Error> {
-    Self::with_args(binary, port, &[], Duration::from_secs(15))
+  pub async fn new(binary: impl AsRef<Path>, port: u16) -> Result<Arc<Self>, Error> {
+    Self::with_args(binary, port, &[], Duration::from_secs(15)).await
   }
 
   /// Launch with app-specific switches and a deadline covering connection and handshake.
   /// The crate-owned main.cjs and preload.cjs must already be staged with the distribution.
-  pub fn with_args(
+  pub async fn with_args(
+    binary: impl AsRef<Path>,
+    port: u16,
+    args: &[String],
+    timeout: Duration,
+  ) -> Result<Arc<Self>, Error> {
+    let binary = binary.as_ref().to_path_buf();
+    let args = args.to_vec();
+    tokio::task::spawn_blocking(move || Self::start(binary, port, &args, timeout))
+      .await
+      .map_err(|error| Error::with_source("Electron startup task failed", error))?
+  }
+
+  fn start(
     binary: impl AsRef<Path>,
     port: u16,
     args: &[String],
@@ -174,10 +247,20 @@ impl Electron {
         return Err(error);
       }
     };
+    let shutdown_stream = match reader.get_ref().try_clone() {
+      Ok(stream) => stream,
+      Err(error) => {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.into());
+      }
+    };
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
     let electron = Arc::new(Self {
       binary,
-      writer: Mutex::new(writer),
+      writer: Arc::new(Mutex::new(writer)),
+      writer_order: Arc::new(tokio::sync::Mutex::new(())),
+      shutdown_stream,
       pending: Mutex::new(HashMap::new()),
       events: Mutex::new(Some(event_rx)),
       subscribers: Mutex::new(Subscribers {
@@ -244,119 +327,74 @@ impl Electron {
     receiver
   }
 
-  /// Execute a synchronous RPC with a response timeout.
-  pub fn call(&self, method: &str, params: Value, timeout: Duration) -> RpcResult {
-    let (id, receiver) = self.begin_call(method, params, timeout, false)?;
-    self.receive_response(id, receiver, method, timeout)
+  /// Execute a typed RPC without blocking the calling executor.
+  pub async fn call<R: RpcRequest>(&self, request: R) -> Result<R::Response, Error> {
+    let method = request.method();
+    let timeout = request.timeout();
+    let deferred = request.deferred();
+    let notification = request.notification();
+    let params = serde_json::to_value(request)?;
+    let value = self.rpc_value(method, params, timeout, deferred, notification).await?;
+    Ok(serde_json::from_value(value)?)
   }
 
-  /// Send in call order without blocking the caller; complete on a waiter thread.
-  pub fn call_async(
-    self: &Arc<Self>,
-    method: &str,
-    params: Value,
-    timeout: Duration,
-    callback: impl FnOnce(RpcResult) + Send + 'static,
-  ) -> Result<(), Error> {
-    let (id, receiver) = self.begin_call(method, params, timeout, true)?;
-    let electron = self.clone();
-    let method = method.to_owned();
-    // ponytail: one bounded waiter thread per callback; use a shared completion
-    // loop if measured concurrent evaluation volume makes this expensive.
-    if let Err(error) = std::thread::Builder::new().name("electron-rpc-callback".into()).spawn(move || {
-      callback(electron.receive_response(id, receiver, &method, timeout));
-    }) {
-      self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
-      return Err(Error::with_source("start Electron RPC callback", error));
-    }
-    Ok(())
-  }
-
-  fn begin_call(
+  async fn rpc_value(
     &self,
     method: &str,
     params: Value,
     timeout: Duration,
-    asynchronous: bool,
-  ) -> Result<(u64, Receiver<RpcResult>), Error> {
+    deferred: bool,
+    notification: bool,
+  ) -> RpcResult {
+    let started = Instant::now();
     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params,"asynchronous":asynchronous}))?;
+    let mut request = json!({"id": id, "method": method, "params": params});
+    if deferred { request["asynchronous"] = json!(true); }
+    if notification { request["notification"] = json!(true); }
+    let mut line = serde_json::to_vec(&request)?;
     line.push(b'\n');
-    let (sender, receiver) = mpsc::channel();
+    if self.closed.load(Ordering::SeqCst) { return Err(Error::ChannelDisconnected); }
+    if timeout.is_zero() { return Err(Error::IpcTimeout { timeout_duration: timeout }); }
+    let deadline = started.checked_add(timeout).ok_or(Error::IpcTimeout { timeout_duration: timeout })?;
+    if notification {
+      self.write_line(line, deadline).await?;
+      return Ok(Value::Null);
+    }
+    let (sender, receiver) = oneshot::channel();
     {
       let mut pending = self.pending.lock().map_err(|_| "pending lock poisoned")?;
-      // Check while holding the same lock disconnect uses to drain waiters.
-      if self.closed.load(Ordering::SeqCst) {
-        return Err(format!("Electron is gone ({method})").into());
-      }
-      if timeout.is_zero() {
-        return Err(format!("Electron did not answer `{method}` in {timeout:?}").into());
-      }
-      pending.insert(id, sender);
+      if self.closed.load(Ordering::SeqCst) { return Err(Error::ChannelDisconnected); }
+      pending.insert(id, (method.to_owned(), sender));
     }
-    let written = self
-      .writer
-      .lock()
-      .map_err(|_| Error::from("writer lock poisoned"))
-      .and_then(|mut writer| {
-        writer
-          .set_write_timeout(Some(timeout))
-          .and_then(|()| writer.write_all(&line))
-          .map_err(Error::from)
-      });
-    if let Err(error) = written {
+    let guard = PendingGuard { electron: self, id };
+    if let Err(error) = self.write_line(line, deadline).await {
+      drop(guard);
       self.shutdown();
-      return Err(error.context(format!("write Electron RPC `{method}`")));
+      return Err(error);
     }
-    Ok((id, receiver))
-  }
-
-  fn receive_response(&self, id: u64, receiver: Receiver<RpcResult>, method: &str, timeout: Duration) -> RpcResult {
-    match receiver.recv_timeout(timeout) {
-      Ok(result) => result,
-      Err(error) => {
-        self
-          .pending
-          .lock()
-          .unwrap_or_else(|poisoned| poisoned.into_inner())
-          .remove(&id);
-        match error {
-          RecvTimeoutError::Timeout => {
-            Err(format!("Electron did not answer `{method}` in {timeout:?}").into())
-          }
-          RecvTimeoutError::Disconnected => Err(format!("Electron is gone ({method})").into()),
-        }
-      }
+    let result = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), receiver).await;
+    drop(guard);
+    match result {
+      Ok(Ok(result)) => result,
+      Ok(Err(_)) => Err(Error::ChannelDisconnected),
+      Err(_) => Err(Error::IpcTimeout { timeout_duration: timeout }),
     }
   }
 
-  /// Send an RPC without waiting for its reply.
-  ///
-  /// `eval` scripts have no useful reply, and the callers run on Tauri's event
-  /// loop: waiting for the page to execute each script would stall every window
-  /// event behind it. The reply is dropped even if Electron sends one.
-  pub fn post(&self, method: &str, params: Value, timeout: Duration) -> Result<(), Error> {
-    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-    let mut line = serde_json::to_vec(&json!({"id":id,"method":method,"params":params,"notification":true}))?;
-    line.push(b'\n');
-    if self.closed.load(Ordering::SeqCst) {
-      return Err(format!("Electron is gone ({method})").into());
-    }
-    let written = self
-      .writer
-      .lock()
-      .map_err(|_| Error::from("writer lock poisoned"))
-      .and_then(|mut writer| {
-        writer
-          .set_write_timeout(Some(timeout))
-          .and_then(|()| writer.write_all(&line))
-          .map_err(Error::from)
-      });
-    if let Err(error) = written {
-      self.shutdown();
-      return Err(error.context(format!("write Electron RPC `{method}`")));
-    }
-    Ok(())
+  async fn write_line(&self, line: Vec<u8>, deadline: Instant) -> Result<(), Error> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    let order = tokio::time::timeout(timeout, Arc::clone(&self.writer_order).lock_owned()).await
+      .map_err(|_| Error::IpcTimeout { timeout_duration: timeout })?;
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() { return Err(Error::IpcTimeout { timeout_duration: timeout }); }
+    let writer = Arc::clone(&self.writer);
+    let task = tokio::task::spawn_blocking(move || {
+      let _order = order;
+      writer.lock().map_err(|_| Error::from("writer lock poisoned"))
+        .and_then(|mut writer| writer.set_write_timeout(Some(timeout)).and_then(|()| writer.write_all(&line)).map_err(Error::from))
+    });
+    tokio::time::timeout(timeout, task).await.map_err(|_| Error::IpcTimeout { timeout_duration: timeout })?
+      .map_err(|error| Error::with_source("Electron RPC writer failed", error))?
   }
 
   /// Run this Electron binary in Node mode.
@@ -370,11 +408,7 @@ impl Electron {
   /// Close IPC, wake pending calls, close subscriptions, and terminate/reap Electron.
   pub fn shutdown(&self) {
     self.disconnect();
-    let _ = self
-      .writer
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .shutdown(Shutdown::Both);
+    let _ = self.shutdown_stream.shutdown(Shutdown::Both);
     if let Some(mut child) = self
       .child
       .lock()
@@ -418,11 +452,8 @@ impl Electron {
     if self.closed.swap(true, Ordering::SeqCst) {
       return;
     }
-    self
-      .pending
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .clear();
+    let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    for (_, (_, sender)) in pending { let _ = sender.send(Err(Error::ChannelDisconnected)); }
     let mut subscribers = self
       .subscribers
       .lock()
@@ -442,7 +473,7 @@ impl Electron {
       self.publish(message);
       return;
     };
-    let Some(waiter) = self
+    let Some((method, waiter)) = self
       .pending
       .lock()
       .ok()
@@ -452,7 +483,7 @@ impl Electron {
     };
     let result = message["error"].as_str().map_or_else(
       || Ok(message.get("result").cloned().unwrap_or(Value::Null)),
-      |error| Err(error.into()),
+      |error| Err(Error::Rpc { method, message: error.into() }),
     );
     let _ = waiter.send(result);
   }
@@ -639,7 +670,7 @@ fn read_handshake(reader: &mut BufReader<TcpStream>, deadline: Instant, token: &
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::error::Error as _;
+  use std::{error::Error as _, sync::mpsc::RecvTimeoutError};
 
   const WAIT: Duration = Duration::from_secs(5);
   const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -657,7 +688,9 @@ mod tests {
     let (sender, receiver) = mpsc::sync_channel(EVENT_CAPACITY);
     let electron = Arc::new(Electron {
       binary: PathBuf::new(),
-      writer: Mutex::new(reader.get_ref().try_clone().unwrap()),
+      writer: Arc::new(Mutex::new(reader.get_ref().try_clone().unwrap())),
+      writer_order: Arc::new(tokio::sync::Mutex::new(())),
+      shutdown_stream: reader.get_ref().try_clone().unwrap(),
       pending: Mutex::new(HashMap::new()),
       events: Mutex::new(Some(receiver)),
       subscribers: Mutex::new(Subscribers {
@@ -670,6 +703,19 @@ mod tests {
       version,
     });
     (electron, peer, reader)
+  }
+
+  #[tokio::test]
+  async fn cancelled_rpc_removes_its_pending_waiter() {
+    let (electron, _peer, _reader) = loopback(READY);
+    let _order = electron.writer_order.lock().await;
+    let mut request = Box::pin(electron.rpc_value("cancel", Value::Null, WAIT, false, false));
+    assert!(std::future::poll_fn(|cx| {
+      std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
+    }).await.is_pending());
+    assert_eq!(electron.pending.lock().unwrap().len(), 1);
+    drop(request);
+    assert!(electron.pending.lock().unwrap().is_empty());
   }
 
   #[test]
@@ -731,22 +777,21 @@ mod tests {
       }
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
-    electron.post("notify", Value::Null, WAIT).unwrap();
+    call(&electron, "notify", Value::Null, WAIT, true).unwrap();
     assert!(
       electron.pending.lock().unwrap().is_empty(),
       "a posted call must not register a waiter"
     );
-    assert_eq!(electron.call("echo", Value::Null, WAIT).unwrap(), 42);
+    assert_eq!(call(&electron, "echo", Value::Null, WAIT, false).unwrap(), 42);
     assert_eq!(future.recv_timeout(WAIT).unwrap()["event"], "future");
     assert_eq!(callback_rx.recv_timeout(WAIT).unwrap()["event"], "future");
-    let error = electron.call("error", Value::Null, WAIT).unwrap_err();
-    assert_eq!(error.to_string(), "remote RPC error");
+    let error = call(&electron, "error", Value::Null, WAIT, false).unwrap_err();
+    assert!(matches!(&error, Error::Rpc { method, message } if method == "error" && message == "remote RPC error"));
     assert!(error.source().is_none());
-    assert!(electron
-      .call("timeout", Value::Null, Duration::from_millis(30))
-      .unwrap_err()
-      .to_string()
-      .contains("did not answer"));
+    assert!(matches!(
+      call(&electron, "timeout", Value::Null, Duration::from_millis(30), false).unwrap_err(),
+      Error::IpcTimeout { timeout_duration } if timeout_duration == Duration::from_millis(30)
+    ));
     assert!(electron.pending.lock().unwrap().is_empty());
     let deadline = Instant::now() + WAIT;
     while Arc::strong_count(&electron) > 1 && Instant::now() < deadline {
@@ -757,11 +802,10 @@ mod tests {
       1,
       "the blocked reader must not own Electron"
     );
-    assert!(electron
-      .call("disconnect", Value::Null, WAIT)
-      .unwrap_err()
-      .to_string()
-      .contains("is gone"));
+    assert!(matches!(
+      call(&electron, "disconnect", Value::Null, WAIT, false).unwrap_err(),
+      Error::ChannelDisconnected
+    ));
     peer.join().unwrap();
     assert!(electron.pending.lock().unwrap().is_empty());
     assert_eq!(events.recv_timeout(WAIT).unwrap()["event"], "future");
@@ -783,11 +827,10 @@ mod tests {
       electron.subscribe().recv_timeout(WAIT),
       Err(RecvTimeoutError::Disconnected)
     ));
-    assert!(electron
-      .call("after-close", Value::Null, WAIT)
-      .unwrap_err()
-      .to_string()
-      .contains("is gone"));
+    assert!(matches!(
+      call(&electron, "after-close", Value::Null, WAIT, false).unwrap_err(),
+      Error::ChannelDisconnected
+    ));
     electron.shutdown();
   }
 
@@ -807,8 +850,8 @@ mod tests {
       line.clear();
       assert_eq!(reader.read_line(&mut line).unwrap(), 0);
     });
-    let error = electron.call("overflow", Value::Null, WAIT).unwrap_err();
-    assert!(error.to_string().contains("is gone"), "{error}");
+    let error = call(&electron, "overflow", Value::Null, WAIT, false).unwrap_err();
+    assert!(matches!(error, Error::ChannelDisconnected), "{error}");
     peer.join().unwrap();
     assert!(electron.closed.load(Ordering::SeqCst));
     assert!(electron.pending.lock().unwrap().is_empty());
@@ -870,13 +913,13 @@ mod tests {
       line.clear();
       assert_eq!(reader.read_line(&mut line).unwrap(), 0);
     });
-    assert_eq!(electron.call("fill", Value::Null, WAIT).unwrap(), 42);
+    assert_eq!(call(&electron, "fill", Value::Null, WAIT, false).unwrap(), 42);
     assert_eq!(callback_rx.recv_timeout(WAIT).unwrap()["index"], 0);
     assert_eq!(electron.subscribers.lock().unwrap().future.len(), 2);
     for index in 0..EVENT_CAPACITY {
       assert_eq!(events.recv_timeout(WAIT).unwrap()["index"], index);
     }
-    assert_eq!(electron.call("overflow", Value::Null, WAIT).unwrap(), 42);
+    assert_eq!(call(&electron, "overflow", Value::Null, WAIT, false).unwrap(), 42);
     assert_eq!(events.recv_timeout(WAIT).unwrap()["index"], EVENT_CAPACITY);
     for index in 0..EVENT_CAPACITY {
       assert_eq!(slow.recv_timeout(WAIT).unwrap()["index"], index);
@@ -886,9 +929,7 @@ mod tests {
       Err(RecvTimeoutError::Disconnected)
     ));
     assert_eq!(
-      electron
-        .call("callback-overflow", Value::Null, WAIT)
-        .unwrap(),
+      call(&electron, "callback-overflow", Value::Null, WAIT, false).unwrap(),
       42
     );
     assert_eq!(
@@ -905,7 +946,7 @@ mod tests {
       Err(RecvTimeoutError::Disconnected)
     ));
     assert!(!electron.closed.load(Ordering::SeqCst));
-    assert_eq!(electron.call("after", Value::Null, WAIT).unwrap(), 42);
+    assert_eq!(call(&electron, "after", Value::Null, WAIT, false).unwrap(), 42);
     electron.shutdown();
     peer.join().unwrap();
   }
@@ -949,7 +990,7 @@ mod tests {
       assert_eq!(reader.read_line(&mut line).unwrap(), 0);
     });
     // The reply is dispatched after every event, so both queues are now full.
-    electron.call("barrier", Value::Null, WAIT).unwrap();
+    call(&electron, "barrier", Value::Null, WAIT, false).unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let closing = Arc::clone(&electron);
     let shutdown = std::thread::spawn(move || {
@@ -982,16 +1023,9 @@ mod tests {
         .unwrap()
         .shutdown(Shutdown::Write)
         .unwrap();
-      let error = if posted {
-        electron.post("write", Value::Null, WAIT).unwrap_err()
-      } else {
-        electron.call("write", Value::Null, WAIT).unwrap_err()
-      };
-      assert!(error.to_string().contains("write Electron RPC `write`"));
-      let context = error.source().unwrap();
-      assert!(context
-        .source()
-        .is_some_and(|cause| cause.is::<io::Error>()));
+      let error = call(&electron, "write", Value::Null, WAIT, posted).unwrap_err();
+      assert!(matches!(&error, Error::Io(_)), "{error}");
+      assert!(error.source().is_some_and(|cause| cause.is::<io::Error>()));
       assert!(electron.pending.lock().unwrap().is_empty());
     }
   }

@@ -64,7 +64,7 @@ if (!isMainThread) {
   })
   server.listen(0, '127.0.0.1', () => parentPort.postMessage({ port: server.address().port }))
 } else {
-  const connect = createRequire(import.meta.url)('../../electron-rs/assets/ipc.cjs')
+  const { IPC } = createRequire(import.meta.url)('../../electron-rs/assets/socket/ipc.cjs')
   const peer = new Worker(new URL(import.meta.url))
   const received = []
   peer.on('message', (message) => received.push(message))
@@ -118,10 +118,10 @@ if (!isMainThread) {
         transport.send({ id: message.id, error: error.message })
       }
     }
-    transport = connect(port, onRequest,
-      () => transport.send({ event: 'ready', params: { token: 'handshake' } }),
-      () => { closes++ },
-    )
+    transport = new IPC(port)
+    transport.on('request', onRequest)
+    transport.on('connect', () => transport.send({ event: 'ready', params: { token: 'handshake' } }))
+    transport.on('close', () => { closes++ })
     await until(() => received.some((message) => message.async))
     assert.deepEqual(received.find((message) => message.ready).ready, { token: 'handshake' })
     assert.deepEqual(received.find((message) => message.async).async.result, { value: '窗口' })
@@ -152,14 +152,18 @@ if (!isMainThread) {
     assert.throws(() => transport.request('closed', {}, 100), /host IPC closed/)
 
     // JSON serialization crashes the socket worker, not the blocked caller.
-    transport = connect(port, onRequest, () => {}, () => { closes++ })
+    transport = new IPC(port)
+    transport.on('request', onRequest)
+    transport.on('close', () => { closes++ })
     transport.send({ value: 1n })
     const crashed = performance.now()
     assert.throws(() => transport.request('worker-crash', {}, 3_000), /host IPC closed/)
     assert.ok(performance.now() - crashed < 1_000, 'worker exception must wake Atomics.wait')
     await until(() => closes === 2)
 
-    transport = connect(port, onRequest, () => {}, () => { closes++ })
+    transport = new IPC(port)
+    transport.on('request', onRequest)
+    transport.on('close', () => { closes++ })
     assert.throws(() => transport.request('malformed', {}, 3_000), /host IPC closed/)
     await until(() => closes === 3)
     console.log('IPC transport: handshake, async, queued/reentrant nested RPC, timeout/stale reply, disconnect, worker exception, invalid JSON passed')

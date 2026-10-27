@@ -4,16 +4,17 @@ Prepare Electron at build time and control its process from Rust, without Tauri.
 
 - Download official releases with SHA-256 verification and a shared cache.
 - Stage a private distribution with built-in main/preload scripts and optional branding.
-- Launch with synchronous JSON-RPC, event subscriptions and Node mode.
+- Launch with async typed JSON-RPC, event subscriptions and Node mode.
 
 ## Usage
 
-Add the crate as both a normal and build dependency:
+Add the crate as both a normal and build dependency, plus Serde for request types and Tokio for the async runtime:
 
 ```toml
 [dependencies]
 electron-rs = { git = "https://github.com/hairyf/tauri-runtime-electron", branch = "main" }
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 
 [build-dependencies]
 electron-rs = { git = "https://github.com/hairyf/tauri-runtime-electron", branch = "main" }
@@ -22,14 +23,11 @@ electron-rs = { git = "https://github.com/hairyf/tauri-runtime-electron", branch
 Pin a Git revision or tag for release builds. In your application's build script:
 
 ```rust
-use electron_rs::{ElectronBuilder, Error, Metadata, DEFAULT_VERSION};
+use electron_rs::{ElectronBuilder, Error, DEFAULT_VERSION};
 
 fn main() -> Result<(), Error> {
     let prepared = ElectronBuilder::new(DEFAULT_VERSION)
-        .metadata(Metadata {
-            app_name: Some("My App".into()),
-            ..Default::default()
-        })
+        .app_name("My App")
         .build()?;
     if let Some(warning) = &prepared.cleanup_warning {
         println!("cargo:warning={warning}");
@@ -41,23 +39,35 @@ fn main() -> Result<(), Error> {
 
 `DEFAULT_VERSION` is currently `45.0.0`. `build()` returns `Result<PreparedDistribution, Error>`. Its fields are `directory: PathBuf` and `binary: PathBuf`, both absolute, and `cleanup_warning: Option<Error>`. Reuse those paths for that build invocation. Bundle the entire `prepared.directory`, including libraries, resources, metadata and scripts. The absolute `APP_ELECTRON_BINARY` path above is for local development; resolve packaged resources on the destination machine.
 
-Launch from the prepared runtime directory or executable:
+Launch from the prepared runtime directory or executable inside a Tokio runtime with time enabled:
 
 ```rust
-use std::{error::Error, path::Path, thread, time::Duration};
-use electron_rs::{find_binary, Electron};
-use serde_json::json;
+use std::{error::Error, path::Path, thread};
+use electron_rs::{find_binary, Electron, RpcRequest};
+use serde::Serialize;
 
-fn connect(runtime: &Path) -> Result<(), Box<dyn Error>> {
+#[derive(Serialize)]
+struct SetTheme {
+    theme: &'static str,
+}
+
+impl RpcRequest for SetTheme {
+    type Response = ();
+    const METHOD: &'static str = "app.theme";
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let runtime = Path::new(env!("APP_ELECTRON_BINARY"));
     let binary = find_binary(runtime)?;
-    let electron = Electron::new(&binary, 0)?;
+    let electron = Electron::new(&binary, 0).await?;
     let events = electron.events()?;
     thread::spawn(move || {
         for event in events {
             eprintln!("{event}");
         }
     });
-    electron.call("app.theme", json!({ "theme": "system" }), Duration::from_secs(5))?;
+    electron.call(SetTheme { theme: "system" }).await?;
     let output = electron.node(&["-p", "process.versions.node"])?;
     if output.status.success() {
         println!("{}", String::from_utf8_lossy(&output.stdout));
@@ -83,7 +93,13 @@ The default layout is `<target-root>/electron/<platform>-<arch>`, with **no vers
 | `path(path)` | Add an ordered source search path, such as `vendor/electron`. |
 | `resources_dir(path)` | Set the root used by paths beginning with `{resources}`, e.g. `{resources}/runtime`. |
 | `output(path)` | Replace the entire default output path; no platform/version suffix is added. |
-| `metadata(value)` | Apply optional app identity to the staged copy. |
+| `app_name(name)` | Set the display name applied to the staged copy. |
+| `identifier(identifier)` | Set the application identifier used by desktop integration. |
+| `icon(path)` | Set a Windows `.ico` or macOS `.icns` application icon. |
+| `host_executable(path)` | Reuse Windows icon/version resources from an existing executable. |
+| `metadata(value)` | Replace all branding settings with a `Metadata` value. |
+
+Fluent branding setters update individual fields. `metadata(value)` replaces all fields; setters called afterward override the corresponding fields.
 
 The builder reuses a matching output, source path, local `node_modules/electron/dist` or cached release before downloading from official Electron releases. Every candidate, including the existing output and cache, needs executable headers matching the target OS/architecture and consistent evidence for the requested Electron version. At least one of `version` or `.electron-rs-version` must match; missing evidence, unreadable files or conflicting version files prevent reuse. Downloads require `curl`, a SHA-256 tool and a ZIP extractor, and the extracted distribution receives the same compatibility checks.
 
@@ -101,16 +117,17 @@ Branding changes existing signatures. Apply release signing and macOS notarizati
 
 ## Process and events
 
-`Electron::new(binary, 0)` selects a free loopback IPC port and returns `Arc<Electron>`. `with_args(binary, port, &args, timeout)` adds `Vec<String>` switches and a positive startup deadline covering connection and handshake; `new` uses 15 seconds. `version` contains the Electron handshake version.
+`Electron::new(binary, 0).await` selects a free loopback IPC port and returns `Result<Arc<Electron>, Error>`. `Electron::with_args(binary, port, &args, timeout).await` accepts switches as `&[String]` and a positive startup deadline covering connection and handshake; `new` uses 15 seconds. Startup requires a Tokio runtime, and RPC deadlines require its time driver. `version` contains the Electron handshake version.
 
 - `events()` takes the initial receiver **once**, including notifications buffered since launch. Its queue holds at most 1,024 events, even before the receiver is taken. Drain it or explicitly drop the receiver; a new event arriving while the initial queue is full shuts down Electron and disconnects IPC.
 - `on(handler)` invokes a `Send + 'static` callback on a dedicated thread for **future** events. `subscribe()` returns a separate receiver for future events. Each has a 1,024-event queue. Overflow closes only that subscription and writes a diagnostic to stderr; other subscriptions and RPC continue. Buffered events drain before the receiver reports disconnection or the callback is dropped. Event delivery never waits for a slow receiver or callback on the RPC reader.
-- `call(method, params, timeout)` sends synchronous RPC with a response timeout. Supported methods and notification payloads live in the bundled [RPC handler](assets/main.cjs#L856).
+- `call(request).await` accepts an owned `R: RpcRequest`, serializes it as RPC parameters and returns `Result<R::Response, Error>` without blocking the calling executor. The request implements `Serialize + Send + 'static`, declares `METHOD: &'static str` and sets `Response: DeserializeOwned + Send + 'static`. `method()` defaults to `METHOD`; `timeout()` defaults to five seconds and covers writing and waiting for the response. Override these methods on the request type when needed. Supported methods and notification payloads live in the [RPC handler](src-ts/runtime/commands.ts).
+- `RpcRequest::deferred()` defaults to `false` and controls the bridge's `asynchronous` flag. `notification()` also defaults to `false`; when `true`, the call completes after writing without waiting for a reply and deserializes JSON `null`, so use `Response = ()`.
 - `shutdown()` closes IPC/subscriptions, wakes pending calls and terminates/reaps Electron. Dropping the final `Arc` also shuts it down. `ipc.closed` is a best-effort final event; it cannot be queued into a full buffer, so consumers must handle channel disconnection. New subscriptions after disconnect are already closed.
 
-Both `ElectronBuilder::node(args)` and `Electron::node(args)` start a separate `ELECTRON_RUN_AS_NODE` process without starting an RPC bridge and return `std::io::Result<std::process::Output>`. A nonzero exit is `Ok(Output)`: inspect `status`, `stdout` and `stderr`. Errors report binary resolution, process creation or output collection failures. Both methods use the same launcher and set `CREATE_NO_WINDOW` on Windows.
+Event receivers use blocking `std::sync::mpsc` iteration; drain them on a separate thread as in the example. `shutdown()` and Node mode also remain synchronous. Both `ElectronBuilder::node(args)` and `Electron::node(args)` start a separate `ELECTRON_RUN_AS_NODE` process without starting an RPC bridge and return `std::io::Result<std::process::Output>`. A nonzero exit is `Ok(Output)`: inspect `status`, `stdout` and `stderr`. Errors report binary resolution, process creation or output collection failures. Both methods use the same launcher and set `CREATE_NO_WINDOW` on Windows.
 
-Preparation, discovery and RPC return the concrete `electron_rs::Error`, which implements `Display` and `std::error::Error`. Its display text includes context and the cause; `source()` retains the underlying error, including I/O, JSON, UTF-16 and Windows errors where applicable. Validation messages can be represented directly. Use `Error` for operations returning crate errors or `Box<dyn std::error::Error>` when combining crate and I/O errors, as in the examples.
+Preparation, discovery and RPC return `electron_rs::ElectronError`, a non-exhaustive enum also exported as the compatibility alias `electron_rs::Error`. It implements `Display` and `std::error::Error`, with matchable variants including `IpcTimeout`, `ChannelDisconnected`, `Rpc`, `ChecksumMismatch` and `InvalidInput`. Its display text includes context and the cause; `source()` retains the underlying error, including I/O, JSON, UTF-16 and Windows errors where applicable. Use `Error` for operations returning crate errors or `Box<dyn std::error::Error>` when combining crate and I/O errors, as in the examples.
 
 The bundled bridge uses sandboxed, isolated renderers and main-frame IPC. Standalone callers own host policy decisions; Tauri CSP/ACL are provided by the Tauri adapter. Keep IPC and executable/resource paths within your application's trust boundary.
 

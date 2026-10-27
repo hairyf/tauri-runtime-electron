@@ -47,14 +47,15 @@ jobs:
 
       # Rust owns expectations; Node executes production JavaScript against
       # native doubles. This job needs no source submodules or GUI.
-      - name: Check Electron script syntax and types
+      - name: Build and check Electron scripts
         run: |
-          node --check electron-rs/assets/main.cjs
-          node --check electron-rs/assets/internal.cjs
-          node --check electron-rs/assets/commands.cjs
-          node --check electron-rs/assets/ipc.cjs
-          node --check electron-rs/assets/preload.cjs
           pnpm run typecheck
+          pnpm run build:electron
+          node --check electron-rs/assets/main.cjs
+          node --check electron-rs/assets/runtime/commands.cjs
+          node --check electron-rs/assets/socket/ipc.cjs
+          node --check electron-rs/assets/preload.cjs
+          git diff --exit-code -- electron-rs/assets
 
       - name: Test Electron bridge regressions
         run: pnpm run test:bridge:regressions
@@ -105,6 +106,13 @@ jobs:
             ~/AppData/Local/electron/Cache
           key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: Build Electron scripts from TypeScript
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm run typecheck
+          pnpm run build:electron
+          git diff --exit-code -- electron-rs/assets
 
       - name: Check
         run: cargo check --locked --all-targets --all-features

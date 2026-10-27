@@ -1,11 +1,12 @@
 // Observe the complete production assets with native doubles; Rust owns policy assertions.
+import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
-import { runtimeModules } from './runtime-modules.mjs'
+import { createRuntime } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const electronDirectory = fileURLToPath(new URL('../../assets/', import.meta.url))
@@ -145,11 +146,7 @@ const electron = {
   shell: { openExternal: (...args) => external.push(args) },
 }
 const context = vm.createContext({
-  require: (name) => name === 'electron' ? electron
-    : name === 'node:fs' ? nativeFs
-    : name === 'node:os' ? { tmpdir: () => root } : require(name),
-  __dirname: electronDirectory,
-  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {} },
+  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
   Buffer, URL, Request, Response, Headers, Uint8Array, console,
   setTimeout(callback, delay) {
     const timer = { callback, delay, unreferenced: false, unref() { this.unreferenced = true } }
@@ -157,15 +154,18 @@ const context = vm.createContext({
     return timer
   },
   clearTimeout: (timer) => timers.delete(timer),
-  testSocket: { request: () => ({ action: 'deny' }), send(message) {
-    messages.push(message)
-    if (message.event === 'protocol.request') {
-      context.handle('protocol.respond', { id: message.params.id, status: 200, body: '' })
-    }
-  } },
 })
+const runtime = createRuntime(context, electron, {
+  require: (name) => name === 'electron' ? electron : name === 'node:fs' ? nativeFs
+    : name === 'node:os' ? { tmpdir: () => root } : require(name),
+  send(message) {
+    messages.push(message)
+    if (message.event === 'protocol.request') runtime.handle('protocol.respond', { id: message.params.id, status: 200, body: '' })
+  },
+  request: (event, params) => ({ action: 'deny' }),
+})
+context.handle = runtime.handle
 const plain = (value) => JSON.parse(JSON.stringify(value))
-let runtime
 let window
 let child
 let noHandler
@@ -193,7 +193,7 @@ const navigationState = (navigation) => plain({
   body: navigation.details.uploadData[0].bytes.toString(),
 })
 const cleanup = () => ({
-  pending: runtime.navigationRequests.size,
+  pending: runtime.state.navigationRequests.size,
   timers: timers.size,
   destroyedListeners: [window.webContents, child.webContents].map((contents) =>
     contents.listeners('destroyed').filter((listener) => !lifecycleDestroyedListeners.has(listener)).length),
@@ -248,7 +248,7 @@ function navigation() {
     const stale = begin(window.webContents)
     const timer = [...timers][0]
     defaultSession[event]({ id: stale.details.id + 1000 })
-    const unrelatedPending = runtime.navigationRequests.has(stale.request.id)
+    const unrelatedPending = runtime.state.navigationRequests.has(stale.request.id)
     const stops = window.webContents.stops
     defaultSession[event]({ id: stale.details.id })
     const ended = cleanup()
@@ -280,10 +280,11 @@ async function preload() {
       const sent = []
       const invoked = []
       const page = vm.createContext({ window: { fetch() {} }, location: { href: 'https://page.invalid/' }, URL, Request })
-      const required = []
+      const required = new Set()
       vm.runInNewContext(source, {
         require(name) {
-          required.push(name)
+          assert.equal(name, 'electron', 'sandboxed preload dependencies remain Electron-only')
+          required.add(name)
           return {
             contextBridge: { exposeInMainWorld: (name, value) => { page.window[name] = value } },
             ipcRenderer: {
@@ -307,7 +308,7 @@ async function preload() {
         }
       }
       frames.push({
-        owner, isMainFrame, required,
+        owner, isMainFrame, required: [...required],
         preferences: {
           contextIsolation: preferences.contextIsolation, sandbox: preferences.sandbox,
           nodeIntegration: preferences.nodeIntegration, nodeIntegrationInSubFrames: preferences.nodeIntegrationInSubFrames,
@@ -369,32 +370,32 @@ function permissions() {
     bypass.push({ request: messages[before]?.params ?? null, replies })
   }
   runtime.handle('webview.permissionResponse', { id: 999, response: 'allow' })
-  return { decisions, bypass, pending: runtime.permissionRequests.size, timers: timers.size }
+  return { decisions, bypass, pending: runtime.state.permissionRequests.size, timers: timers.size }
 }
 async function sessions() {
-  const defaultSelection = runtime.sessionFor() ?? null
+  const defaultSelection = runtime.state.sessionFor() ?? null
   runtime.handle('protocol.register', { scheme: 'tauri' })
   const directory = path.join(root, 'profiles', 'shared')
-  const shared = runtime.sessionFor({ dataDirectory: directory })
+  const shared = runtime.state.sessionFor({ dataDirectory: directory })
   const aliases = [
-    runtime.sessionFor({ dataDirectory: path.join(directory, '..', 'shared') }).id,
-    runtime.sessionFor({ dataDirectory: path.relative(process.cwd(), directory) }).id,
+    runtime.state.sessionFor({ dataDirectory: path.join(directory, '..', 'shared') }).id,
+    runtime.state.sessionFor({ dataDirectory: path.relative(process.cwd(), directory) }).id,
   ]
-  const separate = runtime.sessionFor({ dataDirectory: path.join(root, 'profiles', 'separate') })
-  const privateOne = runtime.sessionFor({ incognito: true, dataDirectory: directory })
-  const privateTwo = runtime.sessionFor({ incognito: true, dataDirectory: directory })
+  const separate = runtime.state.sessionFor({ dataDirectory: path.join(root, 'profiles', 'separate') })
+  const privateOne = runtime.state.sessionFor({ incognito: true, dataDirectory: directory })
+  const privateTwo = runtime.state.sessionFor({ incognito: true, dataDirectory: directory })
   runtime.handle('protocol.register', { scheme: 'asset' })
   runtime.handle('protocol.register', { scheme: 'asset' })
-  const future = runtime.sessionFor({ dataDirectory: path.join(root, 'profiles', 'future') })
+  const future = runtime.state.sessionFor({ dataDirectory: path.join(root, 'profiles', 'future') })
   const otherSession = begin(window.webContents, 'mainFrame', false, shared)
   const sameId = begin(window.webContents, 'mainFrame', false, separate, otherSession.details.id)
   shared.errorOccurred({ id: otherSession.details.id })
-  const remaining = [...runtime.navigationRequests.keys()]
+  const remaining = [...runtime.state.navigationRequests.keys()]
   answer(sameId, true)
   answer(otherSession, false)
   const targets = []
   for (const target of [defaultSession, shared, separate, privateOne, privateTwo, future]) {
-    runtime.installPolicyHandlers(target)
+    runtime.state.installPolicyHandlers(target)
     let before = messages.length
     await target.protocol.handlers.get('tauri')(new Request('tauri://localhost/first'))
     const tauri = messages.slice(before).find(message => message.event === 'protocol.request')
@@ -426,10 +427,8 @@ async function sessions() {
     targets, cleanup: cleanup(),
   }
 }
-context.require = runtimeModules(context, context.require)
 try {
-  vm.runInContext(`${fs.readFileSync(path.join(electronDirectory, 'main.cjs'), 'utf8')}\n;state.socket = testSocket; installPolicyHandlers();`, context)
-  runtime = vm.runInContext('({ handle, sessionFor, installPolicyHandlers, ...state })', context)
+  runtime.state.installPolicyHandlers(defaultSession)
   const scripts = [
     { script: 'globalThis.mainScript = (globalThis.mainScript ?? 0) + 1', mainFrameOnly: true },
     { script: 'globalThis.everyFrameScript = (globalThis.everyFrameScript ?? 0) + 1', mainFrameOnly: false },
@@ -438,13 +437,14 @@ try {
     windowId: 1, trafficLightPosition: { x: 12, y: 18 }, tabbingIdentifier: 'editor-tabs',
     webview: { webviewId: 10, url: 'https://page.invalid/', initScripts: scripts, policy: { navigation: true, permission: true } },
   })
-  window = runtime.windows.get(1)
+  runtime.state.installPolicyHandlers(defaultSession)
+  window = runtime.windows.get(1).native
   await runtime.handle('webview.create', {
     windowId: 1, webviewId: 20, url: 'https://child.invalid/', initScripts: scripts, policy: { navigation: true, permission: true },
   })
-  child = runtime.childWebviews.get(20).view
+  child = runtime.webviews.get(20).view
   await runtime.handle('window.create', { windowId: 2, webview: { webviewId: 30, url: 'https://no-handler.invalid/' } })
-  noHandler = runtime.windows.get(2)
+  noHandler = runtime.windows.get(2).native
   // Policy cleanup counts request listeners separately from theme/ownership lifecycle listeners.
   for (const contents of [window.webContents, child.webContents]) {
     for (const listener of contents.listeners('destroyed')) lifecycleDestroyedListeners.add(listener)

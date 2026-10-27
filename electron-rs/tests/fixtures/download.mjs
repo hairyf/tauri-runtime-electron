@@ -1,10 +1,10 @@
 // Observe production download handling without Electron, network, or live timers.
-import { constants, readFileSync } from 'node:fs'
+import { constants } from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
-import { runtimeModules } from './runtime-modules.mjs'
+import { createRuntime } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const root = path.resolve('download-fixture')
@@ -70,11 +70,34 @@ const context = vm.createContext({
   clearTimeout: (timer) => timers.delete(timer),
   testSocket: { send: (message) => messages.push(message) },
 })
-context.require = runtimeModules(context, context.require)
-vm.runInContext(`${readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8')}
-;state.socket = testSocket; installPolicyHandlers();
-state.webviewByContents.set(7, 70); state.handlerPolicy.set(70, { download: true });`, context)
-const inspect = (expression) => vm.runInContext(expression, context)
+const electron = {
+  app: { getPath: () => root, on() {}, whenReady: () => new Promise(() => {}) },
+  ipcMain: { on() {}, handle() {} }, protocol: { registerSchemesAsPrivileged() {} }, session: { defaultSession: target },
+}
+const nativeRequire = name => name === 'electron' ? electron
+  : name === 'node:fs' ? { constants, appendFileSync: (_file, line) => logs.push(line), mkdtempSync(prefix) {
+    if (stagingFails) throw new Error('staging denied')
+    const directory = `${prefix}${++nextDirectory}`; directories.add(directory); return directory
+  }, rmSync(directory, options) {
+    cleanupOptions.push(options ?? null); directories.delete(directory)
+    for (const file of files.keys()) if (file.startsWith(`${directory}${path.sep}`)) files.delete(file)
+  }, renameSync() { renames++; throw Object.assign(new Error('cross device'), { code: 'EXDEV' }) }, copyFileSync(source, destination, flags) {
+    copyFlags.push(flags)
+    if (copyingFails) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
+    if (!files.has(source)) throw Object.assign(new Error('missing source'), { code: 'ENOENT' })
+    if ((flags & constants.COPYFILE_EXCL) && files.has(destination)) throw Object.assign(new Error('destination exists'), { code: 'EEXIST' })
+    files.set(destination, files.get(source))
+  } }
+  : name === 'node:os' ? { tmpdir: () => root } : require(name)
+const runtime = createRuntime(context, electron, { require: nativeRequire, send: (message) => messages.push(message) })
+context.handle = runtime.handle
+const { policies, webviews } = runtime
+const { Webview } = runtime.load('./runtime/webview.cjs')
+const contents = new EventEmitter(); contents.id = 7
+const view = { webContents: contents }
+webviews.add(new Webview({}, 70, view, { webviewId: 70, url: '', policy: { download: true } }))
+policies.install(target)
+const inspect = (expression) => vm.runInNewContext(expression, { state: { downloadRequests: runtime.downloads.pending } })
 class Item extends EventEmitter {
   savePath = ''
   getURL() { return 'https://download.invalid/file' }

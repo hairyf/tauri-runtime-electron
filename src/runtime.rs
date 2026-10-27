@@ -7,21 +7,21 @@ use crate::{
   webview::ElectronWebviewDispatcher, window::ElectronWindowDispatcher,
   window_handle::ElectronRuntimeHandle,
 };
-use electron_rs::Electron as ElectronProcess;
+use crate::{rpc, rpc_runtime::Ipc as ElectronProcess};
 use serde_json::{json, Value};
 use tauri_runtime::{
-  DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
-  RuntimeInitArgs, UserEvent, WindowEventId,
   dpi::{PhysicalPosition, PhysicalSize, PixelUnit, Position, Size},
-  window::WindowSizeConstraints,
   monitor::Monitor,
   webview::{
-    DetachedWebview, DownloadEvent,
-    PageLoadEvent, PendingWebview, PermissionKind, PermissionResponse, WebviewIpcHandler,
+    DetachedWebview, DownloadEvent, PageLoadEvent, PendingWebview, PermissionKind,
+    PermissionResponse, WebviewIpcHandler,
   },
+  window::WindowSizeConstraints,
   window::{
     DetachedWindow, DetachedWindowWebview, PendingWindow, RawWindow, WindowEvent, WindowId,
   },
+  DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
+  RuntimeInitArgs, UserEvent, WindowEventId,
 };
 use tauri_utils::Theme;
 
@@ -33,12 +33,8 @@ type NavigationHandler = dyn Fn(&url::Url) -> bool + Send;
 type WebviewEventHandler = dyn Fn(&tauri_runtime::window::WebviewEvent) + Send;
 type WindowEventHandler = dyn Fn(&WindowEvent) + Send;
 type UriSchemeProtocolResponder = dyn FnOnce(Response<std::borrow::Cow<'static, [u8]>>) + Send;
-type UriSchemeProtocolHandler = dyn Fn(
-    &str,
-    http::Request<Vec<u8>>,
-    Box<UriSchemeProtocolResponder>,
-  ) + Send
-  + Sync;
+type UriSchemeProtocolHandler =
+  dyn Fn(&str, http::Request<Vec<u8>>, Box<UriSchemeProtocolResponder>) + Send + Sync;
 
 use http::{Request, Response};
 use std::{
@@ -49,13 +45,12 @@ use std::{
   path::{Path, PathBuf},
   rc::Rc,
   sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc::{Receiver, SyncSender, channel, sync_channel},
+    mpsc::{channel, sync_channel, Receiver, SyncSender},
+    Arc, Mutex,
   },
   time::Duration,
 };
-
 
 /// Schemes built into every runtime; application schemes must be known before launch.
 pub(crate) const DEFAULT_SCHEMES: &[&str] = &["ipc", "tauri", "asset"];
@@ -138,10 +133,12 @@ pub(crate) fn size_payload(size: Size) -> Value {
 
 /// Keep each constraint's unit until the target display is known in Electron.
 pub(crate) fn size_constraints_payload(constraints: WindowSizeConstraints) -> Value {
-  let axis = |unit: Option<PixelUnit>| unit.map(|unit| match unit {
-    PixelUnit::Physical(unit) => json!({ "value": unit.0, "physical": true }),
-    PixelUnit::Logical(unit) => json!({ "value": unit.0, "physical": false }),
-  });
+  let axis = |unit: Option<PixelUnit>| {
+    unit.map(|unit| match unit {
+      PixelUnit::Physical(unit) => json!({ "value": unit.0, "physical": true }),
+      PixelUnit::Logical(unit) => json!({ "value": unit.0, "physical": false }),
+    })
+  };
   json!({
     "minWidth": axis(constraints.min_width),
     "minHeight": axis(constraints.min_height),
@@ -242,7 +239,8 @@ pub struct RuntimeContext {
   /// HWND/X11 IDs permit selected cross-process operations; AppKit pointers
   /// cannot be borrowed from Electron's process.
   native_handles: Arc<RefCell<HashMap<u32, isize>>>,
-  pub(crate) new_window_handlers: Arc<RefCell<HashMap<u32, Rc<crate::new_window::NewWindowHandler>>>>,
+  pub(crate) new_window_handlers:
+    Arc<RefCell<HashMap<u32, Rc<crate::new_window::NewWindowHandler>>>>,
 }
 
 // SAFETY: we ensure this type is only used on the main thread.
@@ -264,9 +262,12 @@ impl RuntimeContext {
     }
     let context = self.clone();
     let (tx, rx) = sync_channel(1);
-    self.run_tx.send(Message::Task(Box::new(move || {
-      let _ = tx.send(task(&context));
-    }))).map_err(|_| Error::FailedToSendMessage)?;
+    self
+      .run_tx
+      .send(Message::Task(Box::new(move || {
+        let _ = tx.send(task(&context));
+      })))
+      .map_err(|_| Error::FailedToSendMessage)?;
     rx.recv().map_err(|_| Error::FailedToReceiveMessage)
   }
 
@@ -282,7 +283,10 @@ impl RuntimeContext {
     };
     // Like Wry's proxy, explicit exit requests must reach the callback even
     // when requested during setup, before the event loop starts.
-    if !is_main_thread || matches!(&message, Message::RequestExit(_)) || self.is_running.load(Ordering::Relaxed) {
+    if !is_main_thread
+      || matches!(&message, Message::RequestExit(_))
+      || self.is_running.load(Ordering::Relaxed)
+    {
       self
         .run_tx
         .send(message)
@@ -314,10 +318,17 @@ impl RuntimeContext {
 
   pub(crate) fn forget_webview(&self, serial: u32) -> Result<()> {
     self.on_main_thread(move |context| {
-      let removed = context.windows.borrow_mut().values_mut().find_map(|window| {
-        let index = window.webviews.iter().position(|webview| webview.serial == serial)?;
-        Some(window.webviews.remove(index))
-      });
+      let removed = context
+        .windows
+        .borrow_mut()
+        .values_mut()
+        .find_map(|window| {
+          let index = window
+            .webviews
+            .iter()
+            .position(|webview| webview.serial == serial)?;
+          Some(window.webviews.remove(index))
+        });
       if let Some(webview) = removed {
         context.forget_webview_handlers(webview.serial, &webview.label);
       }
@@ -328,26 +339,49 @@ impl RuntimeContext {
     self.on_main_thread(move |context| {
       let (source, target) = {
         let windows = context.windows.borrow();
-        let source = windows.iter().find_map(|(id, window)| {
-          window.webviews.iter().any(|webview| webview.serial == serial).then_some(*id)
-        }).ok_or_else(|| create_webview_err("webview is no longer tracked".into()))?;
-        let target = windows.get(&destination)
-          .ok_or_else(|| create_webview_err("destination window does not exist".into()))?.serial;
+        let source = windows
+          .iter()
+          .find_map(|(id, window)| {
+            window
+              .webviews
+              .iter()
+              .any(|webview| webview.serial == serial)
+              .then_some(*id)
+          })
+          .ok_or_else(|| create_webview_err("webview is no longer tracked".into()))?;
+        let target = windows
+          .get(&destination)
+          .ok_or_else(|| create_webview_err("destination window does not exist".into()))?
+          .serial;
         (source, target)
       };
-      if source == destination { return Ok(()); }
-      context.ipc.call("webview.reparent", json!({ "webviewId": serial, "windowId": target }), IPC_TIMEOUT)
+      if source == destination {
+        return Ok(());
+      }
+      context
+        .ipc
+        .call(rpc::WebviewReparent {
+          webview_id: serial,
+          window_id: target,
+        })
         .map_err(|error| create_webview_err(error.to_string()))?;
       // Move ownership only after the native move succeeds. Handlers and protocols
       // remain keyed by the unchanged webview ID, including after source close.
       let mut windows = context.windows.borrow_mut();
-      let source = windows.get_mut(&source)
+      let source = windows
+        .get_mut(&source)
         .ok_or_else(|| create_webview_err("source window is gone".into()))?;
-      let index = source.webviews.iter().position(|webview| webview.serial == serial)
+      let index = source
+        .webviews
+        .iter()
+        .position(|webview| webview.serial == serial)
         .ok_or_else(|| create_webview_err("webview is no longer tracked".into()))?;
       let webview = source.webviews.remove(index);
-      windows.get_mut(&destination)
-        .ok_or_else(|| create_webview_err("destination window is gone".into()))?.webviews.push(webview);
+      windows
+        .get_mut(&destination)
+        .ok_or_else(|| create_webview_err("destination window is gone".into()))?
+        .webviews
+        .push(webview);
       Ok(())
     })?
   }
@@ -383,20 +417,36 @@ impl RuntimeContext {
   }
 
   pub(crate) fn serial_for_window(&self, id: WindowId) -> Option<u32> {
-    self.on_main_thread(move |context| {
-      context.windows.borrow().get(&id).map(|window| window.serial)
-    }).ok().flatten()
+    self
+      .on_main_thread(move |context| {
+        context
+          .windows
+          .borrow()
+          .get(&id)
+          .map(|window| window.serial)
+      })
+      .ok()
+      .flatten()
   }
 
   pub(crate) fn window_for_webview(&self, serial: u32) -> Result<ElectronWindowDispatcher> {
     self.on_main_thread(move |context| {
-      context.windows.borrow().iter().find_map(|(id, window)| {
-        window.webviews.iter().any(|webview| webview.serial == serial).then(|| ElectronWindowDispatcher {
-          id: *id,
-          context: context.clone(),
-          effects_target: crate::window::EffectsTarget::new(window.serial, &context.ipc),
+      context
+        .windows
+        .borrow()
+        .iter()
+        .find_map(|(id, window)| {
+          window
+            .webviews
+            .iter()
+            .any(|webview| webview.serial == serial)
+            .then(|| ElectronWindowDispatcher {
+              id: *id,
+              context: context.clone(),
+              effects_target: crate::window::EffectsTarget::new(window.serial, &context.ipc),
+            })
         })
-      }).ok_or_else(|| create_webview_err("webview is no longer tracked".into()))
+        .ok_or_else(|| create_webview_err("webview is no longer tracked".into()))
     })?
   }
 
@@ -414,16 +464,10 @@ impl RuntimeContext {
     }
     let value = self
       .ipc
-      .call(
-        "window.nativeHandle",
-        json!({ "windowId": serial }),
-        IPC_TIMEOUT,
-      )
+      .call(rpc::NativeHandle { window_id: serial })
       .map_err(|error| create_window_err(error.to_string()))?;
-    let handle = value["handle"]
-      .as_i64()
-      .ok_or_else(|| create_window_err("electron returned no native handle".to_string()))?;
-    let handle = handle as isize;
+    let handle = isize::try_from(value.handle)
+      .map_err(|_| create_window_err("Electron native handle exceeds pointer size".into()))?;
     self.native_handles.borrow_mut().insert(serial, handle);
     Ok(handle)
   }
@@ -431,14 +475,22 @@ impl RuntimeContext {
   #[cfg(target_os = "linux")]
   pub(crate) fn x11_window(&self, id: WindowId) -> Result<(u32, u32)> {
     self.on_main_thread(move |context| {
-      let serial = context.serial_for_window(id)
+      let serial = context
+        .serial_for_window(id)
         .ok_or_else(|| create_window_err("window is gone".into()))?;
-      let value = context.ipc.call("window.nativeHandle", json!({ "windowId": serial }), IPC_TIMEOUT)
+      let value = context
+        .ipc
+        .call(rpc::NativeHandle { window_id: serial })
         .map_err(|error| create_window_err(error.to_string()))?;
-      let field = |name| value[name].as_u64().and_then(|value| u32::try_from(value).ok())
+      let handle = u32::try_from(value.handle)
+        .ok()
         .filter(|value| *value != 0)
-        .ok_or_else(|| create_window_err(format!("Electron returned no X11 {name}")));
-      Ok((field("handle")?, field("processId")?))
+        .ok_or_else(|| create_window_err("Electron returned no X11 handle".into()))?;
+      let process = value
+        .process_id
+        .filter(|value| *value != 0)
+        .ok_or_else(|| create_window_err("Electron returned no X11 processId".into()))?;
+      Ok((handle, process))
     })?
   }
 
@@ -448,11 +500,16 @@ impl RuntimeContext {
       return self.on_main_thread(move |context| context.menu_owner_window(id))?;
     }
     let mut windows = self.windows.borrow_mut();
-    let window = windows.get_mut(&id).ok_or_else(|| create_window_err("window is gone".into()))?;
+    let window = windows
+      .get_mut(&id)
+      .ok_or_else(|| create_window_err("window is gone".into()))?;
     if window.menu_owner.is_none() {
       window.menu_owner = crate::window::imp::MenuOwner::new();
     }
-    window.menu_owner.as_ref().map(|owner| owner.handle)
+    window
+      .menu_owner
+      .as_ref()
+      .map(|owner| owner.handle)
       .ok_or_else(|| create_window_err("could not create menu owner".into()))
   }
 
@@ -460,18 +517,36 @@ impl RuntimeContext {
   fn sync_window_menus(&self) {
     // ponytail: O(total menu items) per pump; use native mutation hooks if
     // polling becomes measurable. Only changed menus cross IPC.
-    let changed: Vec<_> = self.windows.borrow().iter().filter_map(|(id, window)| {
-      let owner = window.menu_owner.as_ref()?;
-      match crate::window::imp::menu_snapshot(owner.handle) {
-        Ok(menu) if menu != owner.mirrored => Some((*id, window.serial, menu)),
-        Ok(_) => None,
-        Err(error) => { eprintln!("[electron] menu snapshot failed: {error}"); None }
-      }
-    }).collect();
+    let changed: Vec<_> = self
+      .windows
+      .borrow()
+      .iter()
+      .filter_map(|(id, window)| {
+        let owner = window.menu_owner.as_ref()?;
+        match crate::window::imp::menu_snapshot(owner.handle) {
+          Ok(menu) if menu != owner.mirrored => Some((*id, window.serial, menu)),
+          Ok(_) => None,
+          Err(error) => {
+            eprintln!("[electron] menu snapshot failed: {error}");
+            None
+          }
+        }
+      })
+      .collect();
     for (id, serial, menu) in changed {
-      match self.ipc.call("window.setMenu", json!({ "windowId": serial, "menu": { "items": menu } }), IPC_TIMEOUT) {
+      match self.ipc.call(rpc::WindowSetMenu {
+        window_id: serial,
+        menu: menu.as_array().map(|items| rpc::Menu {
+          items: items.clone(),
+        }),
+      }) {
         Ok(_) => {
-          if let Some(owner) = self.windows.borrow_mut().get_mut(&id).and_then(|window| window.menu_owner.as_mut()) {
+          if let Some(owner) = self
+            .windows
+            .borrow_mut()
+            .get_mut(&id)
+            .and_then(|window| window.menu_owner.as_mut())
+          {
             owner.mirrored = menu;
           }
         }
@@ -495,7 +570,9 @@ impl RuntimeContext {
   pub(crate) fn set_webview_origin_by_serial(&self, serial: u32, url: &str) {
     if std::thread::current().id() != self.main_thread_id {
       let url = url.to_owned();
-      if let Err(error) = self.on_main_thread(move |context| context.set_webview_origin_by_serial(serial, &url)) {
+      if let Err(error) =
+        self.on_main_thread(move |context| context.set_webview_origin_by_serial(serial, &url))
+      {
         eprintln!("[electron] failed to update webview origin: {error}");
       }
       return;
@@ -559,7 +636,11 @@ impl RuntimeContext {
   ) {
     if let Err(error) = self.on_main_thread(move |context| {
       for window in context.windows.borrow_mut().values_mut() {
-        if let Some(webview) = window.webviews.iter_mut().find(|webview| webview.serial == serial) {
+        if let Some(webview) = window
+          .webviews
+          .iter_mut()
+          .find(|webview| webview.serial == serial)
+        {
           webview.handlers.push((event_id, Rc::new(handler)));
           break;
         }
@@ -589,14 +670,20 @@ impl RuntimeContext {
   }
 
   pub(crate) fn new_window<T: UserEvent>(&self, params: &Value) -> Result<Value> {
-    use crate::{new_window::{with_opener, NewWindowFeatures, NewWindowOpener, NewWindowResponse}, ElectronWindowBuilder};
+    use crate::{
+      new_window::{with_opener, NewWindowFeatures, NewWindowOpener, NewWindowResponse},
+      ElectronWindowBuilder,
+    };
     use tauri_runtime::{webview::WebviewAttributes, window::WindowBuilder};
     use tauri_utils::config::{WebviewUrl, WindowConfig};
 
-    let serial = params["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok())
+    let serial = params["webviewId"]
+      .as_u64()
+      .and_then(|id| u32::try_from(id).ok())
       .ok_or_else(|| create_webview_err("invalid popup source".into()))?;
     self.window_for_webview(serial)?;
-    let request = params["request"].as_u64()
+    let request = params["request"]
+      .as_u64()
       .ok_or_else(|| create_webview_err("invalid popup request".into()))?;
     let url = url::Url::parse(params["url"].as_str().unwrap_or_default())
       .map_err(|error| create_webview_err(error.to_string()))?;
@@ -606,32 +693,47 @@ impl RuntimeContext {
       disposition: params["disposition"].as_str().unwrap_or_default().into(),
       position: serde_json::from_value(params["position"].clone()).ok(),
       size: serde_json::from_value(params["size"].clone()).ok(),
-      opener: NewWindowOpener { request, ipc: Arc::downgrade(&self.ipc) },
+      opener: NewWindowOpener {
+        request,
+        ipc: Arc::downgrade(&self.ipc),
+      },
     };
     let handler = self.new_window_handlers.borrow().get(&serial).cloned();
-    let response = handler.map(|handler| handler(url.clone(), features.clone()))
+    let response = handler
+      .map(|handler| handler(url.clone(), features.clone()))
       .unwrap_or(NewWindowResponse::Allow);
     let selected = match response {
       NewWindowResponse::Deny => None,
       NewWindowResponse::Create { window } => {
         if !Arc::ptr_eq(&self.ipc, &window.context.ipc) {
-          return Err(create_webview_err("popup destination belongs to another runtime".into()));
+          return Err(create_webview_err(
+            "popup destination belongs to another runtime".into(),
+          ));
         }
         let windows = self.windows.borrow();
-        let target = windows.get(&window.id).filter(|window| window.new_window_request == Some(request))
-          .ok_or_else(|| create_webview_err("popup destination was not built with this request's opener".into()))?;
+        let target = windows
+          .get(&window.id)
+          .filter(|window| window.new_window_request == Some(request))
+          .ok_or_else(|| {
+            create_webview_err("popup destination was not built with this request's opener".into())
+          })?;
         Some(target.serial)
       }
       NewWindowResponse::Allow => {
         // A handler may have built a destination before choosing Allow. Destroy
         // those staged shells through Electron so their normal window.closed
         // event still removes them from Tauri's registry.
-        let staged: Vec<u32> = self.windows.borrow().values()
+        let staged: Vec<u32> = self
+          .windows
+          .borrow()
+          .values()
           .filter(|window| window.new_window_request == Some(request))
           .map(|window| window.serial)
           .collect();
         for serial in staged {
-          self.ipc.call("window.destroy", json!({ "windowId": serial }), IPC_TIMEOUT)
+          self
+            .ipc
+            .call(rpc::WindowDestroy { window_id: serial })
             .map_err(|error| create_webview_err(error.to_string()))?;
         }
         let label = format!("__electron_popup_{request}");
@@ -642,9 +744,10 @@ impl RuntimeContext {
           y: features.position.map(|position| position.y),
           ..Default::default()
         };
-        let mut webview = PendingWebview::<T, ElectronRuntime>::new(WebviewAttributes::new(
-          WebviewUrl::External(url.clone()),
-        ), label.clone())?;
+        let mut webview = PendingWebview::<T, ElectronRuntime>::new(
+          WebviewAttributes::new(WebviewUrl::External(url.clone())),
+          label.clone(),
+        )?;
         webview.url = url.to_string();
         let pending = with_opener(features.opener(), || {
           let builder = ElectronWindowBuilder::with_config(&config);
@@ -741,7 +844,9 @@ impl ElectronRuntime {
 
   fn start(attrs: Electron, custom_schemes: &[&str]) -> Result<Self> {
     crate::platform::dpi::enable_per_monitor_v2();
-    let binary = attrs.resolve_binary().map_err(|error| create_window_err(error.to_string()))?;
+    let binary = attrs
+      .resolve_binary()
+      .map_err(|error| create_window_err(error.to_string()))?;
     eprintln!("[electron] launching {}", binary.display());
     let mut args = extra_args(&attrs.args);
     switches::warn_about_dangerous_switches(&args);
@@ -761,24 +866,35 @@ impl ElectronRuntime {
       .iter()
       .map(|scheme| scheme.to_string())
       .collect();
-    for scheme in custom_schemes.iter().map(|scheme| (*scheme).to_string()).chain(take_startup_schemes()) {
+    for scheme in custom_schemes
+      .iter()
+      .map(|scheme| (*scheme).to_string())
+      .chain(take_startup_schemes())
+    {
       if !schemes.contains(&scheme) {
         schemes.push(scheme);
       }
     }
     args.push("--tauri-schemes".to_string());
     args.push(schemes.join(","));
-    if let Some(identifier) = attrs.identifier.as_deref().or(option_env!("ELECTRON_RS_TAURI_IDENTIFIER")) {
+    if let Some(identifier) = attrs
+      .identifier
+      .as_deref()
+      .or(option_env!("ELECTRON_RS_TAURI_IDENTIFIER"))
+    {
       args.push("--tauri-identifier".to_string());
       args.push(identifier.to_string());
     }
-    let ipc = ElectronProcess::with_args(
-      &binary,
+    let ipc = ElectronProcess::connect(
+      binary.clone(),
       0,
-      &args,
+      args,
       attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
-    ).map_err(|error| create_window_err(error.to_string()))?;
-    let event_rx = ipc.events().map_err(|error| create_window_err(error.to_string()))?;
+    )
+    .map_err(|error| create_window_err(error.to_string()))?;
+    let event_rx = ipc
+      .events()
+      .map_err(|error| create_window_err(error.to_string()))?;
     let icon = attrs.resolve_icon().or_else(|| {
       // A packaged app has no icon file beside it: the bundler embedded the
       // icon in the executable, so copy it back out for Electron.
@@ -863,14 +979,16 @@ impl Electron {
     let executable = std::env::current_exe()?;
     let mut lookup_error = None;
     if let Some(dir) = executable.parent() {
-      let product_name = option_env!("ELECTRON_RS_TAURI_PRODUCT_NAME")
-        .filter(|_| cfg!(target_os = "linux"));
+      let product_name =
+        option_env!("ELECTRON_RS_TAURI_PRODUCT_NAME").filter(|_| cfg!(target_os = "linux"));
       let app_dir = std::env::var_os("APPDIR").map(PathBuf::from);
       for root in bundled_roots(dir, product_name, app_dir.as_deref()) {
         if root.is_dir() {
           match electron_rs::find_binary(&root) {
             Ok(binary) => return Ok(binary),
-            Err(error) => { lookup_error.get_or_insert(error); }
+            Err(error) => {
+              lookup_error.get_or_insert(error);
+            }
           }
         }
       }
@@ -986,20 +1104,15 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   }
 
   fn primary_monitor(&self) -> Option<Monitor> {
-    let displays = self
-      .context
-      .ipc
-      .call("window.displays", json!({}), IPC_TIMEOUT)
-      .ok()?;
-    platform::monitor_from_value(&displays["primary"])
+    let displays = self.context.ipc.call(rpc::Displays {}).ok()?;
+    displays
+      .primary
+      .as_ref()
+      .and_then(platform::monitor_from_value)
   }
 
   fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
-    let display = self
-      .context
-      .ipc
-      .call("window.displayForPoint", json!({ "x": x, "y": y }), IPC_TIMEOUT)
-      .ok()?;
+    let display = self.context.ipc.call(rpc::DisplayForPoint { x, y }).ok()?;
     platform::monitor_from_value(&display)
   }
 
@@ -1007,12 +1120,14 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     self
       .context
       .ipc
-      .call("window.displays", json!({}), IPC_TIMEOUT)
+      .call(rpc::Displays {})
       .ok()
-      .and_then(|displays| {
-        displays["displays"]
-          .as_array()
-          .map(|list| list.iter().filter_map(platform::monitor_from_value).collect())
+      .map(|displays| {
+        displays
+          .displays
+          .iter()
+          .filter_map(platform::monitor_from_value)
+          .collect()
       })
       .unwrap_or_default()
   }
@@ -1023,11 +1138,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       Some(_) => "light",
       None => "system",
     };
-    if let Err(error) = self
-      .context
-      .ipc
-      .call("app.theme", json!({ "theme": theme }), IPC_TIMEOUT)
-    {
+    if let Err(error) = self.context.ipc.call(rpc::AppTheme { theme }) {
       eprintln!("[electron] set theme failed: {error}");
     }
   }
@@ -1043,11 +1154,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
       _ => "regular",
     };
-    if let Err(error) = self.context.ipc.call(
-      "app.activationPolicy",
-      json!({ "policy": policy }),
-      IPC_TIMEOUT,
-    ) {
+    if let Err(error) = self.context.ipc.call(rpc::AppActivationPolicy { policy }) {
       eprintln!("[electron] set activation policy failed: {error}");
     }
   }
@@ -1055,11 +1162,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   #[cfg(target_os = "macos")]
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn set_dock_visibility(&mut self, visible: bool) {
-    if let Err(error) = self.context.ipc.call(
-      "app.dockVisibility",
-      json!({ "visible": visible }),
-      IPC_TIMEOUT,
-    ) {
+    if let Err(error) = self.context.ipc.call(rpc::AppDockVisibility { visible }) {
       eprintln!("[electron] set dock visibility failed: {error}");
     }
   }
@@ -1068,11 +1171,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn set_activate_ignoring_other_apps(&mut self, ignore: bool) {
     // There is no direct equivalent; focusing with `steal` is the closest.
-    if let Err(error) = self
-      .context
-      .ipc
-      .call("app.focus", json!({ "steal": ignore }), IPC_TIMEOUT)
-    {
+    if let Err(error) = self.context.ipc.call(rpc::AppFocus { steal: ignore }) {
       eprintln!("[electron] focus app failed: {error}");
     }
   }
@@ -1080,7 +1179,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   #[cfg(target_os = "macos")]
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn show(&self) {
-    if let Err(error) = self.context.ipc.call("app.show", json!({}), IPC_TIMEOUT) {
+    if let Err(error) = self.context.ipc.call(rpc::AppShow {}) {
       eprintln!("[electron] show app failed: {error}");
     }
   }
@@ -1088,7 +1187,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   #[cfg(target_os = "macos")]
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn hide(&self) {
-    if let Err(error) = self.context.ipc.call("app.hide", json!({}), IPC_TIMEOUT) {
+    if let Err(error) = self.context.ipc.call(rpc::AppHide {}) {
       eprintln!("[electron] hide app failed: {error}");
     }
   }
@@ -1122,12 +1221,12 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
-    let point = self.context.ipc.call("window.cursorPosition", json!({}), IPC_TIMEOUT)
+    let point = self
+      .context
+      .ipc
+      .call(rpc::CursorPosition {})
       .map_err(|error| create_window_err(error.to_string()))?;
-    Ok(PhysicalPosition::new(
-      point["x"].as_f64().unwrap_or_default(),
-      point["y"].as_f64().unwrap_or_default(),
-    ))
+    Ok(PhysicalPosition::new(point.x, point.y))
   }
 }
 
@@ -1151,21 +1250,44 @@ impl ElectronRuntime {
           #[cfg(windows)]
           Some("menu.command") => {
             let params = &event["params"];
-            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
-            let Some(command) = params["commandId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
-            let owner = self.context.windows.borrow().values()
+            let Some(serial) = params["windowId"]
+              .as_u64()
+              .and_then(|id| u32::try_from(id).ok())
+            else {
+              continue;
+            };
+            let Some(command) = params["commandId"]
+              .as_u64()
+              .and_then(|id| u32::try_from(id).ok())
+            else {
+              continue;
+            };
+            let owner = self
+              .context
+              .windows
+              .borrow()
+              .values()
               .find(|window| window.serial == serial)
               .and_then(|window| window.menu_owner.as_ref().map(|owner| owner.handle));
             if let Some(owner) = owner {
-              if crate::window::imp::menu_snapshot(owner).is_ok_and(|menu| menu_command_enabled(&menu, command)) {
+              if crate::window::imp::menu_snapshot(owner)
+                .is_ok_and(|menu| menu_command_enabled(&menu, command))
+              {
                 crate::window::imp::dispatch_menu_command(owner, command);
               }
             }
           }
           Some("window.themeChanged") => {
             let params = &event["params"];
-            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
-            let Some(id) = self.context.window_for_serial(serial) else { continue };
+            let Some(serial) = params["windowId"]
+              .as_u64()
+              .and_then(|id| u32::try_from(id).ok())
+            else {
+              continue;
+            };
+            let Some(id) = self.context.window_for_serial(serial) else {
+              continue;
+            };
             let theme = match params["theme"].as_str() {
               Some("dark") => Theme::Dark,
               Some("light") => Theme::Light,
@@ -1173,19 +1295,35 @@ impl ElectronRuntime {
             };
             #[cfg(windows)]
             if let Some(dark) = params["dark"].as_bool() {
-              if let Err(error) = self.context.native_handle(id)
-                .and_then(|handle| crate::window::imp::set_theme(handle, dark)) {
+              if let Err(error) = self
+                .context
+                .native_handle(id)
+                .and_then(|handle| crate::window::imp::set_theme(handle, dark))
+              {
                 eprintln!("[electron] native caption theme failed: {error}");
               }
             }
-            let label = self.context.windows.borrow().get(&id).map(|window| window.label.clone());
+            let label = self
+              .context
+              .windows
+              .borrow()
+              .get(&id)
+              .map(|window| window.label.clone());
             if let Some(label) = label {
-              self.context.emit_window_event(id, &WindowEvent::ThemeChanged(theme));
-              callback(RunEvent::WindowEvent { label, event: WindowEvent::ThemeChanged(theme) });
+              self
+                .context
+                .emit_window_event(id, &WindowEvent::ThemeChanged(theme));
+              callback(RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::ThemeChanged(theme),
+              });
             }
           }
           Some("webview.closed") => {
-            if let Some(serial) = event["params"]["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok()) {
+            if let Some(serial) = event["params"]["webviewId"]
+              .as_u64()
+              .and_then(|id| u32::try_from(id).ok())
+            {
               if let Err(error) = self.context.forget_webview(serial) {
                 eprintln!("[electron] webview cleanup failed: {error}");
               }
@@ -1239,7 +1377,12 @@ impl ElectronRuntime {
           }
           Some("webview.navigationCommitted") => {
             let params = &event["params"];
-            if let (Some(serial), Some(url)) = (params["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok()), params["url"].as_str()) {
+            if let (Some(serial), Some(url)) = (
+              params["webviewId"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok()),
+              params["url"].as_str(),
+            ) {
               self.context.set_webview_origin_by_serial(serial, url);
             }
           }
@@ -1251,10 +1394,13 @@ impl ElectronRuntime {
             let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
               continue;
             };
-            let handler = self.context.webview_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.page_load.clone());
-            if let Some(handler) = handler
-            {
+            let handler = self
+              .context
+              .webview_handlers
+              .borrow()
+              .get(&(serial as u32))
+              .and_then(|handlers| handlers.page_load.clone());
+            if let Some(handler) = handler {
               let page_load = if name == "webview.loadStarted" {
                 PageLoadEvent::Started
               } else {
@@ -1269,10 +1415,13 @@ impl ElectronRuntime {
               continue;
             };
             let title = params["title"].as_str().unwrap_or_default().to_string();
-            let handler = self.context.webview_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.title.clone());
-            if let Some(handler) = handler
-            {
+            let handler = self
+              .context
+              .webview_handlers
+              .borrow()
+              .get(&(serial as u32))
+              .and_then(|handlers| handlers.title.clone());
+            if let Some(handler) = handler {
               handler(title);
             }
           }
@@ -1286,7 +1435,11 @@ impl ElectronRuntime {
             // The generic Tauri callback is only exposed on Apple targets.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
-              let handler = self.context.webview_handlers.borrow().get(&serial)
+              let handler = self
+                .context
+                .webview_handlers
+                .borrow()
+                .get(&serial)
                 .and_then(|handlers| handlers.process_terminated.clone());
               if let Some(handler) = handler {
                 handler();
@@ -1300,39 +1453,49 @@ impl ElectronRuntime {
           #[cfg(target_os = "macos")]
           Some("app.reopen") => {
             if let Some(has_visible_windows) = event["params"]["hasVisibleWindows"].as_bool() {
-              callback(RunEvent::Reopen { has_visible_windows });
+              callback(RunEvent::Reopen {
+                has_visible_windows,
+              });
             }
           }
           Some("webview.newWindow") => {
             let params = &event["params"];
             if let Some(id) = params["id"].as_u64() {
-              let response = self.context.new_window::<T>(params).unwrap_or_else(|error| {
-                eprintln!("[electron] native popup denied: {error}");
-                json!({ "action": "deny" })
-              });
-              if let Err(error) = self.context.ipc.call(
-                "webview.newWindowResponse", json!({ "id": id, "response": response }), IPC_TIMEOUT,
-              ) {
+              let response = self
+                .context
+                .new_window::<T>(params)
+                .unwrap_or_else(|error| {
+                  eprintln!("[electron] native popup denied: {error}");
+                  json!({ "action": "deny" })
+                });
+              if let Err(error) = self
+                .context
+                .ipc
+                .call(rpc::NewWindowResponse { id, response })
+              {
                 eprintln!("[electron] failed to answer native popup: {error}");
               }
             }
           }
           Some("webview.navigationRequested") => {
             let params = &event["params"];
-            let (Some(id), Some(serial)) = (params["id"].as_u64(), params["webviewId"].as_u64()) else {
+            let (Some(id), Some(serial)) = (params["id"].as_u64(), params["webviewId"].as_u64())
+            else {
               continue;
             };
             let handler = u32::try_from(serial).ok().and_then(|serial| {
-              self.context.policy_handlers.borrow().get(&serial)
+              self
+                .context
+                .policy_handlers
+                .borrow()
+                .get(&serial)
                 .and_then(|handlers| handlers.navigation.clone())
             });
             let allow = handler.is_some_and(|handler| {
               url::Url::parse(params["url"].as_str().unwrap_or_default())
                 .is_ok_and(|url| handler(&url))
             });
-            if let Err(error) = self.context.ipc.call(
-              "webview.navigationResponse", json!({ "id": id, "allow": allow }), IPC_TIMEOUT,
-            ) {
+            if let Err(error) = self.context.ipc.call(rpc::NavigationResponse { id, allow }) {
               eprintln!("[electron] failed to answer navigation: {error}");
             }
           }
@@ -1361,11 +1524,11 @@ impl ElectronRuntime {
                 .unwrap_or(false),
               None => true,
             };
-            if let Err(error) = self.context.ipc.call(
-              "webview.downloadResponse",
-              json!({ "id": id, "allow": allow, "destination": destination }),
-              IPC_TIMEOUT,
-            ) {
+            if let Err(error) = self.context.ipc.call(rpc::DownloadResponse {
+              id,
+              allow,
+              destination: destination.to_string_lossy().into_owned(),
+            }) {
               eprintln!("[electron] failed to answer a download request: {error}");
             }
           }
@@ -1410,17 +1573,15 @@ impl ElectronRuntime {
                 _ => "default",
               }
             };
-            if let Err(error) = self.context.ipc.call(
-              "webview.permissionResponse",
-              json!({ "id": id, "response": response }),
-              IPC_TIMEOUT,
-            ) {
+            if let Err(error) = self
+              .context
+              .ipc
+              .call(rpc::PermissionResponse { id, response })
+            {
               eprintln!("[electron] failed to answer a permission request: {error}");
             }
           }
           Some("ipc.message") => {
-
-
             let params = &event["params"];
             let Some(serial) = params["webviewId"].as_u64() else {
               continue;
@@ -1446,7 +1607,9 @@ impl ElectronRuntime {
           }
           Some("protocol.request") => {
             let params = &event["params"];
-            let Some(id) = params["id"].as_u64() else { continue };
+            let Some(id) = params["id"].as_u64() else {
+              continue;
+            };
             let scheme = params["scheme"].as_str().unwrap_or_default().to_string();
             if scheme == "ipc" && params["webviewId"].as_u64().is_none() {
               eprintln!("[electron] ipc protocol request has no authenticated webview");
@@ -1458,8 +1621,12 @@ impl ElectronRuntime {
               .borrow()
               .iter()
               .filter(|((registered, owner), _)| {
-                registered == &scheme && (scheme != "ipc" || *owner ==
-                  params["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok()))
+                registered == &scheme
+                  && (scheme != "ipc"
+                    || *owner
+                      == params["webviewId"]
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok()))
               })
               .min_by_key(|((_, owner), _)| *owner)
               .map(|(_, handler)| handler.clone())
@@ -1470,7 +1637,9 @@ impl ElectronRuntime {
             let uri = params["uri"].as_str().unwrap_or_default().to_string();
             let body = params["body"]
               .as_str()
-              .and_then(|body| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).ok())
+              .and_then(|body| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).ok()
+              })
               .unwrap_or_default();
             let mut builder = Request::builder()
               .method(params["method"].as_str().unwrap_or("GET"))
@@ -1492,12 +1661,7 @@ impl ElectronRuntime {
             // Never replace a real (including opaque) origin with a local one:
             // Tauri uses it to select the invocation's ACL execution context.
             // Browser-initiated requests without one use the registered owner.
-            let origin = self
-              .context
-              .webview_origins
-              .borrow()
-              .get(&label)
-              .cloned();
+            let origin = self.context.webview_origins.borrow().get(&label).cloned();
             set_missing_origin(request.headers_mut(), origin.as_deref());
             let ipc = self.context.ipc.clone();
             let request_uri = uri.clone();
@@ -1514,17 +1678,14 @@ impl ElectronRuntime {
                       .map(|value| (name.to_string(), Value::String(value.to_string())))
                   })
                   .collect();
-                let body = base64::engine::general_purpose::STANDARD.encode(response.body().as_ref());
-                if let Err(error) = ipc.call(
-                  "protocol.respond",
-                  json!({
-                    "id": id,
-                    "status": response.status().as_u16(),
-                    "headers": headers,
-                    "body": body,
-                  }),
-                  IPC_TIMEOUT,
-                ) {
+                let body =
+                  base64::engine::general_purpose::STANDARD.encode(response.body().as_ref());
+                if let Err(error) = ipc.call(rpc::ProtocolRespond {
+                  id,
+                  status: response.status().as_u16(),
+                  headers,
+                  body,
+                }) {
                   eprintln!("[electron] failed to answer protocol request {request_uri}: {error}");
                 }
               });
@@ -1572,15 +1733,36 @@ impl ElectronRuntime {
       #[cfg(windows)]
       {
         for (owner, method) in crate::window::imp::take_menu_actions() {
-          let target = self.context.windows.borrow().iter().find_map(|(id, window)| {
-            window.menu_owner.as_ref().filter(|menu| menu.handle == owner)
-              .map(|_| (*id, window.serial))
-          });
+          let target = self
+            .context
+            .windows
+            .borrow()
+            .iter()
+            .find_map(|(id, window)| {
+              window
+                .menu_owner
+                .as_ref()
+                .filter(|menu| menu.handle == owner)
+                .map(|_| (*id, window.serial))
+            });
           let Some((id, serial)) = target else { continue };
           if method == "window.close" {
             close_window(&self.context, id, &mut callback);
-          } else if let Err(error) = self.context.ipc.call(method, json!({ "windowId": serial }), IPC_TIMEOUT) {
-            eprintln!("[electron] native menu action failed: {error}");
+          } else {
+            let result = match method {
+              "window.minimize" => self
+                .context
+                .ipc
+                .call(rpc::WindowMinimize { window_id: serial }),
+              "window.maximize" => self
+                .context
+                .ipc
+                .call(rpc::WindowMaximize { window_id: serial }),
+              _ => continue,
+            };
+            if let Err(error) = result {
+              eprintln!("[electron] native menu action failed: {error}");
+            }
           }
         }
         self.context.sync_window_menus();
@@ -1599,7 +1781,6 @@ impl ElectronRuntime {
     self.context.ipc.shutdown();
     exit_code
   }
-
 }
 
 /// Translates an Electron window event into the Tauri equivalent.
@@ -1678,11 +1859,7 @@ fn close_window<T: UserEvent, F: FnMut(RunEvent<T>)>(
     return false;
   }
   if let Some(serial) = context.serial_for_window(id) {
-    if let Err(error) = context.ipc.call(
-      "window.destroy",
-      serde_json::json!({ "windowId": serial }),
-      IPC_TIMEOUT,
-    ) {
+    if let Err(error) = context.ipc.call(rpc::WindowDestroy { window_id: serial }) {
       eprintln!("[electron] failed to destroy window {serial}: {error}");
     }
   }
@@ -1710,14 +1887,18 @@ fn request_exit<T: UserEvent, F: FnMut(RunEvent<T>)>(code: Option<i32>, callback
 
 #[cfg(any(windows, test))]
 fn menu_command_enabled(menu: &Value, command: u32) -> bool {
-  command <= u16::MAX as u32 && menu.as_array().is_some_and(|items| items.iter().any(|item| {
-    item["enabled"].as_bool() == Some(true) && item["type"] != "separator" &&
-      if item["submenu"].is_array() {
-        menu_command_enabled(&item["submenu"], command)
-      } else {
-        item["commandId"].as_u64() == Some(command as u64)
-      }
-  }))
+  command <= u16::MAX as u32
+    && menu.as_array().is_some_and(|items| {
+      items.iter().any(|item| {
+        item["enabled"].as_bool() == Some(true)
+          && item["type"] != "separator"
+          && if item["submenu"].is_array() {
+            menu_command_enabled(&item["submenu"], command)
+          } else {
+            item["commandId"].as_u64() == Some(command as u64)
+          }
+      })
+    })
 }
 
 fn remove_webview_protocols(protocols: &mut ProtocolHandlerMap, serial: u32, label: &str) {
@@ -1732,7 +1913,9 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   after_window_creation: Option<F>,
 ) -> Result<DetachedWindow<T, ElectronRuntime>> {
   if std::thread::current().id() != context.main_thread_id {
-    return context.on_main_thread(move |context| create_window_impl(context, pending, after_window_creation))?;
+    return context.on_main_thread(move |context| {
+      create_window_impl(context, pending, after_window_creation)
+    })?;
   }
   let PendingWindow {
     label,
@@ -1745,11 +1928,17 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   }
   #[cfg(target_os = "macos")]
   if window_builder.macos_parent.is_some() {
-    return Err(create_window_err("Electron cannot use a process-local AppKit parent pointer".into()));
+    return Err(create_window_err(
+      "Electron cannot use a process-local AppKit parent pointer".into(),
+    ));
   }
   let opener = window_builder.new_window_opener.as_ref();
-  if opener.is_some_and(|opener| !std::sync::Weak::ptr_eq(&opener.ipc, &Arc::downgrade(&context.ipc))) {
-    return Err(create_window_err("native popup opener belongs to another runtime".into()));
+  if opener
+    .is_some_and(|opener| !std::sync::Weak::ptr_eq(&opener.ipc, &Arc::downgrade(&context.ipc)))
+  {
+    return Err(create_window_err(
+      "native popup opener belongs to another runtime".into(),
+    ));
   }
   let new_window_request = opener.map(|opener| opener.request);
   let id = context.next_window_id();
@@ -1762,13 +1951,19 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
 
   #[cfg(windows)]
   if window_builder.owner.is_some() && window_builder.parent.is_some() {
-    return Err(create_window_err("a Windows window cannot have both an owner and a parent".into()));
+    return Err(create_window_err(
+      "a Windows window cannot have both an owner and a parent".into(),
+    ));
   }
 
   #[cfg(windows)]
   let resolve_native_handle = |handle| {
     let menu_owner = context.windows.borrow().iter().find_map(|(id, window)| {
-      window.menu_owner.as_ref().filter(|menu| menu.handle == handle).map(|_| *id)
+      window
+        .menu_owner
+        .as_ref()
+        .filter(|menu| menu.handle == handle)
+        .map(|_| *id)
     });
     match menu_owner {
       Some(id) => context.native_handle(id),
@@ -1776,9 +1971,15 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     }
   };
   #[cfg(windows)]
-  let owner = window_builder.owner.map(resolve_native_handle).transpose()?;
+  let owner = window_builder
+    .owner
+    .map(resolve_native_handle)
+    .transpose()?;
   #[cfg(windows)]
-  let parent = window_builder.parent.map(resolve_native_handle).transpose()?;
+  let parent = window_builder
+    .parent
+    .map(resolve_native_handle)
+    .transpose()?;
   #[cfg(windows)]
   if let Some(handle) = owner.or(parent) {
     crate::window::imp::validate_window_handle(handle)?;
@@ -1792,13 +1993,13 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     && new_window_request.is_none();
   #[cfg(target_os = "linux")]
   if defer_show {
-    payload["deferShow"] = json!(true);
+    payload.defer_show = true;
   }
   if let Some(request) = new_window_request {
-    payload["newWindowRequest"] = json!(request);
+    payload.new_window_request = Some(request);
   }
   if let Some(icon) = &context.icon {
-    payload["icon"] = json!(icon.display().to_string());
+    payload.icon = Some(icon.display().to_string());
   }
 
   if let Some(webview) = webview.as_mut() {
@@ -1811,11 +2012,9 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
         .borrow_mut()
         .entry((scheme.clone(), owner))
         .or_insert_with(|| (webview.label.clone(), Rc::from(handler)));
-      if let Err(error) = context.ipc.call(
-        "protocol.register",
-        json!({ "scheme": scheme }),
-        IPC_TIMEOUT,
-      ) {
+      if let Err(error) = context.ipc.call(rpc::ProtocolRegister {
+        scheme: scheme.clone(),
+      }) {
         eprintln!("[electron] failed to register protocol {scheme}: {error}");
       }
     }
@@ -1830,10 +2029,15 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     _ => json!(null),
   };
   if let (Some(webview), Some(webview_id)) = (&webview, webview_id) {
-    payload["webview"] = webview_create_payload(webview, webview_id, &webview_url, policy);
+    payload.webview = Some(webview_create_payload(
+      webview,
+      webview_id,
+      &webview_url,
+      policy,
+    ));
   }
 
-  if let Err(error) = context.ipc.call("window.create", payload, IPC_TIMEOUT) {
+  if let Err(error) = context.ipc.call(payload) {
     if let (Some(webview), Some(serial)) = (webview.as_ref(), webview_id) {
       context.forget_webview_handlers(serial, &webview.label);
     }
@@ -1850,7 +2054,10 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       webviews: webview_id
         .map(|serial| Webview {
           serial,
-          label: webview.as_ref().map(|pending| pending.label.clone()).unwrap_or_else(|| label.clone()),
+          label: webview
+            .as_ref()
+            .map(|pending| pending.label.clone())
+            .unwrap_or_else(|| label.clone()),
           handlers: Vec::new(),
         })
         .into_iter()
@@ -1865,16 +2072,19 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     #[cfg(target_os = "linux")]
     if !window_builder.config.closable {
       let window = context.x11_window(id)?;
-      crate::platform::linux_window::set_closable(window, false)
-        .map_err(create_window_err)?;
+      crate::platform::linux_window::set_closable(window, false).map_err(create_window_err)?;
       if defer_show {
-        context.ipc.call("window.ready", json!({ "windowId": serial }), IPC_TIMEOUT)
+        context
+          .ipc
+          .call(rpc::WindowReady { window_id: serial })
           .map_err(|error| create_window_err(error.to_string()))?;
       }
     }
     #[cfg(windows)]
-    if window_builder.owner.is_some() || window_builder.parent.is_some()
-      || window_builder.config.always_on_bottom {
+    if window_builder.owner.is_some()
+      || window_builder.parent.is_some()
+      || window_builder.config.always_on_bottom
+    {
       let handle = context.native_handle(id)?;
       crate::window::imp::validate_window_handle(handle)?;
       if window_builder.config.always_on_bottom {
@@ -1920,7 +2130,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     Ok(())
   })();
   if let Err(error) = setup_result {
-    if let Err(cleanup_error) = context.ipc.call("window.destroy", json!({ "windowId": serial }), IPC_TIMEOUT) {
+    if let Err(cleanup_error) = context.ipc.call(rpc::WindowDestroy { window_id: serial }) {
       eprintln!("[electron] failed to destroy window {serial} after setup error: {cleanup_error}");
     }
     context.forget_window(id);
@@ -1929,7 +2139,10 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
 
   let webview = webview_id.map(|webview_id| DetachedWindowWebview {
     webview: DetachedWebview {
-      label: webview.as_ref().map(|pending| pending.label.clone()).unwrap_or_else(|| label.clone()),
+      label: webview
+        .as_ref()
+        .map(|pending| pending.label.clone())
+        .unwrap_or_else(|| label.clone()),
       dispatcher: ElectronWebviewDispatcher {
         id: webview_id,
         context: context.clone(),
@@ -1957,7 +2170,8 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   mut pending: PendingWebview<T, ElectronRuntime>,
 ) -> Result<DetachedWebview<T, ElectronRuntime>> {
   if std::thread::current().id() != context.main_thread_id {
-    return context.on_main_thread(move |context| create_webview_impl(context, window_id, pending))?;
+    return context
+      .on_main_thread(move |context| create_webview_impl(context, window_id, pending))?;
   }
   validate_webview(&pending)?;
   let serial = context
@@ -1982,19 +2196,17 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
       .borrow_mut()
       .entry((scheme.clone(), owner))
       .or_insert_with(|| (pending.label.clone(), Rc::from(handler)));
-    if let Err(error) = context.ipc.call(
-      "protocol.register",
-      json!({ "scheme": scheme }),
-      IPC_TIMEOUT,
-    ) {
+    if let Err(error) = context.ipc.call(rpc::ProtocolRegister {
+      scheme: scheme.clone(),
+    }) {
       eprintln!("[electron] failed to register protocol {scheme}: {error}");
     }
   }
 
   let policy = register_policy_handlers(context, webview_id, &mut pending);
   let mut payload = webview_create_payload(&pending, webview_id, &url, policy);
-  payload["windowId"] = json!(serial);
-  if let Err(error) = context.ipc.call("webview.create", payload, IPC_TIMEOUT) {
+  payload.window_id = Some(serial);
+  if let Err(error) = context.ipc.call(payload) {
     context.forget_webview_handlers(webview_id, &pending.label);
     return Err(create_webview_err(error.to_string()));
   }
@@ -2008,12 +2220,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   }
 
   if let Some(handler) = pending.ipc_handler.take() {
-    register_ipc_handler::<T>(
-      context,
-      webview_id,
-      pending.label.clone(),
-      handler,
-    );
+    register_ipc_handler::<T>(context, webview_id, pending.label.clone(), handler);
   }
   register_webview_handlers::<T>(context, webview_id, &mut pending);
 
@@ -2027,60 +2234,60 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   })
 }
 
-fn window_create_payload(builder: &crate::window_builder::ElectronWindowBuilder, serial: u32, label: &str) -> Result<Value> {
-  let mut payload = json!({
-    "windowId": serial,
-    "label": label,
-    "window": serde_json::to_value(&builder.config).map_err(|error| create_window_err(error.to_string()))?,
-  });
-  if let Some(constraints) = builder.size_constraints {
-    payload["sizeConstraints"] = size_constraints_payload(constraints);
-  }
-  if let Some(icon) = &builder.icon {
+fn window_create_payload(
+  builder: &crate::window_builder::ElectronWindowBuilder,
+  serial: u32,
+  label: &str,
+) -> Result<rpc::WindowCreate> {
+  let window_icon = builder.icon.as_ref().map(|icon| {
     use base64::Engine as _;
     let mut bgra = icon.rgba.clone();
     for pixel in bgra.chunks_exact_mut(4) {
       pixel.swap(0, 2);
     }
-    payload["windowIcon"] = json!({
-      "width": icon.width, "height": icon.height,
-      "bgra": base64::engine::general_purpose::STANDARD.encode(bgra),
-    });
-  }
-  Ok(payload)
+    rpc::WindowIconData {
+      width: icon.width,
+      height: icon.height,
+      bgra: base64::engine::general_purpose::STANDARD.encode(bgra),
+    }
+  });
+  Ok(rpc::WindowCreate {
+    window_id: serial,
+    label: label.to_owned(),
+    window: builder.config.clone(),
+    size_constraints: builder.size_constraints.map(size_constraints_payload),
+    window_icon,
+    icon: None,
+    defer_show: false,
+    new_window_request: None,
+    webview: None,
+  })
 }
 
 /// Main pages and native children use exactly the same webview preferences.
-fn webview_create_payload<T: UserEvent>(pending: &PendingWebview<T, ElectronRuntime>, serial: u32, url: &str, policy: Value) -> Value {
+fn webview_create_payload<T: UserEvent>(
+  pending: &PendingWebview<T, ElectronRuntime>,
+  serial: u32,
+  url: &str,
+  policy: Value,
+) -> rpc::WebviewCreate {
   let attributes = &pending.webview_attributes;
   let scroll_bar_style = match attributes.scroll_bar_style {
     #[cfg(windows)]
     tauri_runtime::webview::ScrollBarStyle::FluentOverlay => "fluentOverlay",
     _ => "default",
   };
-  json!({
-    "webviewId": serial,
-    "url": url,
-    "bounds": attributes.bounds.as_ref().map(|bounds| json!({
-      "position": position_payload(bounds.position), "size": size_payload(bounds.size),
-    })),
-    "autoResize": attributes.auto_resize,
-    "initScripts": initialization_scripts(pending),
-    "dataDirectory": attributes.data_directory,
-    "incognito": attributes.incognito,
-    "userAgent": attributes.user_agent,
-    "acceptFirstMouse": attributes.accept_first_mouse,
-    "javascriptDisabled": attributes.javascript_disabled,
-    "devtools": attributes.devtools,
-    "backgroundThrottling": attributes.background_throttling,
-    "dragDropEnabled": attributes.drag_drop_handler_enabled,
-    "zoomHotkeysEnabled": attributes.zoom_hotkeys_enabled,
-    "scrollBarStyle": scroll_bar_style,
-    "transparent": attributes.transparent,
-    "focus": attributes.focus,
-    "backgroundColor": attributes.background_color,
-    "policy": policy,
-  })
+  rpc::WebviewCreate {
+    webview_id: serial, window_id: None, url: url.to_owned(),
+    bounds: attributes.bounds.as_ref().map(|bounds| json!({ "position": position_payload(bounds.position), "size": size_payload(bounds.size) })),
+    auto_resize: attributes.auto_resize, init_scripts: initialization_scripts(pending),
+    data_directory: attributes.data_directory.clone(), incognito: attributes.incognito,
+    user_agent: attributes.user_agent.clone(), accept_first_mouse: attributes.accept_first_mouse,
+    javascript_disabled: attributes.javascript_disabled, devtools: attributes.devtools,
+    background_throttling: attributes.background_throttling.clone(), drag_drop_enabled: attributes.drag_drop_handler_enabled,
+    zoom_hotkeys_enabled: attributes.zoom_hotkeys_enabled, scroll_bar_style,
+    transparent: attributes.transparent, focus: attributes.focus, background_color: attributes.background_color, policy,
+  }
 }
 
 /// Extra Electron switches, e.g. `TAURI_RUNTIME_ELECTRON_ARGS="--remote-debugging-port=9222"`.
@@ -2109,9 +2316,11 @@ fn register_ipc_handler<T: UserEvent>(
       last_evaluated_script: Default::default(),
     },
   };
-  let handler: Rc<IpcHandler> =
-    Rc::new(move |request| handler(detached.clone(), request));
-  context.ipc_handlers.borrow_mut().insert(webview_id, handler);
+  let handler: Rc<IpcHandler> = Rc::new(move |request| handler(detached.clone(), request));
+  context
+    .ipc_handlers
+    .borrow_mut()
+    .insert(webview_id, handler);
 }
 
 /// Preserve frame scope through Electron's sandboxed preload.
@@ -2122,10 +2331,12 @@ fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
     .webview_attributes
     .initialization_scripts
     .iter()
-    .map(|script| json!({
-      "script": script.script,
-      "mainFrameOnly": script.for_main_frame_only,
-    }))
+    .map(|script| {
+      json!({
+        "script": script.script,
+        "mainFrameOnly": script.for_main_frame_only,
+      })
+    })
     .collect()
 }
 
@@ -2225,7 +2436,10 @@ fn register_webview_handlers<T: UserEvent>(
       page_load,
       title,
       #[cfg(any(target_os = "macos", target_os = "ios"))]
-      process_terminated: pending.on_web_content_process_terminate_handler.take().map(Rc::from),
+      process_terminated: pending
+        .on_web_content_process_terminate_handler
+        .take()
+        .map(Rc::from),
     },
   );
 }
@@ -2285,9 +2499,9 @@ mod tests {
 
   #[test]
   fn window_creation_preserves_config_icons_and_mixed_constraints() {
-    use tauri_runtime::window::WindowBuilder;
-    use tauri_runtime::dpi::{LogicalUnit, PhysicalUnit};
     use base64::Engine as _;
+    use tauri_runtime::dpi::{LogicalUnit, PhysicalUnit};
+    use tauri_runtime::window::WindowBuilder;
     let config = tauri_utils::config::WindowConfig {
       focus: false,
       hidden_title: true,
@@ -2302,30 +2516,52 @@ mod tests {
         max_width: None,
         max_height: Some(PixelUnit::Physical(PhysicalUnit(900))),
       })
-      .icon(tauri_runtime::Icon { rgba: std::borrow::Cow::Borrowed(&[1, 2, 3, 4, 5, 6, 7, 8]), width: 2, height: 1 }).unwrap();
-    let payload = window_create_payload(&builder, 42, "host").unwrap();
+      .icon(tauri_runtime::Icon {
+        rgba: std::borrow::Cow::Borrowed(&[1, 2, 3, 4, 5, 6, 7, 8]),
+        width: 2,
+        height: 1,
+      })
+      .unwrap();
+    let payload =
+      serde_json::to_value(window_create_payload(&builder, 42, "host").unwrap()).unwrap();
     assert_eq!(payload["window"], serde_json::to_value(config).unwrap());
     assert_eq!(payload["windowId"], 42);
-    assert_eq!(payload["sizeConstraints"], json!({
-      "minWidth": { "value": 250, "physical": true },
-      "minHeight": { "value": 120.5, "physical": false },
-      "maxWidth": null,
-      "maxHeight": { "value": 900, "physical": true },
-    }));
-    assert_eq!(base64::engine::general_purpose::STANDARD.decode(payload["windowIcon"]["bgra"].as_str().unwrap()).unwrap(), [3, 2, 1, 4, 7, 6, 5, 8]);
+    assert_eq!(
+      payload["sizeConstraints"],
+      json!({
+        "minWidth": { "value": 250, "physical": true },
+        "minHeight": { "value": 120.5, "physical": false },
+        "maxWidth": null,
+        "maxHeight": { "value": 900, "physical": true },
+      })
+    );
+    assert_eq!(
+      base64::engine::general_purpose::STANDARD
+        .decode(payload["windowIcon"]["bgra"].as_str().unwrap())
+        .unwrap(),
+      [3, 2, 1, 4, 7, 6, 5, 8]
+    );
   }
 
   #[test]
   fn webview_preferences_reach_the_shared_creation_payload() {
-    let mut attributes = tauri_runtime::webview::WebviewAttributes::new(tauri_utils::config::WebviewUrl::default());
+    let mut attributes =
+      tauri_runtime::webview::WebviewAttributes::new(tauri_utils::config::WebviewUrl::default());
     attributes.user_agent = Some("child-agent".into());
     attributes.accept_first_mouse = true;
     attributes.javascript_disabled = true;
-    attributes.background_throttling = Some(tauri_utils::config::BackgroundThrottlingPolicy::Disabled);
+    attributes.background_throttling =
+      Some(tauri_utils::config::BackgroundThrottlingPolicy::Disabled);
     attributes.drag_drop_handler_enabled = false;
     attributes.devtools = Some(false);
     let pending = PendingWebview::<(), ElectronRuntime>::new(attributes, "child").unwrap();
-    let payload = webview_create_payload(&pending, 8, "tauri://localhost", json!({ "navigation": true }));
+    let payload = serde_json::to_value(webview_create_payload(
+      &pending,
+      8,
+      "tauri://localhost",
+      json!({ "navigation": true }),
+    ))
+    .unwrap();
     assert_eq!(payload["userAgent"], "child-agent");
     assert_eq!(payload["acceptFirstMouse"], true);
     assert_eq!(payload["javascriptDisabled"], true);
@@ -2340,11 +2576,17 @@ mod tests {
     let handler: Rc<UriSchemeProtocolHandler> = Rc::new(|_, _, _| {});
     let mut protocols = ProtocolHandlerMap::from([
       (("ipc".into(), Some(1)), ("closed".into(), handler.clone())),
-      (("asset".into(), Some(1)), ("closed".into(), handler.clone())),
+      (
+        ("asset".into(), Some(1)),
+        ("closed".into(), handler.clone()),
+      ),
       (("asset".into(), Some(2)), ("live".into(), handler)),
     ]);
     remove_webview_protocols(&mut protocols, 1, "closed");
-    assert_eq!(protocols.keys().cloned().collect::<Vec<_>>(), [("asset".to_string(), Some(2))]);
+    assert_eq!(
+      protocols.keys().cloned().collect::<Vec<_>>(),
+      [("asset".to_string(), Some(2))]
+    );
   }
 
   #[test]
@@ -2358,7 +2600,9 @@ mod tests {
     ]);
     assert!(menu_command_enabled(&menu, 7));
     assert!(menu_command_enabled(&menu, 10));
-    for command in [8, 9, 11, 12, 13, 65536] { assert!(!menu_command_enabled(&menu, command)); }
+    for command in [8, 9, 11, 12, 13, 65536] {
+      assert!(!menu_command_enabled(&menu, command));
+    }
   }
 
   #[test]
@@ -2377,7 +2621,10 @@ mod tests {
     expected.push(dir.join("../lib/Example App/runtime"));
     expected.push(app_dir.join("usr/lib/Example App/runtime"));
     expected.push(PathBuf::from("/usr/lib/Example App/runtime"));
-    assert_eq!(bundled_roots(dir, Some("Example App"), Some(app_dir)), expected);
+    assert_eq!(
+      bundled_roots(dir, Some("Example App"), Some(app_dir)),
+      expected
+    );
     expected.remove(6);
     assert_eq!(bundled_roots(dir, Some("Example App"), None), expected);
   }
@@ -2385,13 +2632,27 @@ mod tests {
   #[test]
   fn validates_deduplicates_and_consumes_startup_schemes() {
     assert!(take_startup_schemes().is_empty());
-    for scheme in ["", "1bad", "isolation://localhost", "white space", "a,b", "über", "x\ny"] {
-      assert!(register_custom_protocol_scheme(scheme).is_err(), "{scheme:?}");
+    for scheme in [
+      "",
+      "1bad",
+      "isolation://localhost",
+      "white space",
+      "a,b",
+      "über",
+      "x\ny",
+    ] {
+      assert!(
+        register_custom_protocol_scheme(scheme).is_err(),
+        "{scheme:?}"
+      );
     }
     for scheme in ["Isolation-Test", "isolation-test", "custom+1.2"] {
       register_custom_protocol_scheme(scheme).unwrap();
     }
-    assert!(std::thread::spawn(take_startup_schemes).join().unwrap().is_empty());
+    assert!(std::thread::spawn(take_startup_schemes)
+      .join()
+      .unwrap()
+      .is_empty());
     assert_eq!(take_startup_schemes(), ["isolation-test", "custom+1.2"]);
     assert!(take_startup_schemes().is_empty());
   }
@@ -2414,10 +2675,16 @@ mod tests {
   #[test]
   fn maps_permission_names_both_ways() {
     assert_eq!(permission_kind("camera"), Some(PermissionKind::Camera));
-    assert_eq!(permission_kind("clipboard-read"), Some(PermissionKind::ClipboardRead));
+    assert_eq!(
+      permission_kind("clipboard-read"),
+      Some(PermissionKind::ClipboardRead)
+    );
     assert_eq!(permission_kind("openExternal"), None);
     assert_eq!(permission_response_name(PermissionResponse::Allow), "allow");
     assert_eq!(permission_response_name(PermissionResponse::Deny), "deny");
-    assert_eq!(permission_response_name(PermissionResponse::Default), "default");
+    assert_eq!(
+      permission_response_name(PermissionResponse::Default),
+      "default"
+    );
   }
 }

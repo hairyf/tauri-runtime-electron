@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use crate::runtime::{
-  ElectronRuntime, EventProxy, Message, RuntimeContext, create_webview_impl, create_window_impl,
-};
 use crate::platform::monitor_from_value;
-use serde_json::json;
+use crate::rpc;
+use crate::runtime::{
+  create_webview_impl, create_window_impl, ElectronRuntime, EventProxy, Message, RuntimeContext,
+};
 use tauri_runtime::{
-  DeviceEventFilter, Result, RuntimeHandle, UserEvent,
   dpi::PhysicalPosition,
   monitor::Monitor,
   webview::{DetachedWebview, PendingWebview},
   window::{DetachedWindow, PendingWindow, RawWindow, WindowId},
+  DeviceEventFilter, Result, RuntimeHandle, UserEvent,
 };
 use tauri_utils::Theme;
 
@@ -45,11 +45,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     self
       .context
       .ipc
-      .call(
-        "app.activationPolicy",
-        json!({ "policy": policy }),
-        crate::runtime::IPC_TIMEOUT,
-      )
+      .call(rpc::AppActivationPolicy { policy: policy })
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
@@ -60,11 +56,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     self
       .context
       .ipc
-      .call(
-        "app.dockVisibility",
-        json!({ "visible": visible }),
-        crate::runtime::IPC_TIMEOUT,
-      )
+      .call(rpc::AppDockVisibility { visible: visible })
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
@@ -124,20 +116,16 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     let displays = self
       .context
       .ipc
-      .call("window.displays", json!({}), crate::runtime::IPC_TIMEOUT)
+      .call(rpc::Displays {})
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
-    Ok(monitor_from_value(&displays["primary"]))
+    Ok(displays.primary.as_ref().and_then(monitor_from_value))
   }
 
   fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
     let display = self
       .context
       .ipc
-      .call(
-        "window.displayForPoint",
-        json!({ "x": x, "y": y }),
-        crate::runtime::IPC_TIMEOUT,
-      )
+      .call(rpc::DisplayForPoint { x: x, y: y })
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(monitor_from_value(&display))
   }
@@ -146,13 +134,14 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     let displays = self
       .context
       .ipc
-      .call("window.displays", json!({}), crate::runtime::IPC_TIMEOUT)
+      .call(rpc::Displays {})
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(
-      displays["displays"]
-        .as_array()
-        .map(|list| list.iter().filter_map(monitor_from_value).collect())
-        .unwrap_or_default(),
+      displays
+        .displays
+        .iter()
+        .filter_map(monitor_from_value)
+        .collect(),
     )
   }
 
@@ -162,11 +151,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
       Some(_) => "light",
       None => "system",
     };
-    if let Err(error) = self.context.ipc.call(
-      "app.theme",
-      json!({ "theme": theme }),
-      crate::runtime::IPC_TIMEOUT,
-    ) {
+    if let Err(error) = self.context.ipc.call(rpc::AppTheme { theme: theme }) {
       eprintln!("[electron] set theme failed: {error}");
     }
   }
@@ -178,7 +163,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     self
       .context
       .ipc
-      .call("app.show", json!({}), crate::runtime::IPC_TIMEOUT)
+      .call(rpc::AppShow {})
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
@@ -190,7 +175,7 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     self
       .context
       .ipc
-      .call("app.hide", json!({}), crate::runtime::IPC_TIMEOUT)
+      .call(rpc::AppHide {})
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
     Ok(())
   }
@@ -247,11 +232,8 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
     let point = self
       .context
       .ipc
-      .call("window.cursorPosition", json!({}), crate::runtime::IPC_TIMEOUT)
+      .call(rpc::CursorPosition {})
       .map_err(|error| crate::runtime::create_window_err(error.to_string()))?;
-    Ok(PhysicalPosition::new(
-      point["x"].as_f64().unwrap_or_default(),
-      point["y"].as_f64().unwrap_or_default(),
-    ))
+    Ok(PhysicalPosition::new(point.x, point.y))
   }
 }

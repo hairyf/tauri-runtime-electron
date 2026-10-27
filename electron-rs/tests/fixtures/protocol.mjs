@@ -2,7 +2,8 @@
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
-import { runtimeModules } from './runtime-modules.mjs'
+import { EventEmitter } from 'node:events'
+import { createRuntime } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const handlers = new Map()
@@ -26,10 +27,7 @@ const electron = {
   },
   protocol: {
     registerSchemesAsPrivileged() {},
-    handle(scheme, handler) {
-      registrations.push(scheme)
-      handlers.set(scheme, handler)
-    },
+    handle(scheme, handler) { registrations.push(scheme); handlers.set(scheme, handler) },
   },
   net: {
     fetch(request, options) {
@@ -38,27 +36,22 @@ const electron = {
     },
   },
 }
-const context = vm.createContext({
-  require: name => name === 'electron' ? electron
-    : name === 'node:fs' ? { appendFileSync() {} } : require(name),
-  process: { argv: ['node', 'main.cjs', '--port', '1'], env: {} },
-  Buffer, URL, Request, Response, Headers, Uint8Array, console,
-  testSocket: {
-    send(message) {
-      if (message.event === 'ipc.message') messages.push(message.params)
-      else {
-        requests.push(message)
-        context.handle('protocol.respond', { id: message.params.id, ...reply })
-      }
-    },
+const context = vm.createContext({ Buffer, URL, Request, Response, Headers, Uint8Array, console, process: { platform: 'linux' } })
+let runtime
+runtime = createRuntime(context, electron, {
+  require: name => name === 'electron' ? electron : name === 'node:fs' ? { appendFileSync() {} } : require(name),
+  send(message) {
+    if (message.event === 'ipc.message') messages.push(message.params)
+    else {
+      requests.push(message)
+      runtime.handle('protocol.respond', { id: message.params.id, ...reply })
+    }
   },
 })
-context.require = runtimeModules(context, context.require)
-vm.runInContext(`${readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8')}
-;state.socket = testSocket`, context)
-for (const scheme of ['tauri', 'ipc', 'asset', 'isolation-test', 'tauri']) {
-  context.handle('protocol.register', { scheme })
-}
+const { webviews } = runtime
+const { Webview } = runtime.load('./runtime/webview.cjs')
+const testContents = new Map()
+for (const scheme of ['tauri', 'ipc', 'asset', 'isolation-test', 'tauri']) runtime.handle('protocol.register', { scheme })
 const lastRequest = () => {
   const { event, params: { id, ...params } } = requests.at(-1)
   return { event, ...params, body: [...Buffer.from(params.body, 'base64')] }
@@ -122,9 +115,10 @@ switch (process.argv[2]) {
       const frame = { url, origin: url.startsWith('tauri:') ? 'tauri://localhost' : new URL(url).origin }
       const sender = { id: contentsId, mainFrame: frame }
       senderEvents.push({ sender, senderFrame: frame })
-      context.senderId = contentsId
-      context.webviewId = webviewId
-      vm.runInContext('state.webviewByContents.set(senderId, webviewId)', context)
+      const contents = new EventEmitter()
+      contents.id = contentsId
+      testContents.set(contentsId, contents)
+      webviews.add(new Webview({}, webviewId, { webContents: contents }, { webviewId, url }))
       listeners.get('tauri-ipc')({ sender, senderFrame: frame }, 'ping')
     }
     const acceptedMessages = messages.slice()

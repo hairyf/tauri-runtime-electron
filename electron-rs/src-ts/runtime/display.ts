@@ -1,99 +1,60 @@
-import type { BaseWindow, Rectangle, Screen } from 'electron'
+import type { BaseWindow, BrowserWindow, Display, Rectangle, Screen } from 'electron'
 
-/**
- * 显示器领域（骨架）。
- *
- * 从 window.ts 里拆出来的原因：window.displays / window.cursorPosition /
- * window.displayForPoint 三个命令与具体窗口无关，之前却住在 executeWindow 里，
- * 于是任何窗口逻辑改动都要碰它们。
- *
- * 坐标约定的唯一来源也在这里：
- * - Tauri 的显示器与坐标全部是物理像素
- * - Electron 的 display / bounds / cursor 全部是 DIP
- * 所以每个函数要么显式接收是否 physical，要么显式做换算。
- */
-
-/** Tauri 侧的显示器信息，全部是物理像素。 */
 export interface DisplayInfo {
   name: string
-  position: { x: number; y: number }
+  position: Rectangle
   size: { width: number; height: number }
-  workArea: {
-    position: { x: number; y: number }
-    size: { width: number; height: number }
-  }
+  workArea: { position: Rectangle; size: { width: number; height: number } }
   scaleFactor: number
 }
+export interface CursorPoint { x: number; y: number }
+export interface DisplaySource { readonly screen: Screen; readonly platform: NodeJS.Platform }
+export interface DisplayList { displays: DisplayInfo[]; primary: DisplayInfo }
 
-export interface CursorPoint {
-  x: number
-  y: number
+export function physicalScreenRect(source: DisplaySource, window: BaseWindow | null, rect: Rectangle, scaleFactor: number): Rectangle {
+  if (source.platform === 'win32') return source.screen.dipToScreenRect(window as BrowserWindow | null, rect)
+  return { x: Math.round(rect.x * scaleFactor), y: Math.round(rect.y * scaleFactor), width: Math.round(rect.width * scaleFactor), height: Math.round(rect.height * scaleFactor) }
 }
 
-/** 无状态世界：只有 Electron 的 screen 和平台判断，没有其它依赖。 */
-export interface DisplaySource {
-  readonly screen: Screen
-  readonly platform: NodeJS.Platform
-}
-
-/** window.displays 的返回结构。 */
-export interface DisplayList {
-  displays: DisplayInfo[]
-  primary: DisplayInfo
+export function readDisplay(source: DisplaySource, display: Display): DisplayInfo {
+  const bounds = physicalScreenRect(source, null, display.bounds, display.scaleFactor)
+  const workArea = physicalScreenRect(source, null, display.workArea, display.scaleFactor)
+  return {
+    name: display.label, position: bounds, size: { width: bounds.width, height: bounds.height },
+    workArea: { position: workArea, size: { width: workArea.width, height: workArea.height } },
+    scaleFactor: display.scaleFactor,
+  }
 }
 
 export function displays(source: DisplaySource): DisplayList {
-  // TODO: Implement displays
-  throw new Error('not implemented')
+  return { displays: source.screen.getAllDisplays().map((display) => readDisplay(source, display)), primary: readDisplay(source, source.screen.getPrimaryDisplay()) }
 }
 
-/** 物理像素的全局光标位置。 */
 export function cursorPosition(source: DisplaySource): CursorPoint {
-  // TODO: Implement cursorPosition
-  throw new Error('not implemented')
+  const point = source.screen.getCursorScreenPoint()
+  if (source.platform === 'win32') return source.screen.dipToScreenPoint(point)
+  const scale = source.screen.getDisplayNearestPoint(point).scaleFactor
+  return { x: Math.round(point.x * scale), y: Math.round(point.y * scale) }
 }
 
-/** 覆盖 Window 所在显示器的信息（window.currentDisplay）。 */
-export function displayForBounds(source: DisplaySource, bounds: Rectangle): DisplayInfo {
-  // TODO: Implement displayForBounds
-  throw new Error('not implemented')
+export function findDisplay(source: DisplaySource, x: number, y: number, physical: boolean): Display | undefined {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('invalid monitor point')
+  return source.screen.getAllDisplays().find((display) => {
+    const rect = physical ? physicalScreenRect(source, null, display.bounds, display.scaleFactor) : display.bounds
+    return x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+  })
 }
 
-/** window.displayForPoint：点在所有显示器之外时返回 null，而不是就近吸附。 */
 export function displayAtPoint(source: DisplaySource, x: number, y: number): DisplayInfo | null {
-  // TODO: Implement displayAtPoint
-  throw new Error('not implemented')
+  const display = findDisplay(source, x, y, source.platform === 'win32')
+  return display ? readDisplay(source, display) : null
 }
 
-/** 命中测试：Tauri 在窗口外返回 undefined，Electron 的 nearest 会吸附。 */
-export function findDisplay(
-  source: DisplaySource,
-  x: number,
-  y: number,
-  physical: boolean,
-): Electron.Display | undefined {
-  // TODO: Implement findDisplay
-  throw new Error('not implemented')
+export function displayForBounds(source: DisplaySource, bounds: Rectangle): DisplayInfo {
+  return readDisplay(source, source.screen.getDisplayMatching(bounds))
 }
 
-/** DIP → 物理。Windows 上必须走 screen.dipToScreenRect，不能用 scaleFactor 乘。 */
-export function physicalScreenRect(
-  source: DisplaySource,
-  window: BaseWindow | null,
-  rect: Rectangle,
-  scaleFactor: number,
-): Rectangle {
-  // TODO: Implement physicalScreenRect
-  throw new Error('not implemented')
-}
-
-export function readDisplay(source: DisplaySource, display: Electron.Display): DisplayInfo {
-  // TODO: Implement readDisplay
-  throw new Error('not implemented')
-}
-
-/** 窗口所在显示器的工作区中心，供 Window.center() 使用。 */
 export function centeredPosition(source: DisplaySource, bounds: Rectangle): CursorPoint {
-  // TODO: Implement centeredPosition
-  throw new Error('not implemented')
+  const workArea = source.screen.getDisplayMatching(bounds).workArea
+  return { x: Math.round(workArea.x + (workArea.width - bounds.width) / 2), y: Math.round(workArea.y + (workArea.height - bounds.height) / 2) }
 }

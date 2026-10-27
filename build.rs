@@ -12,19 +12,18 @@ fn main() {
 }
 
 fn prepare() -> Result<(), String> {
-  for path in ["build_support.rs", "electron-rs/assets/main.cjs", "electron-rs/assets/internal.cjs", "electron-rs/assets/commands.cjs", "electron-rs/assets/preload.cjs", "electron-rs/assets/ipc.cjs", "electron-rs/assets/appkit.mm"] {
+  for path in ["build_support.rs", "electron-rs/assets", "electron-rs/native/appkit.mm"] {
     println!("cargo:rerun-if-changed={path}");
   }
   for key in ["CARGO_TARGET_DIR", "INIT_CWD", "PWD", "TAURI_CONFIG"] {
     println!("cargo:rerun-if-env-changed={key}");
   }
-  let builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION);
+  let mut builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION);
   let directory = builder.directory().map_err(|error| error.to_string())?;
   let target_root = directory.parent().and_then(|path| path.parent()).ok_or("Electron output has no Cargo target root")?;
   let triple = env::var("TARGET").map_err(|error| error.to_string())?;
   let target = Target::from_triple(&triple);
   let app = build_support::discover(target_root, target)?;
-  let mut metadata = electron_rs::Metadata::default();
   if let Some(app) = app {
     for input in &app.inputs {
       println!("cargo:rerun-if-changed={}", input.display());
@@ -36,13 +35,13 @@ fn prepare() -> Result<(), String> {
     if let Some(identifier) = &app.identifier {
       println!("cargo:rustc-env=ELECTRON_RS_TAURI_IDENTIFIER={identifier}");
     }
-    metadata.app_name = Some(app.name);
+    builder = builder.app_name(app.name);
     if matches!(target, Target::Windows | Target::MacOS) {
-      metadata.identifier = app.identifier;
-      metadata.icon = app.icon;
+      if let Some(identifier) = app.identifier { builder = builder.identifier(identifier); }
+      if let Some(icon) = app.icon { builder = builder.icon(icon); }
     }
   }
-  let builder = builder.output(&directory).metadata(metadata);
+  let builder = builder.output(&directory);
   let prepared = builder.build().map_err(|error| error.to_string())?;
   if let Some(warning) = prepared.cleanup_warning {
     println!("cargo:warning={warning}");

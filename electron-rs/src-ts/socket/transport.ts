@@ -2,6 +2,21 @@ import type { IPC, IPCRequestPayload } from './ipc'
 import { isThenable } from '../utils'
 import type { CommandTable } from './table'
 
+const synchronousMethods = new Set([
+  'window.create', 'protocol.register', 'protocol.respond', 'webview.url',
+  'webview.newWindowResponse', 'webview.navigationResponse', 'webview.downloadResponse', 'webview.permissionResponse',
+  'window.nativeHandle', 'window.setMenu', 'window.setTitle', 'window.geometry', 'window.icon',
+  'window.size', 'window.position', 'window.minSize', 'window.maxSize', 'window.sizeConstraints',
+  'window.resizable', 'window.maximizable', 'window.minimizable', 'window.closable',
+  'window.maximize', 'window.unmaximize', 'window.minimize', 'window.simpleFullscreen',
+  'window.alwaysOnTop', 'window.setParentWindow', 'window.skipTaskbar', 'window.focusable',
+  'window.contentProtected', 'window.center', 'window.requestAttention', 'window.show', 'window.hide',
+  'window.focus', 'window.close', 'window.destroy', 'window.visibleOnAllWorkspaces', 'window.enabled',
+  'window.enabledQuery', 'window.progressBar', 'window.shadow', 'window.decorations', 'window.badgeCount',
+  'window.overlayIcon', 'window.backgroundColor', 'window.backgroundMaterial', 'window.ignoreCursorEvents',
+  'window.displays', 'window.cursorPosition', 'window.currentDisplay', 'window.displayForPoint', 'window.trafficLight',
+])
+
 /**
  * 线协议边界。
  *
@@ -70,6 +85,7 @@ export class Transport {
     }
 
     try {
+      if (synchronous && !synchronousMethods.has(method)) throw new Error(`${method} requires the native policy callback to return first`)
       const command = this.table?.[method]
       if (!command) throw new Error(`unknown method ${method}`)
       const result = command(params)

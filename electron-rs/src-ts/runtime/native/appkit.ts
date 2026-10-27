@@ -1,3 +1,4 @@
+import path from 'node:path'
 import type { BaseWindowConstructorOptions } from 'electron'
 
 /**
@@ -26,8 +27,7 @@ let loaded: AppKit | undefined
  * 不能用 __dirname 之外的路径，否则 asar 里会取不到。
  */
 export function appkit(): AppKit {
-  // TODO: Implement require(path.join(__dirname, 'appkit.node')) 并缓存
-  throw new Error('not implemented')
+  return loaded ??= require(path.join(__dirname, '../../appkit.node')) as AppKit
 }
 
 export interface TitleBarConfig {
@@ -47,6 +47,8 @@ export function titleBarStyle(
   platform: NodeJS.Platform,
   config: TitleBarConfig,
 ): BaseWindowConstructorOptions['titleBarStyle'] {
-  // TODO: Implement titleBarStyle
-  throw new Error('not implemented')
+  if (platform === 'darwin') return 'default'
+  const style = String(config.titleBarStyle ?? 'visible').toLowerCase()
+  if (config.hiddenTitle || config.titleBarHidden || style === 'transparent') return 'hidden'
+  return style === 'overlay' ? 'hiddenInset' : 'default'
 }

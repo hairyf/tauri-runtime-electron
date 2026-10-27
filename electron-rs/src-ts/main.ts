@@ -1,5 +1,6 @@
 import fs from 'node:fs'
-import { app, Menu, nativeTheme, screen, session } from 'electron'
+import path from 'node:path'
+import { app, ipcMain, Menu, nativeTheme, screen, session } from 'electron'
 import { IPC } from './socket/ipc'
 import { Transport } from './socket/transport'
 import { createCommands } from './runtime/commands'
@@ -12,6 +13,7 @@ import { Protocols } from './runtime/protocol'
 import { Webviews } from './runtime/webview'
 import { Windows } from './runtime/window'
 import { arg, noop } from './utils'
+import type { WebContents } from 'electron'
 
 /**
  * 组合根：只描述「谁依赖谁」和「按什么顺序建」，不含任何行为。
@@ -23,6 +25,15 @@ import { arg, noop } from './utils'
  *
  * 想改行为去对应文件；这里能改的只有依赖图本身。
  */
+
+const appName = process.env.ELECTRON_RS_APP_NAME
+if (appName) app.setName(appName)
+const owner = process.env.TAURI_RUNTIME_ELECTRON_OWNER
+if (owner) {
+  const directory = path.join(app.getPath('appData'), owner)
+  fs.mkdirSync(directory, { recursive: true })
+  app.setPath('userData', directory)
+}
 
 // ── 进程输入 ───────────────────────────────────────────────────────────────
 // argv + 继承的 stdin（一次性凭据）。全仓只有这里读 process。
@@ -101,6 +112,30 @@ const commands = createCommands({
 // ── 组装 ───────────────────────────────────────────────────────────────────
 // commands 依赖 transport（respond），transport 又需要命令表，所以表建好后再注入。
 transport.use(commands)
+
+export { windows, webviews, downloads, popups, transport, environment, policies, protocols, factory, commands }
+
+// IPC identity is derived from Electron's sender, never supplied by the renderer.
+ipcMain.handle('tauri-ipc-fetch', async (event, data) => {
+  const frame = event.senderFrame
+  const webview = webviews.forContents(event.sender.id)
+  if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || !webview) throw new Error('unknown IPC sender')
+  if (!data || typeof data.url !== 'string' || data.method !== 'POST' || !(data.body instanceof Uint8Array)) throw new Error('invalid IPC request')
+  const url = new URL(data.url)
+  if (url.username || url.password || url.port || !((url.protocol === 'ipc:' && url.hostname === 'localhost') || (/^https?:$/.test(url.protocol) && url.hostname === 'ipc.localhost'))) throw new Error('invalid IPC request')
+  const headers = new Headers(data.headers)
+  headers.set('Origin', frame.origin)
+  const response = await protocols.fetchIpc(new Request(url, { method: 'POST', headers, body: data.body }), webview.id)
+  return { status: response.status, headers: [...response.headers], body: new Uint8Array(await response.arrayBuffer()) }
+})
+
+ipcMain.on('tauri-ipc', (event, data) => {
+  const frame = event.senderFrame
+  if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || typeof data !== 'string') return
+  const webview = webviews.forContents(event.sender.id)
+  if (!webview) return
+  transport.send('ipc.message', { webviewId: webview.id, url: frame.url, body: data })
+})
 
 // 下载终态没有对应的命令回包，只能当事件发出去。
 downloads.on('finished', (payload) => transport.send('download.finished', payload))
