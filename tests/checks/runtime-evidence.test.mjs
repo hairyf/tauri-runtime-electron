@@ -39,10 +39,10 @@ assert.equal(aggregate(PLATFORMS.map(platform => artifact(platform))).runtime.al
 assert.equal(aggregate([artifact('windows', [result('Runtime::new_any_thread')]), artifact('linux', [result('Runtime::new_any_thread')])]).runtime.all.passed, 1, 'upstream macOS N/A is excluded, not a fake pass')
 assert.equal(aggregate(PLATFORMS.map(platform => artifact(platform, [result('ElectronWebviewDispatcher::on_new_window')]))).runtime.all.passed, 0)
 assert.equal(aggregate(PLATFORMS.map(platform => artifact(platform, [result('ElectronWebviewDispatcher::on_new_window')]))).extensions.all.passed, 1)
-assert.deepEqual(SUITES.map(suite => suite.id), ['runtime-tests', 'new_window_smoke', 'tauri_new_window_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke', 'macos_behavior_smoke', 'windows_behavior_smoke', 'rendering_behavior_smoke'])
+assert.deepEqual(SUITES.map(suite => suite.id), ['runtime-tests', 'new_window_smoke', 'tauri_new_window_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke', 'macos_behavior_smoke', 'windows_behavior_smoke', 'linux_behavior_smoke', 'rendering_behavior_smoke'])
 const commonSuites = ['runtime-tests', 'new_window_smoke', 'tauri_new_window_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke']
 assert.deepEqual(suitesFor('windows').map(suite => suite.id), [...commonSuites, 'windows_behavior_smoke', 'rendering_behavior_smoke'])
-assert.deepEqual(suitesFor('linux').map(suite => suite.id), [...commonSuites, 'rendering_behavior_smoke'])
+assert.deepEqual(suitesFor('linux').map(suite => suite.id), [...commonSuites, 'linux_behavior_smoke', 'rendering_behavior_smoke'])
 assert.deepEqual(suitesFor('macos').map(suite => suite.id), [...commonSuites, 'macos_behavior_smoke', 'rendering_behavior_smoke'])
 assert.ok(SUITES.every(suite => suite.command === 'cargo' && suite.args.includes('--locked')))
 assert.ok(SUITES.find(suite => suite.id === 'tauri_new_window_smoke').args.includes('tauri'))
@@ -51,7 +51,7 @@ const completeSuites = PLATFORMS.flatMap(platform => suitesFor(platform).map(sui
   evidence.testRun.id = suite.id
   return evidence
 }))
-assert.equal(completeSuites.length, 26, 'Windows/macOS require nine suites each; Linux requires eight')
+assert.equal(completeSuites.length, 27, 'each desktop platform requires nine suites')
 requireSuites(completeSuites)
 assert.equal(aggregate(completeSuites).runtime.all.passed, 0, 'suite success never invents member behavior')
 const unrecognized = artifact('windows', [])

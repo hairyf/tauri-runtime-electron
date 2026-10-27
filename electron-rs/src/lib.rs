@@ -144,7 +144,7 @@ impl ElectronBuilder {
       .join(output.file_name().ok_or("Electron output has no directory name")?);
     let existing = compatible_distribution(&output, &self.version, &target).is_ok();
     let reusable = existing && metadata::matches(&output, &self.metadata, &target, &self.version)?;
-    if reusable && assets_match(&output) {
+    if reusable && assets_match(&output, &target) {
       let binary = metadata::binary_for(&output, None, &target)?;
       return Ok(PreparedDistribution { directory: output, binary, cleanup_warning: None });
     }
@@ -180,6 +180,7 @@ impl ElectronBuilder {
     let result = (|| {
       acquisition::copy_dir(&source, &stage)?;
       write_assets(&stage)?;
+      compile_native_assets(&stage, &target)?;
       metadata::apply(&stage, &self.metadata, &target, &self.version)?;
       let version_path = stage.join(".electron-rs-version");
       fs::write(&version_path, &self.version)
@@ -275,16 +276,18 @@ fn validate_version(version: &str) -> Result<(), Error> {
   Ok(())
 }
 
-const ASSETS: [(&str, &[u8]); 5] = [
+const ASSETS: [(&str, &[u8]); 6] = [
   ("main.cjs", include_bytes!("../assets/main.cjs")),
   ("internal.cjs", include_bytes!("../assets/internal.cjs")),
   ("commands.cjs", include_bytes!("../assets/commands.cjs")),
   ("ipc.cjs", include_bytes!("../assets/ipc.cjs")),
   ("preload.cjs", include_bytes!("../assets/preload.cjs")),
+  ("appkit.mm", include_bytes!("../assets/appkit.mm")),
 ];
 
-fn assets_match(dir: &Path) -> bool {
-  ASSETS.iter().all(|(name, bytes)| {
+fn assets_match(dir: &Path, target: &DistributionTarget) -> bool {
+  (target.platform != "darwin" || fs::symlink_metadata(dir.join("appkit.node")).is_ok_and(|metadata| metadata.is_file()))
+    && ASSETS.iter().all(|(name, bytes)| {
     let path = dir.join(name);
     fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
       && fs::read(path).is_ok_and(|actual| actual == *bytes)
@@ -300,6 +303,31 @@ fn write_assets(dir: &Path) -> Result<(), Error> {
     if fs::read(&path).ok().as_deref() != Some(bytes) {
       fs::write(&path, bytes).map_err(|error| Error::with_source(format!("write {}", path.display()), error))?;
     }
+  }
+  Ok(())
+}
+
+fn compile_native_assets(dir: &Path, target: &DistributionTarget) -> Result<(), Error> {
+  if target.platform != "darwin" { return Ok(()); }
+  if !cfg!(target_os = "macos") {
+    return Err("building the AppKit bridge requires a macOS host with Xcode Command Line Tools".into());
+  }
+  let binary = dir.join("appkit.node");
+  if fs::symlink_metadata(&binary).is_ok_and(|metadata| metadata.is_symlink()) {
+    fs::remove_file(&binary).map_err(|error| Error::with_source("remove AppKit bridge link", error))?;
+  }
+  let arch = if target.arch == "arm64" { "arm64" } else { "x86_64" };
+  let output = Command::new("clang++")
+    .args(["-std=c++17", "-fobjc-arc", "-bundle", "-undefined", "dynamic_lookup", "-framework", "AppKit", "-arch", arch, "-mmacosx-version-min=12.0"])
+    .arg(dir.join("appkit.mm")).arg("-o").arg(&binary)
+    .output().map_err(|error| Error::with_source("start AppKit bridge compiler", error))?;
+  if !output.status.success() {
+    return Err(format!("AppKit bridge compilation failed ({}): {}", output.status, String::from_utf8_lossy(&output.stderr)).into());
+  }
+  let output = Command::new("codesign").args(["--force", "--sign", "-"]).arg(&binary)
+    .output().map_err(|error| Error::with_source("start AppKit bridge signing", error))?;
+  if !output.status.success() {
+    return Err(format!("AppKit bridge signing failed ({}): {}", output.status, String::from_utf8_lossy(&output.stderr)).into());
   }
   Ok(())
 }
@@ -344,7 +372,12 @@ mod tests {
     fs::remove_file(output.join("preload.cjs")).unwrap();
     fs::write(output.join("commands.cjs"), b"stale commands").unwrap();
     fs::remove_file(output.join("internal.cjs")).unwrap();
+    if target.platform == "darwin" {
+      assert!(output.join("appkit.node").is_file());
+      fs::remove_file(output.join("appkit.node")).unwrap();
+    }
     builder.build().unwrap();
+    assert!(assets_match(&output, &target));
     for (name, bytes) in ASSETS {
       assert_eq!(fs::read(output.join(name)).unwrap(), bytes, "staged asset {name}");
     }

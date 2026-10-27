@@ -43,6 +43,8 @@ function createCommandRouter(context) {
     installLocalhostProtocols,
     serializeError,
     setWindowBackgroundColor,
+    configureWindowStyle,
+    setTrafficLights,
     applyWindowCursorCss,
     setWindowCursor,
     readWindowTheme,
@@ -215,7 +217,7 @@ function createCommandRouter(context) {
         const buffer = window.getNativeWindowHandle()
         const handle =
           buffer.length >= 8 ? Number(buffer.readBigUInt64LE(0)) : buffer.readUInt32LE(0)
-        return { handle }
+        return { handle, processId: process.pid }
       }
       case 'window.close':
         state.windows.get(params.windowId)?.close()
@@ -259,7 +261,9 @@ function createCommandRouter(context) {
       case 'window.decorations': {
         // The native frame is toggled by Rust; recalculate its content limits too.
         const window = findWindow(params.windowId)
-        window.__tauriDecorations = (params.value ?? params.decorations) !== false
+        const decorations = (params.value ?? params.decorations) !== false
+        if (process.platform === 'darwin') configureWindowStyle(window, { decorations })
+        window.__tauriDecorations = decorations
         applySizeConstraints(window)
         setImmediate(() => applySizeConstraints(window))
         return null
@@ -322,11 +326,12 @@ function createCommandRouter(context) {
         const display = displayForPoint(params.x, params.y, process.platform === 'win32')
         return display ? readDisplay(display) : null
       }
+      case 'window.titleBarStyle':
+        configureWindowStyle(findWindow(params.windowId), { titleBarStyle: params.style })
+        return null
       case 'window.trafficLight': {
         const window = findWindow(params.windowId)
-        if (typeof window.setWindowButtonPosition === 'function') {
-          window.setWindowButtonPosition({ x: toDip(window, params, 'x'), y: toDip(window, params, 'y') })
-        }
+        setTrafficLights(window, { x: toDip(window, params, 'x'), y: toDip(window, params, 'y') })
         return null
       }
       default: throw new Error(`unknown window method ${method}`)

@@ -19,6 +19,8 @@ use crate::runtime::{rect_position, rect_size};
 
 pub(crate) mod cursor;
 pub(crate) mod dpi;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_window;
 
 /// Maps the monitor JSON shape produced by `electron-rs/assets/main.cjs` onto Tauri's
 /// physical-pixel `Monitor`.

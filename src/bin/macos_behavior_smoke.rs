@@ -495,6 +495,7 @@ int main(int argc, const char **argv) {
   fn titlebars(handle: &ElectronRuntimeHandle, observer: &Observer, failures: &mut Vec<String>) {
     for (case, member, assertion) in [
       ("title_bar_style", "WindowBuilder::title_bar_style", "Visible/Transparent retain native AXWebArea caption inset; Overlay extends beneath the caption, with all three native controls retained"),
+      ("dispatch_title_bar_style", "WindowDispatch::set_title_bar_style", "Transparent/Overlay/Transparent moves the same real AXWebArea below/under/below the caption while retaining all three native controls"),
       ("hidden_title", "WindowBuilder::hidden_title", "a readable visible-title baseline changes to confirmed absent/hidden native title text without moving controls or changing content inset"),
       ("builder_traffic_light_position", "WindowBuilder::traffic_light_position", "two fresh Overlay windows' three native AX control frames differ by the requested 26x16 logical delta"),
       ("dispatch_traffic_light_position", "WindowDispatch::set_traffic_light_position", "logical and physical requests move all three native AX control frames by distinct correct logical deltas"),
@@ -520,6 +521,21 @@ int main(int argc, const char **argv) {
             require(inset(&normal)? >= 16.0, "Visible titlebar must keep real web content below the titlebar")?;
             require((inset(&transparent)? - inset(&normal)?).abs() <= 2.0, "Transparent titlebar must retain normal content inset, unlike Overlay")?;
             require(inset(&overlay)?.abs() <= 2.0, "Overlay must place the actual AXWebArea underneath the titlebar")?;
+          }
+          "dispatch_title_bar_style" => {
+            let window = make("title-dispatch", builder("title-dispatch").title_bar_style(TitleBarStyle::Visible))?;
+            let initial = caption(observer, "title-dispatch")?;
+            let normal_inset = inset(&initial)?;
+            require(normal_inset >= 16.0, "Visible baseline must keep the AXWebArea below the caption")?;
+            for (style, fullsize) in [(TitleBarStyle::Transparent, false), (TitleBarStyle::Overlay, true), (TitleBarStyle::Transparent, false)] {
+              WindowDispatch::<()>::set_title_bar_style(&window.dispatcher, style).map_err(|error| error.to_string())?;
+              let snapshot = observer.wait_for("live title style must change the same AXWebArea inset", &["windows", "cgWindows"], |state| {
+                native_window(state, "title-dispatch").and_then(|window| inset(window).ok())
+                  .is_some_and(|actual| if fullsize { actual.abs() <= 2.0 } else { (actual-normal_inset).abs() <= 2.0 })
+              })?;
+              let actual = native_window(&snapshot, "title-dispatch").ok_or("FAIL: live title style lost the window")?;
+              for index in 0..3 { numbers(&actual["buttons"][index])?; }
+            }
           }
           "hidden_title" => {
             let _visible = make("title-visible", builder("title-visible").title_bar_style(TitleBarStyle::Visible).hidden_title(false))?;

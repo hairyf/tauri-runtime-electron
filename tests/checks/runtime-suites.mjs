@@ -8,10 +8,11 @@ import { ciMetadata, collectEvidence, PLATFORMS } from './runtime-evidence.mjs'
 
 export const SUITES = [
   { id: 'runtime-tests', command: 'cargo', args: ['test', '--locked', '--', '--nocapture', '--test-threads=1'] },
-  ...['new_window_smoke', 'tauri_new_window_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke', 'macos_behavior_smoke', 'windows_behavior_smoke', 'rendering_behavior_smoke'].map(id => ({
+  ...['new_window_smoke', 'tauri_new_window_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke', 'macos_behavior_smoke', 'windows_behavior_smoke', 'linux_behavior_smoke', 'rendering_behavior_smoke'].map(id => ({
     id, command: 'cargo', args: ['run', '--locked', ...(id === 'tauri_new_window_smoke' ? ['--features', 'tauri'] : []), '--bin', id],
     ...(id === 'macos_behavior_smoke' ? { platforms: ['macos'] } : {}),
     ...(id === 'windows_behavior_smoke' ? { platforms: ['windows'] } : {}),
+    ...(id === 'linux_behavior_smoke' ? { platforms: ['linux'] } : {}),
   })),
 ]
 

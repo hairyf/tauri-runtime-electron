@@ -1,5 +1,11 @@
 import type { BaseWindow, BrowserWindowConstructorOptions, DownloadItem, Protocol, Rectangle, Session, WebContents, WebContentsView } from 'electron'
 
+export interface AppKit {
+  configureStyle(handle: Buffer, decorated: boolean, style: string, hiddenTitle: boolean): void
+  isDecorated(handle: Buffer): boolean
+  trafficLights(handle: Buffer, x: number, y: number): void
+}
+
 export interface IpcFetchRequest {
   url: string
   method: string
@@ -100,7 +106,7 @@ export interface RuntimeState {
   sizeConstraints: WeakMap<BaseWindow, SizeConstraints>
   windowCursorState: WeakMap<BaseWindow, { visible: boolean; cursor?: string }>
   cursorCssKey: WeakMap<WebContents, { pending: Promise<void>; key?: string }>
-  windowConfigs: WeakMap<BaseWindow, { transparent?: boolean }>
+  windowConfigs: WeakMap<BaseWindow, { transparent?: boolean; decorations?: boolean; titleBarStyle?: string; hiddenTitle?: boolean; titleBarHidden?: boolean; trafficLightPosition?: { x: number; y: number } }>
   fullscreenBounds: WeakMap<BaseWindow, { bounds: Rectangle; maximized: boolean }>
   webviews: Map<number, BaseWindow>
   webviewByContents: Map<number, number>

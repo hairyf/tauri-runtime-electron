@@ -491,6 +491,22 @@ mod win {
     expect_icon(&window, BLUE)
   }
 
+  fn window_handle_checks(handle: &ElectronRuntimeHandle, prefix: &str) -> Check {
+    let window = create(handle, prefix, ElectronWindowBuilder::new())?;
+    let raw = WindowDispatch::<()>::window_handle(&window.dispatcher)
+      .map_err(|error| format!("UNKNOWN: WindowDispatch::window_handle unavailable: {error}"))?
+      .as_raw();
+    let hwnd = match raw {
+      raw_window_handle::RawWindowHandle::Win32(raw) => HWND(raw.hwnd.get() as *mut std::ffi::c_void),
+      other => return Err(format!("FAIL: Windows window_handle returned {other:?}, not Win32")),
+    };
+    require(unsafe { IsWindow(Some(hwnd)) }.as_bool(), "window_handle must name a live native menu-proxy HWND")?;
+    let mut pid = 0;
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    require(tid != 0 && pid == std::process::id(),
+      format!("menu-proxy HWND must belong to this process and a live thread (pid={pid}, tid={tid})"))
+  }
+
   fn composition() -> Check {
     match unsafe { DwmIsCompositionEnabled() } {
       Ok(enabled) if enabled.as_bool() => Ok(()),
@@ -541,11 +557,12 @@ mod win {
     passed &= check("WindowDispatch::set_cursor_grab", "cursor_grab", "at two distinct native client screen rectangles GetClipCursor matches grab bounds, outside physical pointer attempts clamp to opposite edges, false releases the clip and permits outside positions; original clip and pointer are restored", || cursor_grab_checks(handle, prefix));
     passed &= check("WindowBuilder::icon", "builder_icons", "two fresh opposite icon replacements expose the final RGB color in every native ICON_SMALL and ICON_BIG resource pixel", || builder_icon_checks(handle, prefix));
     passed &= check("WindowDispatch::set_icon", "dispatch_icons", "native WM_GETICON resource pixels change blue to red to blue in both small and big slots after opposite set_icon calls", || dispatch_icon_checks(handle, prefix));
+    passed &= check("WindowDispatch::window_handle", "window_handle", "WindowDispatch::window_handle returns a live current-process menu-proxy HWND, not Electron's top-level HWND", || window_handle_checks(handle, prefix));
     passed &= check("WindowBuilder::content_protected", "builder_protection", "two fresh content_protected setters override opposite WindowConfig values with native WDA_EXCLUDEFROMCAPTURE and WDA_NONE", || builder_protection_checks(handle, prefix));
     passed &= check("WindowDispatch::set_content_protected", "dispatch_protection", "external GetWindowDisplayAffinity changes WDA_NONE to WDA_EXCLUDEFROMCAPTURE to WDA_NONE after opposite dispatcher setters", || dispatch_protection_checks(handle, prefix));
     for (member, reason) in [
+      ("WindowBuilder::no_redirection_bitmap", "not verified: cross-process extended-style mutation failed with Win32 error 87; no native setter evidence"),
       ("WindowBuilder::window_classname", "not asserted: current creation bridge does not apply a custom native class; logged GetClassNameW is diagnostic only"),
-      ("WindowBuilder::no_redirection_bitmap", "not asserted: current creation bridge does not apply this native style; a default bit is not setter evidence"),
       ("WindowBuilder::skip_taskbar", "not asserted: Electron and Tao use ITaskbarList; APPWINDOW/TOOLWINDOW observations alone cannot prove an actual shell tab"),
       ("WindowDispatch::set_skip_taskbar", "not asserted: opposite dispatcher calls need an independent shell-tab observer, not unchanged extended styles or an Ok result"),
     ] {

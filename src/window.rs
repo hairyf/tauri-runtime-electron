@@ -193,6 +193,10 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn is_decorated(&self) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    return crate::platform::linux_window::is_decorated(self.context.x11_window(self.id)?)
+      .map_err(create_window_err);
+    #[cfg(not(target_os = "linux"))]
     Ok(self.geometry()?["decorated"].as_bool().unwrap_or(true))
   }
 
@@ -209,6 +213,10 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn is_closable(&self) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    return crate::platform::linux_window::is_closable(self.context.x11_window(self.id)?)
+      .map_err(create_window_err);
+    #[cfg(not(target_os = "linux"))]
     Ok(self.geometry()?["closable"].as_bool().unwrap_or(true))
   }
 
@@ -363,6 +371,9 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_closable(&self, closable: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    crate::platform::linux_window::set_closable(self.context.x11_window(self.id)?, closable)
+      .map_err(create_window_err)?;
     self.window_call("window.closable", json!({ "closable": closable }))
   }
 
@@ -414,8 +425,8 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     Ok(())
   }
 
-  // Electron cannot flip the frame through its own API; change only the Win32
-  // caption, leaving resize and caption-button capabilities intact.
+  // Electron cannot flip the frame through its own API. Change the native
+  // caption/hints without rewriting the independent button capabilities.
   fn set_decorations(&self, decorations: bool) -> Result<()> {
     #[cfg(windows)]
     {
@@ -424,7 +435,15 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
         .window_call("window.decorations", json!({ "value": decorations }))
         .map(|_| ())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+      crate::platform::linux_window::set_decorations(self.context.x11_window(self.id)?, decorations)
+        .map_err(create_window_err)?;
+      self.window_call("window.decorations", json!({ "value": decorations }))
+    }
+    #[cfg(target_os = "macos")]
+    return self.window_call("window.decorations", json!({ "value": decorations }));
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
       let _ = decorations;
       crate::runtime::unsupported(

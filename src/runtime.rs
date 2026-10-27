@@ -428,6 +428,20 @@ impl RuntimeContext {
     Ok(handle)
   }
 
+  #[cfg(target_os = "linux")]
+  pub(crate) fn x11_window(&self, id: WindowId) -> Result<(u32, u32)> {
+    self.on_main_thread(move |context| {
+      let serial = context.serial_for_window(id)
+        .ok_or_else(|| create_window_err("window is gone".into()))?;
+      let value = context.ipc.call("window.nativeHandle", json!({ "windowId": serial }), IPC_TIMEOUT)
+        .map_err(|error| create_window_err(error.to_string()))?;
+      let field = |name| value[name].as_u64().and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| create_window_err(format!("Electron returned no X11 {name}")));
+      Ok((field("handle")?, field("processId")?))
+    })?
+  }
+
   #[cfg(windows)]
   pub(crate) fn menu_owner_window(&self, id: WindowId) -> Result<isize> {
     if std::thread::current().id() != self.main_thread_id {
@@ -1840,6 +1854,12 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   );
 
   let setup_result = (|| -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if !window_builder.config.closable {
+      let window = context.x11_window(id)?;
+      crate::platform::linux_window::set_closable(window, false)
+        .map_err(create_window_err)?;
+    }
     #[cfg(windows)]
     if window_builder.owner.is_some() || window_builder.parent.is_some()
       || window_builder.config.always_on_bottom {

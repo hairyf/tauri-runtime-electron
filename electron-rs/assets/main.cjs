@@ -465,6 +465,28 @@ function titleBarStyleOf(config) {
   return style === 'overlay' ? 'hiddenInset' : 'default'
 }
 
+/** @returns {import('./runtime.d.ts', { with: { 'resolution-mode': 'import' } }).AppKit} */
+function appKit() {
+  return require(path.join(__dirname, 'appkit.node'))
+}
+
+function configureWindowStyle(window, changes = {}) {
+  const config = { ...state.windowConfigs.get(window), ...changes }
+  const style = String(config.titleBarStyle ?? 'visible').toLowerCase()
+  if (!['visible', 'transparent', 'overlay'].includes(style)) throw new Error('invalid title bar style')
+  appKit().configureStyle(window.getNativeWindowHandle(), config.decorations !== false, style, config.hiddenTitle === true || config.titleBarHidden === true)
+  state.windowConfigs.set(window, config)
+  if (config.trafficLightPosition) setTrafficLights(window, config.trafficLightPosition)
+  resizeChildWebviews(window)
+}
+
+function setTrafficLights(window, position) {
+  if (process.platform === 'darwin') {
+    appKit().trafficLights(window.getNativeWindowHandle(), position.x, position.y)
+    state.windowConfigs.set(window, { ...state.windowConfigs.get(window), trafficLightPosition: position })
+  } else if (typeof window.setWindowButtonPosition === 'function') window.setWindowButtonPosition(position)
+}
+
 function webviewConfig(config, webview = {}) {
   return { ...config, ...Object.fromEntries(Object.entries(webview).filter(([, value]) => value != null)) }
 }
@@ -570,6 +592,7 @@ function applyWebviewConfig(contents, config) {
 }
 
 function applyWindowConfig(window, config, constraints) {
+  if (process.platform === 'darwin') configureWindowStyle(window)
   if (process.platform === 'linux') setWindowBackgroundColor(window, config.backgroundColor)
   if (process.platform === 'linux' && config.focusable === false) window.setFocusable(false)
   state.sizeConstraints.set(window, constraints)
@@ -580,7 +603,6 @@ function applyWindowConfig(window, config, constraints) {
   if (config.focus && config.focusable !== false && config.visible !== false) window.focus()
   if (config.visibleOnAllWorkspaces) window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   if (config.contentProtected) window.setContentProtection(true)
-  if (process.platform === 'darwin' && config.trafficLightPosition) window.setWindowButtonPosition(config.trafficLightPosition)
   if (config.preventOverflow) {
     const bounds = window.getBounds()
     const area = screen.getDisplayMatching(bounds).workArea
@@ -1210,7 +1232,7 @@ function readGeometry(window) {
     fullscreen: window.isFullScreen() || (process.platform === 'darwin' && window.isSimpleFullScreen()),
     resizable: window.isResizable(),
     alwaysOnTop: window.isAlwaysOnTop(),
-    decorated: window.__tauriDecorations ?? true,
+    decorated: process.platform === 'darwin' ? appKit().isDecorated(window.getNativeWindowHandle()) : window.__tauriDecorations ?? true,
     title: window.getTitle(),
     maximizable: window.isMaximizable(),
     minimizable: window.isMinimizable(),
@@ -1418,6 +1440,8 @@ const commandContext = {
   installLocalhostProtocols,
   serializeError,
   setWindowBackgroundColor,
+  configureWindowStyle,
+  setTrafficLights,
   applyWindowCursorCss,
   setWindowCursor,
   readWindowTheme,

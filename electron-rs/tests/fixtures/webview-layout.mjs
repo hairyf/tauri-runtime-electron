@@ -170,6 +170,11 @@ class Window extends EventEmitter {
     this.minimizable = options.minimizable ?? true
     this.closable = options.closable ?? true
   }
+  getNativeWindowHandle() {
+    const handle = Buffer.alloc(8)
+    handle.writeBigUInt64LE(BigInt(allWindows.indexOf(this) + 1))
+    return handle
+  }
   getBackgroundColor() {
     const color = this.color ?? this.options.backgroundColor ?? '#ffffff'
     const rgb = color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/)
@@ -230,6 +235,18 @@ class Window extends EventEmitter {
   destroy() { this.destroyed = true; this.emit('closed') }
   resize(width, height) { this.content.width = width; this.content.height = height; this.emit('resize') }
 }
+const appkit = {
+  window(handle) {
+    assert.ok(Buffer.isBuffer(handle))
+    return allWindows[Number(handle.readBigUInt64LE()) - 1]
+  },
+  configureStyle(handle, decorated, style, hidden) {
+    const window = this.window(handle)
+    window.appkitStyle = { decorated, style, hidden }
+  },
+  isDecorated(handle) { return this.window(handle).appkitStyle?.decorated ?? true },
+  trafficLights(handle, x, y) { this.window(handle).setWindowButtonPosition({ x, y }) },
+}
 const context = vm.createContext({
   require: (name) => name === 'electron' ? {
     app: { on() {}, quit() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
@@ -241,6 +258,7 @@ const context = vm.createContext({
   } : name === 'node:net' ? { connect: () => transport }
     : name === 'node:fs' ? { appendFileSync() {}, readFileSync(fd) { assert.equal(fd, 0); return '0123456789abcdef'.repeat(4) + '\n' } }
     : name === 'node:os' ? { tmpdir: () => '.', release: () => '10.0.22631' }
+      : name.endsWith('appkit.node') ? appkit
       : name === './ipc.cjs' ? ipcModule.exports : require(name),
   process: { argv: ['node', 'main.cjs', '--port', '1'], env: {}, platform: 'win32' },
   Buffer, URL, console,

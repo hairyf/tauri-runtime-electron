@@ -266,14 +266,10 @@ fn unix_frame_checks(window: &Window) {
       println!("skip {setter}/{getter}: official Linux contract is unsupported");
       continue;
     }
-    // These known runtime gaps cannot become passes by echoing a config/WeakMap.
-    if flag == "decorations" || (cfg!(target_os = "linux") && flag == "closable") {
-      report(setter, "this backend does not implement this platform's native frame/button mutation", "unknown");
-      continue;
-    }
     let mut unknown = None;
     for wanted in [false, true] {
       match flag {
+        "decorations" => WindowDispatch::<()>::set_decorations(window, wanted),
         "maximizable" => WindowDispatch::<()>::set_maximizable(window, wanted),
         "minimizable" => WindowDispatch::<()>::set_minimizable(window, wanted),
         "closable" => WindowDispatch::<()>::set_closable(window, wanted),
@@ -325,7 +321,7 @@ fn probe(program: &str, args: &[&str]) -> Result<String, String> {
 fn native_flag(window: &Window, flag: &str) -> Result<bool, String> {
   let title = WindowDispatch::<()>::title(window).map_err(|error| error.to_string())?;
   let attribute = match flag {
-    "decorations" => "AXTitleUIElement",
+    "decorations" => "native-caption-controls",
     "maximizable" => "AXZoomButton",
     "minimizable" => "AXMinimizeButton",
     "closable" => "AXCloseButton",
@@ -345,10 +341,24 @@ fn native_flag(window: &Window, flag: &str) -> Result<bool, String> {
       end repeat
       if (count of matches) is not 1 then error "Expected one real Electron AX window"
       set w to item 1 of matches
+      if attributeName is "native-caption-controls" then
+        -- AXTitleUIElement is optional even on a normal titled window.
+        -- Observe the real caption controls and their nonzero native frames.
+        repeat with buttonName in {"AXCloseButton", "AXMinimizeButton", "AXZoomButton"}
+          if not (exists attribute buttonName of w) then error "Native caption controls are unavailable"
+          set captionButton to (get value of attribute buttonName of w)
+          if captionButton is missing value then return false
+          set buttonSize to (get value of attribute "AXSize" of captionButton)
+          if (item 1 of buttonSize) <= 0 or (item 2 of buttonSize) <= 0 then return false
+          if exists attribute "AXHidden" of captionButton then
+            if (get value of attribute "AXHidden" of captionButton) then return false
+          end if
+        end repeat
+        return true
+      end if
       if not (exists attribute attributeName of w) then error "Native AX attribute is unavailable"
       set axElement to (get value of attribute attributeName of w)
-      if axElement is missing value then return false
-      if attributeName is "AXTitleUIElement" then return true
+      if axElement is missing value then error "Native button is absent; enabled state is unavailable"
       return (get value of attribute "AXEnabled" of axElement)
     end tell
   end run"#;
