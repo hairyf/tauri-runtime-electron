@@ -405,6 +405,102 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     .block_on(future)
 }
 
+fn real_commands(electron: &Arc<Electron>) {
+  use std::{future::IntoFuture as _, sync::atomic::{AtomicBool, Ordering}};
+  use electron_rs::OutputStream;
+
+  let general = electron.subscribe();
+  let oracle = electron.node(&["-e", "process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));"])
+    .expect("direct connected Node binary-output oracle");
+  assert!(oracle.status.success(), "{oracle:?}");
+  block_on(async {
+    let identity = "const {isMainThread,threadId}=require('node:worker_threads');return {pid:process.pid,isMainThread,threadId,electron:process.versions.electron};";
+    let worker = electron.node_in_main(identity, &[]).timeout(WAIT).await.unwrap();
+    assert_eq!(worker.code, 0);
+    assert!(worker.stdout.is_empty() && worker.stderr.is_empty());
+    assert_eq!(worker.result["isMainThread"], false);
+    assert!(worker.result["threadId"].as_u64().unwrap() > 0);
+    assert_eq!(worker.result["electron"], DEFAULT_VERSION);
+    let main = electron.electron_in_main(
+      "const {isMainThread,threadId}=require('node:worker_threads');return {pid:process.pid,isMainThread,threadId,ready:require('electron').app.isReady(),electron:process.versions.electron};", &[],
+    ).timeout(WAIT).await.unwrap();
+    assert_eq!(main.code, 0);
+    assert!(main.stdout.is_empty() && main.stderr.is_empty());
+    assert!(main.result["pid"].as_u64().unwrap() > 0);
+    assert_eq!(main.result["pid"], worker.result["pid"]);
+    assert_eq!(main.result["isMainThread"], true);
+    assert_eq!(main.result["threadId"], 0);
+    assert_eq!(main.result["ready"], true);
+    assert_eq!(main.result["electron"], DEFAULT_VERSION);
+    for electron_mode in [false, true] {
+      let script = "process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));return {args,answer:42};";
+      let args = &["argument with spaces", "雪 🦀"];
+      let command = if electron_mode { electron.electron_in_main(script, args) }
+        else { electron.node_in_main(script, args) };
+      let output = command.timeout(WAIT).max_output_bytes(64).await.unwrap();
+      assert_eq!(output.code, 0);
+      assert_eq!(output.stdout, oracle.stdout);
+      assert_eq!(output.stderr, oracle.stderr);
+      assert_eq!(output.result, json!({"args":args,"answer":42}));
+    }
+    let failed = electron.node_in_main("process.exit(17)", &[]).timeout(WAIT).await.unwrap();
+    assert_eq!(failed.code, 17);
+    assert!(failed.stdout.is_empty() && failed.stderr.is_empty());
+    assert_eq!(failed.result, Value::Null);
+    let failed = electron.electron_in_main("process.exitCode=23;return {scoped:true};", &[])
+      .timeout(WAIT).await.unwrap();
+    assert_eq!(failed.code, 23);
+    assert_eq!(failed.result, json!({"scoped":true}));
+
+    let first = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&first);
+    let (chunks, received) = mpsc::channel();
+    let mut pending = electron.electron_in_main(
+      "console.log('live stdout');console.error('live stderr');await new Promise(resolve=>setTimeout(resolve,1000));console.log('last stdout');console.error('last stderr');return {answer:42};", &[],
+    ).timeout(WAIT).max_output_bytes(1024).on_output(move |chunk| {
+      chunks.send(chunk).unwrap();
+      observed.store(true, Ordering::SeqCst);
+    }).into_future();
+    tokio::time::timeout(WAIT, async {
+      tokio::select! {
+        biased;
+        result = &mut pending => panic!("command completed before live output was observed: {result:?}"),
+        _ = async {
+          while !first.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+          }
+        } => {}
+      }
+    }).await.expect("first output must arrive while the script is delayed");
+    let output = pending.await.unwrap();
+    assert_eq!(output.code, 0);
+    assert_eq!(output.stdout, b"live stdout\nlast stdout\n");
+    assert_eq!(output.stderr, b"live stderr\nlast stderr\n");
+    assert_eq!(output.result, json!({"answer":42}));
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for (sequence, chunk) in received.try_iter().enumerate() {
+      assert_eq!(chunk.sequence, sequence as u64);
+      match chunk.stream {
+        OutputStream::Stdout => stdout.extend(chunk.data),
+        OutputStream::Stderr => stderr.extend(chunk.data),
+      }
+    }
+    assert_eq!(stdout, output.stdout);
+    assert_eq!(stderr, output.stderr);
+    let timed_out = electron.electron_in_main("await new Promise(()=>{});", &[])
+      .timeout(Duration::from_millis(100)).await.unwrap();
+    assert_eq!(timed_out.code, 124);
+    assert_eq!(timed_out.result, Value::Null);
+    let healthy = electron.electron_in_main(
+      "return {pid:process.pid,ready:require('electron').app.isReady(),code:process.exitCode??0};", &[],
+    ).timeout(WAIT).await.unwrap();
+    assert_eq!(healthy.code, 0);
+    assert_eq!(healthy.result, json!({"pid":main.result["pid"],"ready":true,"code":0}));
+  });
+  assert!(matches!(general.try_recv(), Err(mpsc::TryRecvError::Empty)),
+    "command output must bypass general events");
+}
+
 struct Request {
   method: &'static str,
   params: Value,
@@ -530,6 +626,7 @@ fn real_bridge() {
   electron.on(move |event| {
     let _ = callback_tx.send(event);
   });
+  real_commands(electron);
   let output = electron.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,answer:21*2,page:Buffer.from(process.argv[1]).toString('base64')}))", PAGE]).unwrap();
   assert!(output.status.success(), "{:?}", output);
   let node: Value = serde_json::from_slice(&output.stdout).unwrap();

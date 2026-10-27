@@ -6,6 +6,7 @@ import { Transport } from './socket/transport'
 import { createCommands } from './runtime/commands'
 import { Downloads } from './runtime/downloads'
 import { Environment } from './runtime/environment'
+import { Executions } from './runtime/execution'
 import { Factory } from './runtime/factory'
 import { Policies } from './runtime/policy'
 import type { PopupPlan } from './runtime/policy'
@@ -73,6 +74,7 @@ const ipc = new IPC(port)
 
 // transport 才负责「请求 → 查表 → 回包」，是唯一能被替身替换的接缝。
 const transport = new Transport(ipc)
+const executions = new Executions(transport)
 
 // Window 的原生接缝：appkit / 光标 / 主题。只有这里知道 native 适配器。
 const environment = new Environment(webviews)
@@ -99,6 +101,7 @@ const factory = new Factory({
 // 命令只是 adapter：解析 id → 取领域对象 → 调一个方法。
 const commands = createCommands({
   factory,
+  executions,
   windows,
   webviews,
   policies,
@@ -113,7 +116,7 @@ const commands = createCommands({
 // commands 依赖 transport（respond），transport 又需要命令表，所以表建好后再注入。
 transport.use(commands)
 
-export { windows, webviews, downloads, popups, transport, environment, policies, protocols, factory, commands }
+export { windows, webviews, downloads, popups, transport, environment, policies, protocols, factory, commands, executions }
 
 // IPC identity is derived from Electron's sender, never supplied by the renderer.
 ipcMain.handle('tauri-ipc-fetch', async (event, data) => {
@@ -157,6 +160,7 @@ transport.onConnect(async () => {
 
 // 连接断开即退出：窗口寿命归 Rust，socket 断了就没有继续存在的理由。
 transport.onClose(() => app.quit())
+app.on('will-quit', () => { void executions.close() })
 
 // 没有窗口时继续运行，直到 socket 断开。
 app.on('window-all-closed', noop)

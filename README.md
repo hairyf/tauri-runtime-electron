@@ -56,6 +56,35 @@ Startup locates prepared files beside the app (`runtime`, `resources/runtime` or
 
 For use without Tauri, see the separate [electron-rs README](electron-rs/README.md).
 
+## Node and Electron commands
+
+`Electron::new().node(&args)` runs a separate Node-mode process; `.electron(&args)` runs a separate normal Electron process. Both use the configured/resolved binary, block until exit, and return `std::io::Result<std::process::Output>`. Nonzero exits retain their status and raw stdout/stderr. Neither starts an RPC bridge.
+
+To reuse the application's **current** Electron process, enable `features = ["tauri"]` and obtain its client from a Tauri webview:
+
+```rust
+use tauri_runtime_electron::{main_bridge, CommandOutput, ElectronRuntime};
+
+async fn run_task(
+    webview: &tauri::Webview<ElectronRuntime>,
+) -> Result<CommandOutput, Box<dyn std::error::Error>> {
+    let bridge = main_bridge(webview).await?;
+    let output = bridge.node_in_main(
+        "console.log(args[0]); return { answer: 42 };", &["hello from Rust"],
+    ).await?;
+    assert_eq!(output.result["answer"], 42);
+    let main = bridge.electron_in_main(
+        "return { ready: require('electron').app.isReady() };", &[],
+    ).await?;
+    assert_eq!(main.result["ready"], true);
+    Ok(output)
+}
+```
+
+The returned `ElectronBridge` is an `Arc` of the existing authenticated client; keep it for subsequent commands if desired. Direct runtime users can call `ElectronWebviewDispatcher::main_bridge()`. Node tasks use short-lived Workers in that same process; Electron tasks run on the current main thread. These methods take async JavaScript function bodies, not command-line argument lists.
+
+Both async variants return `CommandOutput { code, stdout, stderr, result }`; logs remain raw bytes, separate from the JSON value. Add `.on_output(...)` for continuous `CommandChunk { sequence, stream, data }` notifications before completion, and `.timeout(...)` / `.max_output_bytes(...)` for bounds. Defaults are 30 seconds and 16 MiB; nonzero exit codes remain results, while transport/output-limit failures are errors. Logs are isolated by task and bypass the runtime event queue. Worker cancellation terminates the Worker; main-thread cancellation is cooperative and cannot interrupt synchronous JavaScript. Await work inside an Electron task before returning. See the [command API and streaming example](electron-rs/README.md#command-execution) for exit codes, cleanup and limits. No generic renderer execution endpoint is registered.
+
 <a id="2-window-api-and-native-effects"></a>
 <details>
 <summary>Optional native window effects</summary>

@@ -943,6 +943,18 @@ impl Electron {
     self
   }
 
+  /// Run the resolved binary in a separate Node process, waiting for its output.
+  /// Nonzero exits remain `Ok(Output)`; this does not start an RPC bridge.
+  pub fn node(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+    electron_rs::node(self.resolve_binary().map_err(std::io::Error::other)?, args)
+  }
+
+  /// Run the resolved binary normally in a separate Electron process.
+  /// Clears `ELECTRON_RUN_AS_NODE`; nonzero exits remain `Ok(Output)`.
+  pub fn electron(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+    electron_rs::electron(self.resolve_binary().map_err(std::io::Error::other)?, args)
+  }
+
   /// Appended to the Electron command line (after the main script).
   pub fn arg(mut self, arg: impl Into<String>) -> Self {
     self.args.push(arg.into());

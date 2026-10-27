@@ -62,6 +62,10 @@ impl Ipc {
       .map_err(|_| electron_rs::Error::ChannelDisconnected)?
   }
 
+  pub(crate) fn client(&self) -> Arc<Electron> {
+    self.electron.clone()
+  }
+
   pub(crate) fn events(&self) -> Result<mpsc::Receiver<electron_rs::Event>, electron_rs::Error> {
     self.electron.events()
   }

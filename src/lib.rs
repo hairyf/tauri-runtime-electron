@@ -22,6 +22,7 @@
 //! the independent `electron-rs` crate.
 
 mod app_icon;
+mod command_bridge;
 mod devtools;
 mod environment;
 mod locale;
@@ -37,6 +38,10 @@ pub mod window;
 mod window_builder;
 mod window_handle;
 
+#[cfg(feature = "tauri")]
+pub use command_bridge::main_bridge;
+pub use command_bridge::ElectronBridge;
+pub use electron_rs::{Command, CommandChunk, CommandOutput, OutputStream};
 pub use environment::DebugEnvironment;
 #[cfg(feature = "tauri")]
 pub use new_window::on_new_window;

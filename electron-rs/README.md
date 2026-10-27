@@ -81,6 +81,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 `find_binary` accepts an executable, a distribution directory or a resource root containing `<platform>-<arch>`. It resolves renamed executables from staged metadata and checks executable headers for the target OS and CPU architecture. Launching needs the prepared scripts; **it never downloads, extracts, brands or repairs files**. The crate owns [main.cjs](assets/main.cjs) and [preload.cjs](assets/preload.cjs); consumers supply neither assets nor a `main_script` argument.
 
+## Command execution
+
+| Method on `Arc<Electron>` | Execution | Result |
+| --- | --- | --- |
+| `node(&args)` | Separate process with `ELECTRON_RUN_AS_NODE=1` | Synchronous `std::process::Output` |
+| `electron(&args)` | Separate normal Electron process; removes `ELECTRON_RUN_AS_NODE` | Synchronous `std::process::Output` |
+| `node_in_main(body, &args).await` | Short-lived Node Worker in the connected Electron process | `CommandOutput` |
+| `electron_in_main(body, &args).await` | Current Electron main JavaScript thread | `CommandOutput` |
+
+The native methods also exist on `ElectronBuilder`, and as `node(binary, args)` / `electron(binary, args)` free functions. They do not start an RPC bridge. Both preserve argument boundaries and return nonzero exits as `Ok(Output)`; process creation and collection failures are I/O errors.
+
+The shared variants reuse the authenticated connection. Their source is an **async function body**, with `args: string[]`, `signal: AbortSignal`, CommonJS `require`, `process` and `console` available. `require` resolves from the main process's current directory. A JSON return value is separate from stdout/stderr:
+
+```rust
+use electron_rs::{Electron, OutputStream};
+use std::{io::Write, time::Duration};
+
+async fn commands(electron: &std::sync::Arc<Electron>) -> Result<(), electron_rs::Error> {
+    let output = electron.node_in_main(
+        "console.log(args[0]); process.stderr.write('progress'); return { answer: 42 };",
+        &["one argument with spaces"],
+    )
+    .timeout(Duration::from_secs(10))
+    .on_output(|chunk| {
+        match chunk.stream {
+            OutputStream::Stdout => std::io::stdout().write_all(&chunk.data),
+            OutputStream::Stderr => std::io::stderr().write_all(&chunk.data),
+        }.expect("forward command output");
+    })
+    .await?;
+    assert!(output.success());
+    assert_eq!(output.result["answer"], 42);
+
+    let main = electron.electron_in_main(
+        "return { ready: require('electron').app.isReady(), pid: process.pid };", &[],
+    ).await?;
+    assert_eq!(main.result["ready"], true);
+    Ok(())
+}
+```
+
+`CommandOutput` contains `code: i32`, raw `stdout` / `stderr: Vec<u8>` and `result: serde_json::Value`. Byte chunks retain stream identity and an increasing sequence; text decoding is the caller's choice. Callbacks run on the awaiting task, never the RPC reader, and all queued output is delivered before completion. Command logs bypass general event queues. Keep callbacks short: a full bounded output queue fails and cancels that command rather than silently dropping data or stopping Electron.
+
+A script exception returns code `1` and its stack on stderr; exit codes follow native `std::process::ExitStatus::code()` representation (signed 32-bit on Windows, 8-bit on POSIX). Server deadlines return `124`; cancellation/disconnect cleanup stops Workers, and explicit cancellation returns `130`. Transport, invalid input, non-JSON return values and output-limit failures are errors. Defaults are 30 seconds and 16 MiB of combined stdout/stderr; `.timeout(...)` accepts whole milliseconds from 1 to 2,147,483,647, and `.max_output_bytes(...)` accepts 1 byte to 256 MiB. Logs are bounded, collected even without a callback, and never silently truncated. Dropping a pending future sends best-effort cancellation on its Tokio runtime; the server deadline remains the fallback if that runtime is gone.
+
+Worker tasks finish when their Node event loop and output pipes finish. Main-thread tasks finish when their async body settles, so await their asynchronous work; task-owned timers are then cleared. Main-thread exit handling is task-scoped, and cancellation is cooperative: it cannot preempt synchronous infinite JavaScript. These are trusted Rust-side execution APIs, not a JavaScript sandbox or a renderer endpoint; Electron tasks share application globals. The connected process must have reached `app.whenReady()` before using Electron APIs, as the bundled bridge does.
+
 ## Build options
 
 Call `build()` in a build script. It resolves the output once, prepares any changes privately, and returns the published paths. Both `binary()` and `directory()` return `Result<PathBuf, Error>` and resolve using the current environment without changing files. Prefer the returned `PreparedDistribution` when reusing the result of a particular build.

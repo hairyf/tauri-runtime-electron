@@ -136,6 +136,67 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
   );
   expect(main, "document.title", json!("/opener"));
   security(main);
+  tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .expect("async consumer bridge runtime")
+    .block_on(async {
+      tokio::time::timeout(WAIT, async {
+        let webview: &tauri::Webview<ElectronRuntime> = main.as_ref();
+        let bridge = tauri_runtime_electron::main_bridge(webview)
+          .await.expect("resolve existing Electron client through the Tauri UI route");
+        let electron = bridge.electron_in_main(
+          "const {isMainThread,threadId}=require('node:worker_threads');return {pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId};", &[],
+        ).timeout(WAIT).await.expect("execute on actual Electron main");
+        let node = bridge.node_in_main(
+          "const {isMainThread,threadId}=require('node:worker_threads');return {pid:process.pid,isMainThread,threadId};", &[],
+        ).timeout(WAIT).await.expect("execute on actual Node worker");
+        assert_eq!(electron.code, 0);
+        assert_eq!(node.code, 0);
+        assert!(electron.result["pid"].as_u64().unwrap() > 0);
+        assert_eq!(electron.result["ready"], true);
+        assert_eq!(electron.result["isMainThread"], true);
+        assert_eq!(electron.result["threadId"], 0);
+        assert_eq!(node.result["pid"], electron.result["pid"]);
+        assert_eq!(node.result["isMainThread"], false);
+        assert!(node.result["threadId"].as_u64().unwrap() > 0);
+        use std::{future::IntoFuture as _, sync::atomic::{AtomicBool, Ordering}};
+        for electron_mode in [false, true] {
+          let script = "process.stdout.write(Buffer.from([0,255,195]));await new Promise(resolve=>setTimeout(resolve,1000));process.stderr.write(Buffer.from([128,10]));return {done:true};";
+          let command = if electron_mode { bridge.electron_in_main(script, &[]) }
+            else { bridge.node_in_main(script, &[]) };
+          let first = Arc::new(AtomicBool::new(false));
+          let observed = Arc::clone(&first);
+          let (chunks, received) = mpsc::channel();
+          let mut pending = command.timeout(WAIT).max_output_bytes(64).on_output(move |chunk| {
+            chunks.send(chunk).unwrap();
+            observed.store(true, Ordering::SeqCst);
+          }).into_future();
+          tokio::select! {
+            biased;
+            result = &mut pending => panic!("command completed before live chunk: {result:?}"),
+            _ = async {
+              while !first.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+              }
+            } => {}
+          }
+          let output = pending.await.expect("collect real streamed command");
+          assert_eq!(output.code, 0);
+          assert_eq!(output.stdout, [0, 255, 195]);
+          assert_eq!(output.stderr, [128, 10]);
+          assert_eq!(output.result, json!({"done":true}));
+          let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+          for (sequence, chunk) in received.try_iter().enumerate() {
+            assert_eq!(chunk.sequence, sequence as u64);
+            if chunk.stream == electron_rs::OutputStream::Stdout { stdout.extend(chunk.data); }
+            else { stderr.extend(chunk.data); }
+          }
+          assert_eq!(stdout, output.stdout);
+          assert_eq!(stderr, output.stderr);
+        }
+      }).await.expect("Tauri consumer bridge check timed out");
+    });
   let calls: Arc<Mutex<Vec<String>>> = Default::default();
   let observed = calls.clone();
   let child_calls: Arc<Mutex<Vec<String>>> = Default::default();

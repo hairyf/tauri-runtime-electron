@@ -16,7 +16,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use crate::Error;
+use crate::{command::{CommandRoute, Mode}, Error};
 
 const EVENT_CAPACITY: usize = 1024;
 
@@ -67,7 +67,7 @@ fn call(electron: &Electron, method: &'static str, params: Value, timeout: Durat
   tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(electron.call(request))
 }
 
-type PendingSender = (String, oneshot::Sender<RpcResult>);
+type PendingSender = (String, Option<String>, oneshot::Sender<RpcResult>);
 
 struct Subscribers {
   initial: Option<SyncSender<Event>>,
@@ -81,6 +81,7 @@ pub struct Electron {
   writer_order: Arc<tokio::sync::Mutex<()>>,
   shutdown_stream: TcpStream,
   pending: Mutex<HashMap<u64, PendingSender>>,
+  command_routes: Mutex<HashMap<String, CommandRoute>>,
   events: Mutex<Option<Receiver<Event>>>,
   subscribers: Mutex<Subscribers>,
   next_id: AtomicU64,
@@ -262,6 +263,7 @@ impl Electron {
       writer_order: Arc::new(tokio::sync::Mutex::new(())),
       shutdown_stream,
       pending: Mutex::new(HashMap::new()),
+      command_routes: Mutex::new(HashMap::new()),
       events: Mutex::new(Some(event_rx)),
       subscribers: Mutex::new(Subscribers {
         initial: Some(event_tx),
@@ -348,6 +350,7 @@ impl Electron {
   ) -> RpcResult {
     let started = Instant::now();
     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    let command_task = if method == "command.execute" { params["taskId"].as_str().map(str::to_owned) } else { None };
     let mut request = json!({"id": id, "method": method, "params": params});
     if deferred { request["asynchronous"] = json!(true); }
     if notification { request["notification"] = json!(true); }
@@ -364,7 +367,7 @@ impl Electron {
     {
       let mut pending = self.pending.lock().map_err(|_| "pending lock poisoned")?;
       if self.closed.load(Ordering::SeqCst) { return Err(Error::ChannelDisconnected); }
-      pending.insert(id, (method.to_owned(), sender));
+      pending.insert(id, (method.to_owned(), command_task, sender));
     }
     let guard = PendingGuard { electron: self, id };
     if let Err(error) = self.write_line(line, deadline).await {
@@ -402,7 +405,58 @@ impl Electron {
   /// Nonzero exits return `Ok(Output)`, preserving status, stdout, and stderr.
   /// Only process creation or output collection failures return an I/O error.
   pub fn node(&self, args: &[&str]) -> io::Result<std::process::Output> {
-    crate::run_node(&self.binary, args)
+    crate::node(&self.binary, args)
+  }
+
+  /// Run this binary in Electron mode in a separate process, without an RPC bridge.
+  /// Clears `ELECTRON_RUN_AS_NODE`; nonzero exits return `Ok(Output)`.
+  pub fn electron(&self, args: &[&str]) -> io::Result<std::process::Output> {
+    crate::electron(&self.binary, args)
+  }
+
+  /// Run an owned async source body in this connection's shared main process.
+  /// The body receives `args` and `signal`; await the builder to execute it.
+  pub fn node_in_main(self: &Arc<Self>, script: &str, args: &[&str]) -> crate::Command {
+    crate::Command::new(Arc::clone(self), Mode::Node, script, args)
+  }
+
+  /// Run an owned async source body with Electron access in the shared main process.
+  /// The body receives `args` and `signal`; await the builder to execute it.
+  pub fn electron_in_main(self: &Arc<Self>, script: &str, args: &[&str]) -> crate::Command {
+    crate::Command::new(Arc::clone(self), Mode::Electron, script, args)
+  }
+
+  pub(crate) fn command_task_id(&self) -> Result<String, Error> {
+    let id = self.next_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+      .map_err(|_| Error::from("command task ID space exhausted"))?;
+    Ok(format!("command-{id}"))
+  }
+
+  pub(crate) fn register_command(&self, task_id: String, route: CommandRoute) -> Result<(), Error> {
+    let mut routes = self.command_routes.lock().map_err(|_| "command routes lock poisoned")?;
+    if self.closed.load(Ordering::SeqCst) { return Err(Error::ChannelDisconnected); }
+    match routes.entry(task_id) {
+      std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(route); Ok(()) }
+      std::collections::hash_map::Entry::Occupied(_) => Err("duplicate command task ID".into()),
+    }
+  }
+
+  pub(crate) fn remove_command(&self, task_id: &str) {
+    self.command_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(task_id);
+  }
+
+  fn command_output(&self, params: Value) {
+    let mut routes = self.command_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(task_id) = params["taskId"].as_str().map(str::to_owned) else {
+      for (_, mut route) in routes.drain() {
+        route.fail(Error::Rpc { method: "command.execute".into(), message: "command.output missing string taskId".into() });
+      }
+      return;
+    };
+    // Unknown IDs are late output from cancelled/completed commands, never events.
+    if let Some(route) = routes.get_mut(&task_id) {
+      if !route.dispatch(params) { routes.remove(&task_id); }
+    }
   }
 
   /// Close IPC, wake pending calls, close subscriptions, and terminate/reap Electron.
@@ -452,8 +506,11 @@ impl Electron {
     if self.closed.swap(true, Ordering::SeqCst) {
       return;
     }
+    for (_, mut route) in self.command_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain() {
+      route.fail(Error::ChannelDisconnected);
+    }
     let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-    for (_, (_, sender)) in pending { let _ = sender.send(Err(Error::ChannelDisconnected)); }
+    for (_, (_, _, sender)) in pending { let _ = sender.send(Err(Error::ChannelDisconnected)); }
     let mut subscribers = self
       .subscribers
       .lock()
@@ -469,11 +526,15 @@ impl Electron {
   }
 
   fn dispatch(&self, message: Value) {
+    if message["event"] == "command.output" || message["method"] == "command.output" {
+      self.command_output(message.get("params").cloned().unwrap_or(Value::Null));
+      return;
+    }
     let Some(id) = message["id"].as_u64() else {
       self.publish(message);
       return;
     };
-    let Some((method, waiter)) = self
+    let Some((method, command_task, waiter)) = self
       .pending
       .lock()
       .ok()
@@ -481,6 +542,9 @@ impl Electron {
     else {
       return;
     };
+    // The wire guarantees output is flushed before this reply. Closing the
+    // route now seals its queue and prevents a later disconnect overriding it.
+    if let Some(task_id) = command_task { self.remove_command(&task_id); }
     let result = message["error"].as_str().map_or_else(
       || Ok(message.get("result").cloned().unwrap_or(Value::Null)),
       |error| Err(Error::Rpc { method, message: error.into() }),
@@ -692,6 +756,7 @@ mod tests {
       writer_order: Arc::new(tokio::sync::Mutex::new(())),
       shutdown_stream: reader.get_ref().try_clone().unwrap(),
       pending: Mutex::new(HashMap::new()),
+      command_routes: Mutex::new(HashMap::new()),
       events: Mutex::new(Some(receiver)),
       subscribers: Mutex::new(Subscribers {
         initial: Some(sender),
@@ -703,6 +768,166 @@ mod tests {
       version,
     });
     (electron, peer, reader)
+  }
+
+  #[tokio::test]
+  async fn shared_main_streams_owned_bytes_before_completion_and_survives_final_disconnect() {
+    use std::future::IntoFuture as _;
+    let (electron, peer, reader) = loopback(READY);
+    electron.start_reader(reader).unwrap();
+    let events = electron.events().unwrap();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      let mut line = String::new();
+      reader.read_line(&mut line).unwrap();
+      let request: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(request["method"], "command.execute");
+      let params = &request["params"];
+      assert!(params["taskId"].is_string());
+      assert_eq!(params["mode"], "node");
+      assert_eq!(params["script"], "return args[0]");
+      assert_eq!(params["args"], json!(["owned argument"]));
+      assert_eq!(params["timeoutMs"], 30_000);
+      assert_eq!(params["maxOutputBytes"], 16 * 1024 * 1024);
+      assert_eq!(params["stream"], true);
+      writeln!(reader.get_mut(), "{}", json!({"event":"command.output","params":{
+        "taskId":params["taskId"],"chunks":[
+          {"sequence":0,"stream":"stdout","data":"AP8="},
+          {"sequence":1,"stream":"stderr","data":"gA=="},
+          {"sequence":2,"stream":"stdout","data":"YQ=="}
+        ]
+      }})).unwrap();
+      writeln!(reader.get_mut(), "{}", json!({"id":request["id"],"result":{
+        "code":23,"stdout":"AP9h","stderr":"gA==","result":{"answer":42}
+      }})).unwrap();
+      reader.get_ref().shutdown(Shutdown::Both).unwrap();
+    });
+    let command = {
+      let script = String::from("return args[0]");
+      let arg = String::from("owned argument");
+      electron.node_in_main(&script, &[&arg])
+    };
+    let (chunks, received) = mpsc::channel();
+    let future = command.on_output(move |chunk| chunks.send(chunk).unwrap()).into_future();
+    fn assert_send_static<T: Send + 'static>(_: &T) {}
+    assert_send_static(&future);
+    let output = future.await.unwrap();
+    peer.join().unwrap();
+    let received: Vec<_> = received.try_iter().collect();
+    assert_eq!(received.iter().map(|chunk| chunk.sequence).collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(received[0].data, [0, 255]);
+    assert_eq!(output.stdout, [0, 255, b'a']);
+    assert_eq!(output.stderr, [128]);
+    assert_eq!(output.result, json!({"answer":42}));
+    assert_eq!(output.code, 23);
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    assert!(events.try_iter().all(|event| event["event"] == "ipc.closed"));
+  }
+
+  #[test]
+  fn command_output_bypasses_all_generic_event_queues_even_after_cancellation() {
+    let (electron, _peer, _reader) = loopback(READY);
+    let events = electron.events().unwrap();
+    let subscriber = electron.subscribe();
+    for _ in 0..EVENT_CAPACITY + 1 {
+      for envelope in ["event", "method"] {
+        let mut event = json!({"params":{"taskId":"cancelled-command","chunks":[]}});
+        event[envelope] = json!("command.output");
+        electron.dispatch(event);
+      }
+    }
+    assert!(events.try_recv().is_err());
+    assert!(subscriber.try_recv().is_err());
+    assert!(!electron.closed.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn dropping_pending_command_removes_routes_and_posts_typed_cancel() {
+    use std::future::IntoFuture as _;
+    let (electron, peer, reader) = loopback(READY);
+    electron.start_reader(reader).unwrap();
+    let (executed, received) = oneshot::channel();
+    let (cancelled, cancellation) = oneshot::channel();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      let mut line = String::new();
+      reader.read_line(&mut line).unwrap();
+      let request: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(request["method"], "command.execute");
+      assert_eq!(request["params"]["mode"], "electron");
+      assert_eq!(request["params"]["stream"], false);
+      assert_eq!(request["params"]["timeoutMs"], 1000);
+      assert_eq!(request["params"]["maxOutputBytes"], 32);
+      executed.send(()).unwrap();
+      line.clear();
+      reader.read_line(&mut line).unwrap();
+      let cancel: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(cancel["method"], "command.cancel");
+      assert_eq!(cancel["notification"], true);
+      assert_eq!(cancel["params"]["taskId"], request["params"]["taskId"]);
+      cancelled.send(()).unwrap();
+      reader
+    });
+    let future = electron.electron_in_main("await new Promise(() => {})", &[])
+      .timeout(Duration::from_secs(1)).max_output_bytes(32).into_future();
+    let mut future = Box::pin(future);
+    tokio::select! {
+      result = &mut future => panic!("command unexpectedly completed: {result:?}"),
+      received = received => received.unwrap(),
+    }
+    assert_eq!(electron.command_routes.lock().unwrap().len(), 1);
+    drop(future);
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    assert!(electron.pending.lock().unwrap().is_empty());
+    tokio::time::timeout(WAIT, cancellation).await.unwrap().unwrap();
+    let _peer = peer.join().unwrap();
+  }
+
+  #[tokio::test]
+  async fn shared_main_validates_limits_and_rejects_incomplete_streams() {
+    let (electron, peer, reader) = loopback(READY);
+    assert!(electron.node_in_main("", &[]).timeout(Duration::ZERO).await.is_err());
+    assert!(electron.node_in_main("", &[]).max_output_bytes(0).await.is_err());
+    assert!(electron.node_in_main("", &[]).max_output_bytes(256 * 1024 * 1024 + 1).await.is_err());
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    electron.start_reader(reader).unwrap();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      let mut line = String::new();
+      reader.read_line(&mut line).unwrap();
+      let request: Value = serde_json::from_str(&line).unwrap();
+      writeln!(reader.get_mut(), "{}", json!({"id":request["id"],"result":{
+        "code":0,"stdout":"YQ==","stderr":"","result":null
+      }})).unwrap();
+      line.clear();
+      reader.read_line(&mut line).unwrap();
+      let cancel: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(cancel["method"], "command.cancel");
+      assert_eq!(cancel["params"]["taskId"], request["params"]["taskId"]);
+      reader
+    });
+    let error = electron.node_in_main("", &[]).on_output(|_| {}).await.unwrap_err();
+    assert!(error.to_string().contains("do not match"));
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    // Let the Drop guard's best-effort cancellation run on this current runtime.
+    while !peer.is_finished() { tokio::task::yield_now().await; }
+    let _peer = peer.join().unwrap();
+  }
+
+  #[tokio::test]
+  async fn command_disconnect_removes_routes_and_wakes_the_future() {
+    let (electron, peer, reader) = loopback(READY);
+    electron.start_reader(reader).unwrap();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      let mut line = String::new();
+      reader.read_line(&mut line).unwrap();
+      reader.get_ref().shutdown(Shutdown::Both).unwrap();
+    });
+    assert!(matches!(electron.node_in_main("", &[]).await, Err(Error::ChannelDisconnected)));
+    peer.join().unwrap();
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    assert!(electron.pending.lock().unwrap().is_empty());
   }
 
   #[tokio::test]
