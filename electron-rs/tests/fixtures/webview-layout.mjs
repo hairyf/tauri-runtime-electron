@@ -165,6 +165,7 @@ class Window extends EventEmitter {
     super()
     allWindows.push(this)
     this.options = options
+    this.visible = options.show !== false
     this.content = { x: -200, y: 100, width: options.width ?? 800, height: options.height ?? 600 }
     this.maximizable = options.maximizable ?? true
     this.minimizable = options.minimizable ?? true
@@ -248,6 +249,7 @@ const appkit = {
   isDecorated(handle) { return this.window(handle).appkitStyle?.decorated ?? true },
   setMaximizable(handle, enabled) { this.window(handle).nativeMaximizable = enabled },
   isMaximizable(handle) { return this.window(handle).nativeMaximizable !== false },
+  setTrafficLightPosition(handle, x, y) { (this.window(handle).nativeInsets ??= []).push({ x, y }) },
 }
 const context = vm.createContext({
   require: (name) => name === 'electron' ? {
@@ -603,6 +605,15 @@ switch (process.argv[2]) {
     break
   }
   case 'configuration': {
+    await call('window.create', { windowId: 36, deferShow: true, window: { focus: false } })
+    const deferred = inspect('state.windows.get(36)')
+    assert.equal(deferred.visible, false, 'deferred host must stay unmapped during native setup')
+    await call('window.ready', { windowId: 36 })
+    assert.equal(deferred.visible, true)
+    assert.equal(deferred.focused, false, 'native setup must preserve showInactive semantics')
+    await call('window.create', { windowId: 37, deferShow: true, window: { visible: false } })
+    await call('window.ready', { windowId: 37 })
+    assert.equal(inspect('state.windows.get(37).visible'), false)
     await call('window.create', { windowId: 30, title: 'ignored flat title', width: 999,
       window: { title: 'Nested window', width: 640, height: 480, acceptFirstMouse: true,
         backgroundColor: [10, 20, 30, 128], titleBarStyle: 'Overlay',
@@ -993,8 +1004,9 @@ switch (process.argv[2]) {
     inspect('app').focus = (options) => focus.push({ app: options })
     host.focus = () => focus.push('window')
     await call('window.focus', { windowId: 63 })
-    const trafficLights = []
-    host.setWindowButtonPosition = (position) => trafficLights.push(position)
+    assert.equal(host.options.titleBarStyle, 'default', 'AppKit styling must retain Electron constructor frame accounting')
+    const trafficLights = host.nativeInsets = []
+    host.setWindowButtonPosition = () => { throw new Error('Electron button proxy cannot implement Tauri native insets') }
     await call('window.trafficLight', { windowId: 63, x: 42, y: 34, physical: false })
     await call('window.trafficLight', { windowId: 63, x: 52, y: 44, physical: true })
     const initialTrafficLights = [...trafficLights]
@@ -1002,6 +1014,7 @@ switch (process.argv[2]) {
     assert.equal(host.nativeMaximizable, false)
     await call('window.titleBarStyle', { windowId: 63, style: 'Overlay' })
     assert.equal(host.appkitStyle.style, 'overlay')
+    assert.deepEqual(host.nativeInsets.at(-1), { x: 26, y: 22 }, 'native insets survive titlebar restyling')
     assert.equal(host.nativeMaximizable, false)
     await call('window.resizable', { windowId: 63, resizable: true })
     assert.equal(host.nativeMaximizable, false)

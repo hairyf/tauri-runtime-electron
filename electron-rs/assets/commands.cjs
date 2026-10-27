@@ -52,6 +52,7 @@ function createCommandRouter(context) {
     emulateContentsTheme,
     setWindowTheme,
     createWindow,
+    showWindow,
     createChildWebview,
     rememberChildBounds,
     setChildBounds,
@@ -80,6 +81,11 @@ function createCommandRouter(context) {
     switch (method) {
       case 'window.create':
         return createWindow(params)
+      case 'window.ready': {
+        const window = findWindow(params.windowId)
+        showWindow(window, state.windowConfigs.get(window) ?? {})
+        return null
+      }
       case 'window.setTitle': {
         const window = state.windows.get(params.windowId)
         if (window) window.setTitle(params.title)
@@ -597,7 +603,7 @@ function createCommandRouter(context) {
   }
 
   return new CommandRouter([
-    new CommandStrategy('window', ["window.create","window.setTitle","window.geometry","window.size","window.position","window.minSize","window.maxSize","window.sizeConstraints","window.resizable","window.maximizable","window.minimizable","window.closable","window.maximize","window.unmaximize","window.minimize","window.unminimize","window.fullscreen","window.alwaysOnTop","window.cursor","window.setCursorIcon","window.setCursorVisible","window.setParentWindow","window.setMenu","window.skipTaskbar","window.focusable","window.contentProtected","window.center","window.requestAttention","window.show","window.hide","window.focus","window.nativeHandle","window.close","window.destroy","window.visibleOnAllWorkspaces","window.icon","window.enabled","window.enabledQuery","window.simpleFullscreen","window.progressBar","window.shadow","window.decorations","window.badgeCount","window.overlayIcon","window.backgroundColor","window.backgroundMaterial","window.theme","window.ignoreCursorEvents","window.themeQuery","window.displays","window.cursorPosition","window.currentDisplay","window.displayForPoint","window.trafficLight","window.titleBarStyle"], executeWindow),
+    new CommandStrategy('window', ["window.create","window.ready","window.setTitle","window.geometry","window.size","window.position","window.minSize","window.maxSize","window.sizeConstraints","window.resizable","window.maximizable","window.minimizable","window.closable","window.maximize","window.unmaximize","window.minimize","window.unminimize","window.fullscreen","window.alwaysOnTop","window.cursor","window.setCursorIcon","window.setCursorVisible","window.setParentWindow","window.setMenu","window.skipTaskbar","window.focusable","window.contentProtected","window.center","window.requestAttention","window.show","window.hide","window.focus","window.nativeHandle","window.close","window.destroy","window.visibleOnAllWorkspaces","window.icon","window.enabled","window.enabledQuery","window.simpleFullscreen","window.progressBar","window.shadow","window.decorations","window.badgeCount","window.overlayIcon","window.backgroundColor","window.backgroundMaterial","window.theme","window.ignoreCursorEvents","window.themeQuery","window.displays","window.cursorPosition","window.currentDisplay","window.displayForPoint","window.trafficLight","window.titleBarStyle"], executeWindow),
     new CommandStrategy('webview', ["webview.create","webview.url","webview.eval","webview.newWindowResponse","webview.navigationResponse","webview.downloadResponse","webview.permissionResponse","webview.navigate","webview.reload","webview.setAutoResize","webview.goBack","webview.canGoBack","webview.goForward","webview.canGoForward","webview.openDevtools","webview.closeDevtools","webview.isDevtoolsOpen","webview.setZoom","webview.reparent","webview.bounds","webview.setBounds","webview.visibility","webview.backgroundColor","webview.focus","webview.print","webview.close","webview.cookies","webview.setCookie","webview.deleteCookie","webview.clearBrowsingData"], executeWebview),
     new CommandStrategy('protocol', ["protocol.register","protocol.respond"], executeProtocol),
     new CommandStrategy('app', ["app.badgeLabel","app.focus","app.show","app.hide","app.activationPolicy","app.dockVisibility","app.theme"], executeApp),

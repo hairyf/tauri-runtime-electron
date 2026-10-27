@@ -460,6 +460,9 @@ function setWindowBackgroundColor(window, color) {
 
 /** @returns {import('electron').BaseWindowConstructorOptions['titleBarStyle']} */
 function titleBarStyleOf(config) {
+  // Electron caches has_frame at construction. AppKit applies Tauri's styles
+  // afterwards without opting into Electron's frameless button proxy.
+  if (process.platform === 'darwin') return 'default'
   const style = String(config.titleBarStyle ?? 'visible').toLowerCase()
   if (config.hiddenTitle || config.titleBarHidden || style === 'transparent') return 'hidden'
   return style === 'overlay' ? 'hiddenInset' : 'default'
@@ -489,11 +492,9 @@ function applyMaximizable(window) {
 }
 
 function setTrafficLights(window, position) {
-  if (typeof window.setWindowButtonPosition === 'function') {
-    // Electron retains this inset and reapplies it after AppKit relayouts.
-    window.setWindowButtonPosition(position)
-    state.windowConfigs.set(window, { ...state.windowConfigs.get(window), trafficLightPosition: position })
-  }
+  if (process.platform !== 'darwin') return
+  appKit().setTrafficLightPosition(window.getNativeWindowHandle(), position.x, position.y)
+  state.windowConfigs.set(window, { ...state.windowConfigs.get(window), trafficLightPosition: position })
 }
 
 function webviewConfig(config, webview = {}) {
@@ -870,12 +871,12 @@ function createWindow(params) {
         // and sandbox settings chosen before Chromium created it.
         const view = new WebContentsView({ webContents: guest, webPreferences: options.webPreferences })
         loadWebview(window, params.webview, view, false)
-        showWindow(window, config)
+        if (!params.deferShow) showWindow(window, config)
       },
     })
   } else {
     if (params.webview) loadWebview(window, params.webview, new WebContentsView({ webPreferences: options.webPreferences }))
-    showWindow(window, config)
+    if (!params.deferShow) showWindow(window, config)
   }
   return { windowId }
   } catch (error) {
@@ -1458,6 +1459,7 @@ const commandContext = {
   emulateContentsTheme,
   setWindowTheme,
   createWindow,
+  showWindow,
   createChildWebview,
   rememberChildBounds,
   setChildBounds,

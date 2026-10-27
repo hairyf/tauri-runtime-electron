@@ -1786,6 +1786,14 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
 
   // Build all fallible payload data before installing handlers or protocols.
   let mut payload = window_create_payload(&window_builder, serial, &label)?;
+  #[cfg(target_os = "linux")]
+  let defer_show = !window_builder.config.closable
+    && window_builder.config.visible
+    && new_window_request.is_none();
+  #[cfg(target_os = "linux")]
+  if defer_show {
+    payload["deferShow"] = json!(true);
+  }
   if let Some(request) = new_window_request {
     payload["newWindowRequest"] = json!(request);
   }
@@ -1859,6 +1867,10 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       let window = context.x11_window(id)?;
       crate::platform::linux_window::set_closable(window, false)
         .map_err(create_window_err)?;
+      if defer_show {
+        context.ipc.call("window.ready", json!({ "windowId": serial }), IPC_TIMEOUT)
+          .map_err(|error| create_window_err(error.to_string()))?;
+      }
     }
     #[cfg(windows)]
     if window_builder.owner.is_some() || window_builder.parent.is_some()

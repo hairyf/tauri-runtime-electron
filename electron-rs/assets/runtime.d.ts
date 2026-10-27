@@ -5,6 +5,7 @@ export interface AppKit {
   isDecorated(handle: Buffer): boolean
   setMaximizable(handle: Buffer, enabled: boolean): void
   isMaximizable(handle: Buffer): boolean
+  setTrafficLightPosition(handle: Buffer, x: number, y: number): void
 }
 
 export interface IpcFetchRequest {

@@ -2,6 +2,43 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <cmath>
+#import <objc/runtime.h>
+
+// AppKit relayouts native caption controls after title/size/fullscreen changes.
+// Retain the inset with the owning window; notifications never retain the window.
+@interface DSHWindowButtonInset : NSObject
+@property(nonatomic, weak) NSWindow* window;
+@property(nonatomic) NSPoint inset;
+- (void)apply;
+@end
+
+@implementation DSHWindowButtonInset
+- (void)apply {
+  NSWindow* window = self.window;
+  NSButton* close = [window standardWindowButton:NSWindowCloseButton];
+  NSButton* mini = [window standardWindowButton:NSWindowMiniaturizeButton];
+  NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
+  NSView* container = close.superview.superview;
+  if (!window || window.styleMask & NSWindowStyleMaskFullScreen || !close || !mini || !zoom || !container) return;
+  // Match Tao's logical-coordinate inset of the actual standard NSButtons.
+  NSRect frame = container.frame;
+  frame.size.height = close.frame.size.height + self.inset.y;
+  frame.origin.y = window.frame.size.height - frame.size.height;
+  if (!NSEqualRects(container.frame, frame)) container.frame = frame;
+  CGFloat spacing = mini.frame.origin.x - close.frame.origin.x;
+  NSButton* buttons[] = { close, mini, zoom };
+  for (int i = 0; i < 3; ++i) {
+    NSPoint origin = buttons[i].frame.origin;
+    origin.x = self.inset.x + i * spacing;
+    if (!NSEqualPoints(buttons[i].frame.origin, origin)) [buttons[i] setFrameOrigin:origin];
+  }
+}
+- (void)layoutChanged:(NSNotification*)notification { [self apply]; }
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+@end
+
+static char buttonInsetKey;
 
 // Stable Node-API ABI; no Electron/V8 headers or renderer access is required.
 extern "C" {
@@ -142,6 +179,36 @@ napi_value is_maximizable(napi_env env, napi_callback_info info) {
   } @catch (NSException* exception) { return fail(env, exception.reason.UTF8String); }
 }
 
+napi_value set_traffic_light_position(napi_env env, napi_callback_info info) {
+  napi_value args[3];
+  double x = 0, y = 0;
+  if (!args_for(env, info, 3, args)
+      || napi_get_value_double(env, args[1], &x) != 0
+      || napi_get_value_double(env, args[2], &y) != 0
+      || !std::isfinite(x) || !std::isfinite(y)) {
+    return fail(env, "setTrafficLightPosition expects a native handle and finite logical coordinates");
+  }
+  NSWindow* window = window_for_view(env, args[0]);
+  if (!window) return nullptr;
+  @try {
+    NSButton* close = [window standardWindowButton:NSWindowCloseButton];
+    if (!close || !close.superview.superview) return fail(env, "native titlebar controls are unavailable");
+    DSHWindowButtonInset* layout = objc_getAssociatedObject(window, &buttonInsetKey);
+    if (!layout) {
+      layout = [DSHWindowButtonInset new];
+      layout.window = window;
+      objc_setAssociatedObject(window, &buttonInsetKey, layout, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+      for (NSNotificationName name in @[NSWindowDidResizeNotification, NSWindowDidUpdateNotification,
+          NSWindowDidExitFullScreenNotification]) {
+        [NSNotificationCenter.defaultCenter addObserver:layout selector:@selector(layoutChanged:) name:name object:window];
+      }
+    }
+    layout.inset = NSMakePoint(x, y);
+    [layout apply];
+    return done(env);
+  } @catch (NSException* exception) { return fail(env, exception.reason.UTF8String); }
+}
+
 napi_value is_decorated(napi_env env, napi_callback_info info) {
   napi_value args[1], result = nullptr;
   if (!args_for(env, info, 1, args)) return fail(env, "isDecorated expects a native window handle");
@@ -156,9 +223,9 @@ napi_value is_decorated(napi_env env, napi_callback_info info) {
 } // namespace
 
 extern "C" __attribute__((visibility("default"))) napi_value napi_register_module_v1(napi_env env, napi_value exports) {
-  const char* names[] = { "configureStyle", "isDecorated", "setMaximizable", "isMaximizable" };
-  napi_callback callbacks[] = { configure_style, is_decorated, set_maximizable, is_maximizable };
-  for (int i = 0; i < 4; ++i) {
+  const char* names[] = { "configureStyle", "isDecorated", "setMaximizable", "isMaximizable", "setTrafficLightPosition" };
+  napi_callback callbacks[] = { configure_style, is_decorated, set_maximizable, is_maximizable, set_traffic_light_position };
+  for (int i = 0; i < 5; ++i) {
     napi_value function = nullptr;
     if (napi_create_function(env, names[i], static_cast<size_t>(-1), callbacks[i], nullptr, &function) != 0
         || napi_set_named_property(env, exports, names[i], function) != 0) return nullptr;

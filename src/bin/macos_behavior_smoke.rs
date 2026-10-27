@@ -481,6 +481,7 @@ int main(int argc, const char **argv) {
   }
   fn inset(window: &Value) -> Check<f64> { Ok(numbers(&window["content"])?[1] - numbers(&window["frame"])?[1]) }
   fn controls_shift(before: &Value, after: &Value, x: f64, y: f64) -> Check {
+    eprintln!("native caption delta want ({x}, {y}): before={before}, after={after}");
     let a = numbers(&before["frame"])?;
     let b = numbers(&after["frame"])?;
     for index in 0..3 {
@@ -515,6 +516,7 @@ int main(int argc, const char **argv) {
             let transparent = caption(observer, "title-transparent")?;
             let _overlay = make("title-overlay", builder("title-overlay").title_bar_style(TitleBarStyle::Overlay).hidden_title(false))?;
             let overlay = caption(observer, "title-overlay")?;
+            eprintln!("native titlebar layouts: visible={normal}, transparent={transparent}, overlay={overlay}");
             for state in [&normal, &transparent, &overlay] {
               for index in 0..3 { numbers(&state["buttons"][index])?; }
             }
