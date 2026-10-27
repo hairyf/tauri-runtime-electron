@@ -1,5 +1,32 @@
 # 官方案例与多平台 CI 验收
 
+## 当前逐成员结果
+
+提交 `4fb041d9854a3a2f7a4051f83df530c74082ef8c` 的 [CI 40483922198 / attempt 1](https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1) 已完成，8 个作业全部成功。三平台各 9 个真实 Electron 套件全部返回 0，27 份原始日志的行为 marker 与结果 JSON 逐项一致。
+
+| 范围 | 通过 / 官方适用成员 |
+| --- | --- |
+| Windows | 146/169（86.4%） |
+| macOS | 152/181（84.0%） |
+| Linux（X11） | 136/158（86.1%） |
+| 全部适用平台均通过 | **154/192（80.2%）** |
+
+剩余 38 个官方成员尚未完整验证，不计支持；5 个 Electron 扩展独立三平台通过，不补官方分母。用途、各平台结果及具体断言见 [逐成员表](coverage.md)，可重现输入见 [27 份证据快照](coverage-evidence.json)。原始日志下载：[Windows](https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/artifacts/12724930913)、[macOS](https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/artifacts/12723918135)、[Linux](https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/artifacts/12724013281)。
+
+本次还通过三平台桥接回归、真实 TypeScript 检查及六个官方案例功能检查；Windows 另检查透明窗口案例。官方进程内 opener、GTK/AppKit/WebView 原生互操作、Wayland、安装态集成和截图目视结论仍有各自边界。以上证据只属于所列提交，不自动证明后续修改。
+
+复核本轮结果：
+
+```bash
+node tests/checks/coverage.mjs --evidence <下载的证据目录> --commit 4fb041d9854a3a2f7a4051f83df530c74082ef8c --run 40483922198/1 --require-platforms --require-suites --min-percent 80
+```
+
+不带 `--evidence` 时，文档生成器读取已提交快照；实时 CI 始终显式传入本轮 SHA、attempt 和原始证据，不继承快照通过项。
+
+## 历史案例记录
+
+以下保留旧轮次的案例和目视记录，不作为当前逐成员分数来源。
+
 CI 验证提交：`26c17a9008edfcb83b0679cb50224b5eb5c7523b`。本报告记录已有证据和限制，不把 CI 绿灯解释为全部能力覆盖。
 
 [GitHub Actions 39858533463](https://github.com/hairyf/tauri-runtime-electron/actions/runs/39858533463) 已完成，五个作业全部成功，工作区和两个源码子仓库均无未提交修改。

@@ -14,6 +14,7 @@ const TAURI = 'source/tauri/crates'
 const RUNTIME_LIB = `${TAURI}/tauri-runtime/src/lib.rs`
 const WRY_LIB = `${TAURI}/tauri-runtime-wry/src/lib.rs`
 const DOC = 'docs/coverage.md'
+const SNAPSHOT = 'docs/coverage-evidence.json'
 
 const targets = [
   { trait: 'WindowDispatch', file: 'src/window.rs' },
@@ -302,7 +303,7 @@ const limitations = {
   default_vbox: '无本地 GTK 控件树；返回错误不算功能通过',
   with_webview: '报错且不调用回调，不算功能通过',
   set_device_event_filter: '本库仅警告；Windows 仍留在分母',
-  set_cursor_position: 'Linux 仅警告，不得改为平台 N/A',
+  set_cursor_position: 'Linux 仅 X11；Wayland 明确报错，X11 坐标限有符号 16 位',
   reparent: '迁移原生视图及 Rust 所属关系；需保留页面状态、IPC 和父窗销毁语义',
   fetch_data_store_identifiers: '本库报错且不回调',
   remove_data_store: '本库报错且不回调',
@@ -336,7 +337,7 @@ export function renderCoverage(evidence = aggregateEvidence(inventory, [])) {
   ].join('\n')
   return `# 桌面运行时逐成员验收
 
-由 \`node tests/checks/coverage.mjs --write\` 生成。用途说明官方契约；**源码连线、编译、负测和 setter 返回 Ok 均不算功能通过。**
+由 \`node tests/checks/coverage.mjs --write\` 生成。默认读取${link(SNAPSHOT, null, '已存档的 27 份 CI 套件记录')}，结果仅对应表内提交，不自动证明后续提交。用途说明官方契约；**源码连线、编译、负测和 setter 返回 Ok 均不算功能通过。**
 
 ## 口径与当前结果
 
@@ -376,9 +377,14 @@ export function main(args = process.argv.slice(2)) {
   }
   assert.ok(flags.slice(0, 3).filter(flag => options[flag]).length <= 1, 'choose write, check or md')
   assert.ok(!options['--evidence'] || !(options['--write'] || options['--check']), 'CI evidence reports use --md; checked-in docs stay deterministic')
-  const artifacts = options['--evidence'] ? readArtifacts(options['--evidence']) : []
-  if (options['--evidence']) assert.ok(artifacts.length, 'evidence directory has no result artifacts')
-  const evidence = aggregateEvidence(inventory, artifacts, { commit: options['--commit'], runId: options['--run'] })
+  const artifacts = options['--evidence'] ? readArtifacts(options['--evidence']) : JSON.parse(read(SNAPSHOT))
+  assert.ok(Array.isArray(artifacts) && artifacts.length, 'evidence has no result artifacts')
+  // The checked-in snapshot is historical; explicit CI input never inherits it.
+  if (!options['--evidence']) requireSuites(artifacts)
+  const evidence = aggregateEvidence(inventory, artifacts, {
+    commit: options['--commit'] ?? (!options['--evidence'] ? artifacts[0].commit : undefined),
+    runId: options['--run'] ?? (!options['--evidence'] ? artifacts[0].run.id : undefined),
+  })
   if (options['--require-suites']) requireSuites(artifacts)
   if (options['--require-platforms']) {
     assert.deepEqual([...evidence.platforms].sort(), [...PLATFORMS].sort(), 'missing Windows/macOS/Linux runtime artifacts')

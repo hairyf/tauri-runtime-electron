@@ -187,8 +187,10 @@ try {
 
 if (existsSync(new URL('../../source/tauri/crates/tauri-runtime/src/lib.rs', import.meta.url))) {
   const { definitions, inventory: desktop, renderCoverage, main } = await import('./coverage.mjs')
-  assert.throws(() => main(['--require-platforms']), /missing Windows\/macOS\/Linux/)
-  assert.throws(() => main(['--require-suites']), /missing or duplicate suite/)
+  const published = spawnSync(process.execPath, [fileURLToPath(new URL('./coverage.mjs', import.meta.url)), '--require-platforms', '--require-suites', '--min-percent', '80'], { encoding: 'utf8' })
+  assert.equal(published.status, 0, published.stderr)
+  assert.match(published.stdout, /全部适用平台: 154\/192/)
+  assert.match(published.stdout, /Electron 扩展（独立）: 5\/5/)
   assert.throws(() => main(['--evidence', 'missing', '--write']), /stay deterministic/)
   assert.throws(() => main(['--evidence', '--commit']), /missing value/)
   assert.equal(definitions(`impl<T: UserEvent> RuntimeHandle<T> for Handle<T> {

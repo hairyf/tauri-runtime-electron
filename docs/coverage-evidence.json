@@ -1,0 +1,3934 @@
+[
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "desktop_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "run exits its isolated process with requested code 29 after Ready/ExitRequested/Exit",
+        "kind": "behavior",
+        "member": "Runtime::run",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "run exits its isolated process with requested code 29 after Ready/ExitRequested/Exit",
+        "kind": "behavior",
+        "member": "RuntimeHandle::request_exit",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a non-main thread initializes real Electron, receives its user event and returns the requested exit code",
+        "kind": "behavior",
+        "member": "Runtime::new_any_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::create_proxy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_proxy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "EventLoopProxy::send_event",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::run_iteration",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::available_monitors",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "Runtime::create_window",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "Runtime::create_webview",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "WindowBuilder::new",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a handle moved to a distinct worker schedules a callback on the recorded runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::handle",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a handle moved to a distinct worker schedules a callback on the recorded runtime thread",
+        "kind": "behavior",
+        "member": "RuntimeHandle::run_on_main_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a webview scheduled from a worker invokes its closure on the runtime thread",
+        "kind": "behavior",
+        "member": "WebviewDispatch::run_on_main_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle-created native child loads its own unique proof page",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_webview",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "closing the handle-created child makes it unevaluable while the independent root page remains alive",
+        "kind": "behavior",
+        "member": "WebviewDispatch::close",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "window-dispatch creation makes a separate native window and live proof page",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_window",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "destroy removes a live window and emits Destroyed despite an active close veto, without another CloseRequested",
+        "kind": "behavior",
+        "member": "WindowDispatch::destroy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::available_monitors",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "WindowDispatch::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "WindowDispatch::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::outer_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the actual outer-frame center matches the current monitor work-area center within 15 logical pixels",
+        "kind": "behavior",
+        "member": "WindowDispatch::center",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "setting the minimum clamps real content to 280x200; clearing it permits 190x150",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_min_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "setting maximum clamps actual content to 470x350; clearing it permits 520x390",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_max_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "mixed-axis logical minimum width and physical maximum height constrain actual content; clearing restores a 420x320 page viewport",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_size_constraints",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "enter/leave fullscreen changes native state, spans the actual monitor and restores the prior normal position and size",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "enter/leave fullscreen changes native state, spans the actual monitor and restores the prior normal position and size",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "fullscreen physically selects each of 1 available monitors and restores the prior normal frame on exit; outside all monitors changes neither state nor frame; cross-screen selection only exercised when more than one is present",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_fullscreen_on_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a window created by center() has its live frame centered in its monitor work area",
+        "kind": "behavior",
+        "member": "WindowBuilder::center",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an explicitly positioned new window starts at its requested logical-pixel location within 8 physical pixels",
+        "kind": "behavior",
+        "member": "WindowBuilder::position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::min_inner_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::max_inner_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::inner_size_constraints",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an oversized initial window is actually clamped inside the monitor work area, with the requested margin when enabled",
+        "kind": "behavior",
+        "member": "WindowBuilder::prevent_overflow",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an oversized initial window is actually clamped inside the monitor work area, with the requested margin when enabled",
+        "kind": "behavior",
+        "member": "WindowBuilder::prevent_overflow_with_margin",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::resizable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::title",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::visible",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the live new window is already topmost before calling a topmost dispatcher setter",
+        "kind": "behavior",
+        "member": "WindowBuilder::always_on_top",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the newly created native window is maximized before any maximize dispatcher call",
+        "kind": "behavior",
+        "member": "WindowBuilder::maximized",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the newly created native window is fullscreen and its actual outer frame spans the current monitor",
+        "kind": "behavior",
+        "member": "WindowBuilder::fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a focused(false) new window stays unfocused while a separate focused(true) new window acquires native focus",
+        "kind": "behavior",
+        "member": "WindowBuilder::focused",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowBuilder::focusable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_focusable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_focus",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two separately constructed theme(Light)/theme(Dark) windows produce false/true from the live page matchMedia prefers-color-scheme query",
+        "kind": "behavior",
+        "member": "WindowBuilder::theme",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "within real window creation has_icon changes false to true and get_theme changes None to Light to Dark; this does not assert native icon rendering",
+        "kind": "behavior",
+        "member": "WindowBuilder::has_icon",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "within real window creation has_icon changes false to true and get_theme changes None to Light to Dark; this does not assert native icon rendering",
+        "kind": "behavior",
+        "member": "WindowBuilder::get_theme",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "linux_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "returned Xlib XID has external _NET_WM_PID (nonzero and not the Rust process) and the unique Electron WM_NAME",
+        "kind": "behavior",
+        "member": "WindowDispatch::window_handle",
+        "status": "pass",
+        "test": "linux_behavior_smoke::native_x11"
+      },
+      {
+        "assertion": "independent xprop _NET_WM_ICON contains four 2x2 ARGB pixels matching the builder's red RGBA icon",
+        "kind": "behavior",
+        "member": "WindowBuilder::icon",
+        "status": "pass",
+        "test": "linux_behavior_smoke::native_x11"
+      },
+      {
+        "assertion": "after set_icon, independent xprop _NET_WM_ICON contains four 2x2 ARGB pixels matching the changed blue RGBA icon",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_icon",
+        "status": "pass",
+        "test": "linux_behavior_smoke::native_x11"
+      },
+      {
+        "assertion": "independent _NET_WM_DESKTOP follows current desktop, 0xFFFFFFFF, then current desktop after false/true/false",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_visible_on_all_workspaces",
+        "status": "pass",
+        "test": "linux_behavior_smoke::native_x11"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "new_window_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "默认 Allow、自定义 Allow/Create/Deny、真实 WindowProxy/opener、命名复用、跨源隔离与消息、noopener/noreferrer、POST/referrer、关闭及 opener 生命周期",
+        "kind": "behavior",
+        "member": "ElectronWebviewDispatcher::on_new_window",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      },
+      {
+        "assertion": "同请求接管 Chromium guest；过期 opener 拒绝，未重新导航目标页",
+        "kind": "behavior",
+        "member": "tauri_runtime_electron::with_opener",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      },
+      {
+        "assertion": "原生请求一次性令牌用于构建目标；尺寸333×222和位置40,50保持",
+        "kind": "behavior",
+        "member": "NewWindowFeatures::opener",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "rendering_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two fresh builder background_color calls produce distinct opaque RGB pixels on the actual desktop with their webviews hidden",
+        "kind": "behavior",
+        "member": "WindowBuilder::background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "two distinct dispatcher colors change actual native backing screen pixels; alpha-zero then reveals two changing lower-window colors; no getters/config echoes",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "transparent(true) reveals two changing lower-window colors through native alpha-zero backing; a fresh transparent(false) control does not follow both colors",
+        "kind": "behavior",
+        "member": "WindowBuilder::transparent",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "empty transparent target page shows two API-selected opaque colors, then alpha-zero exposes two controlled lower-window colors in native desktop pixels",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "the native bridge has no observable WebviewEvent source; lifecycle/RunEvent is not listener proof",
+        "kind": "behavior",
+        "member": "WebviewDispatch::on_webview_event",
+        "status": "unknown",
+        "test": "rendering_behavior_smoke::native_pixels"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "runtime_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "a worker-scheduled closure ran on the runtime UI ThreadId, changed/read the first real window title, and left the second window unchanged",
+        "kind": "behavior",
+        "member": "WindowDispatch::run_on_main_thread",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with decorations(false) and decorations(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::decorations",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with decorations(false) and decorations(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_decorated",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with closable(false) and closable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with closable(false) and closable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true requests disable/enable the real Electron window's native decorations button, observed outside Electron",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_decorations",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true reads agree with the independently observed native decorations button",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_decorated",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true requests disable/enable the real Electron window's native closable button, observed outside Electron",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true reads agree with the independently observed native closable button",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "registered listener receives two actual resize payloads and CloseRequested/Destroyed on the UI thread; veto preserves the real page, final Destroyed occurs once, and the peer listener/page stays isolated",
+        "kind": "behavior",
+        "member": "WindowDispatch::on_window_event",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "runtime-tests",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "create_window returned a webview whose real custom-protocol document title is smoke-page and emitted page-load Finished",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_window",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "live window title() == smoke-1 after set_title",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title",
+        "status": "pass",
+        "test": "smoke::title_checks"
+      },
+      {
+        "assertion": "live window title() == smoke-1 after set_title",
+        "kind": "behavior",
+        "member": "WindowDispatch::title",
+        "status": "pass",
+        "test": "smoke::title_checks"
+      },
+      {
+        "assertion": "live Electron geometry reports a finite scale factor greater than zero",
+        "kind": "behavior",
+        "member": "WindowDispatch::scale_factor",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "Electron screen.getDisplayMatching for the live window returns a monitor",
+        "kind": "behavior",
+        "member": "WindowDispatch::current_monitor",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "Electron screen.getAllDisplays returns a nonempty monitor list",
+        "kind": "behavior",
+        "member": "WindowDispatch::available_monitors",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+        "kind": "behavior",
+        "member": "WindowBuilder::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live content size matches set_size(420x320 logical pixels in physical units) within 8px",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live content size matches set_size(420x320 logical pixels in physical units) within 8px",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live outer frame size contains the live content size in both dimensions",
+        "kind": "behavior",
+        "member": "WindowDispatch::outer_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "with_config min_width=250/min_height=180 keeps the live outer frame above the scaled minimum after requesting 120x100 physical pixels",
+        "kind": "behavior",
+        "member": "WindowBuilder::with_config",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live isResizable reads false then true after set_resizable(false) then set_resizable(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_resizable",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isResizable reads false then true after set_resizable(false) then set_resizable(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_resizable",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_enabled",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_enabled",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live Electron isFocused reports true",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_focused",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state is true from creation config before the setter is called",
+        "kind": "behavior",
+        "member": "WindowBuilder::with_config",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state is true from creation config before the setter is called",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state changes false then true after set_always_on_top(false) then true",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state changes false then true after set_always_on_top(false) then true",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::maximize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::unmaximize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximized",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_theme",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))",
+        "kind": "behavior",
+        "member": "WindowDispatch::theme",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::minimize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::unminimize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimized",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::hide",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::show",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_visible",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "same-session child loads smoke-page, reads localStorage=a, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_webview",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "same-session child loads smoke-page, reads localStorage=a, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "other-session child loads smoke-page, reads localStorage=empty, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_webview",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "other-session child loads smoke-page, reads localStorage=empty, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "the real page evaluates 1 + 1 and invokes the callback with JSON 2",
+        "kind": "behavior",
+        "member": "WebviewDispatch::eval_script_with_callback",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "callback evaluation reads executed from the page global written by fire-and-forget eval_script",
+        "kind": "behavior",
+        "member": "WebviewDispatch::eval_script",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "url() and the real page location.href both equal the initial custom-protocol URL",
+        "kind": "behavior",
+        "member": "WebviewDispatch::url",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href",
+        "kind": "behavior",
+        "member": "WebviewDispatch::url",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::open_devtools",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::close_devtools",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::is_devtools_open",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "page devicePixelRatio doubles after set_zoom(2) and returns to its initial value after set_zoom(1)",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_zoom",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "page computed root cursor is pointer after set_cursor_icon(Hand)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_icon",
+        "status": "pass",
+        "test": "smoke::cursor_style_checks"
+      },
+      {
+        "assertion": "page computed cursor changes to none when hidden and returns to pointer when shown",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_visible",
+        "status": "pass",
+        "test": "smoke::cursor_style_checks"
+      },
+      {
+        "assertion": "title() == smoke-idle after set_title following 61 seconds of idle IPC",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "title() == smoke-idle after set_title following 61 seconds of idle IPC",
+        "kind": "behavior",
+        "member": "WindowDispatch::title",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "close emitted Destroyed and the last window caused the event loop to request exit",
+        "kind": "behavior",
+        "member": "WindowDispatch::close",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+        "kind": "behavior",
+        "member": "Runtime::new",
+        "status": "pass",
+        "test": "smoke::main"
+      },
+      {
+        "assertion": "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+        "kind": "behavior",
+        "member": "Runtime::run_return",
+        "status": "pass",
+        "test": "smoke::main"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "system_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two distinct real OS pointer movements are independently read by Win32/CoreGraphics/X11 and agree with this API's physical screen coordinates; original cursor restored",
+        "kind": "behavior",
+        "member": "Runtime::cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two independently loaded pages both switch dark/light matchMedia values and receive change events for opposite app-theme requests; system theme selection is restored",
+        "kind": "behavior",
+        "member": "Runtime::set_theme",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two independently loaded pages both switch dark/light matchMedia values and receive change events for opposite app-theme requests; system theme selection is restored",
+        "kind": "behavior",
+        "member": "RuntimeHandle::set_theme",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct real OS pointer movements are independently read by Win32/CoreGraphics/X11 and agree with this API's physical screen coordinates; original cursor restored",
+        "kind": "behavior",
+        "member": "RuntimeHandle::cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "physical and logical client offsets move the real OS pointer to two distinct expected screen points, confirmed independently rather than through IPC; original cursor restored",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "tauri_new_window_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "ordinary worker registration reaches native popup callback; UI-thread reentrant registration, Deny/Allow, native WindowProxy/opener, child policy isolation and close cleanup",
+        "kind": "behavior",
+        "member": "tauri_runtime_electron::on_new_window",
+        "status": "pass",
+        "test": "tauri_new_window_smoke::exercise"
+      },
+      {
+        "assertion": "ordinary WebviewWindowBuilder destination selected in UI callback and resolved from worker; original destination URL and before-page initializer preserved, native opener/message routing, unrelated target denied, remote IPC ACL denied and no Node globals",
+        "kind": "behavior",
+        "member": "NewWindowResponse::create",
+        "status": "pass",
+        "test": "tauri_new_window_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "linux",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "webview_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "native child bounds equal requested parent-relative rect and physical renderer viewport, not the host window rect",
+        "kind": "behavior",
+        "member": "WebviewDispatch::bounds",
+        "status": "pass",
+        "test": "webview_behavior_smoke::bounds"
+      },
+      {
+        "assertion": "child position is the requested parent-relative physical offset rather than the parent's screen position",
+        "kind": "behavior",
+        "member": "WebviewDispatch::position",
+        "status": "pass",
+        "test": "webview_behavior_smoke::position"
+      },
+      {
+        "assertion": "child native physical size corresponds to its real 240x160 renderer viewport",
+        "kind": "behavior",
+        "member": "WebviewDispatch::size",
+        "status": "pass",
+        "test": "webview_behavior_smoke::size"
+      },
+      {
+        "assertion": "changes native child rect to 40,50/280x180 and the renderer ResizeObserver observes the new viewport",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_bounds",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_bounds"
+      },
+      {
+        "assertion": "changes renderer viewport and ResizeObserver to 300x200 while preserving native child position",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_size",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_size"
+      },
+      {
+        "assertion": "physical child offset moves to logical 60,70 without resizing or replacing the renderer document",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_position",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_position"
+      },
+      {
+        "assertion": "HTTP load counter advances, renderer nonce changes and ephemeral JS state is gone after child reload",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reload",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reload"
+      },
+      {
+        "assertion": "focus moves from host page to native child, independently confirmed by both real documents' hasFocus()",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_focus",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_focus"
+      },
+      {
+        "assertion": "native child renderer becomes hidden and emits visibilitychange while its parent window/page remain visible",
+        "kind": "behavior",
+        "member": "WebviewDispatch::hide",
+        "status": "pass",
+        "test": "webview_behavior_smoke::hide"
+      },
+      {
+        "assertion": "previously hidden child renderer becomes visible and emits the second real visibilitychange event",
+        "kind": "behavior",
+        "member": "WebviewDispatch::show",
+        "status": "pass",
+        "test": "webview_behavior_smoke::show"
+      },
+      {
+        "assertion": "enabling scales child native position/edges, renderer viewport and ResizeObserver with the parent; disabling keeps them fixed on another parent resize",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_auto_resize",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_auto_resize"
+      },
+      {
+        "assertion": "reads HTTP-set HttpOnly /scope cookie for its matching URL and excludes it for /outside",
+        "kind": "behavior",
+        "member": "WebviewDispatch::cookies_for_url",
+        "status": "pass",
+        "test": "webview_behavior_smoke::cookies_for_url"
+      },
+      {
+        "assertion": "session enumeration contains both real HTTP HttpOnly and renderer-written cookies while document.cookie hides the HttpOnly one",
+        "kind": "behavior",
+        "member": "WebviewDispatch::cookies",
+        "status": "pass",
+        "test": "webview_behavior_smoke::cookies"
+      },
+      {
+        "assertion": "domainless runtime HttpOnly cookie is sent in a real child HTTP Cookie header but is not exposed to document.cookie",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_cookie",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_cookie"
+      },
+      {
+        "assertion": "selected runtime cookie disappears from real HTTP requests and cookie enumeration while both unrelated cookies remain",
+        "kind": "behavior",
+        "member": "WebviewDispatch::delete_cookie",
+        "status": "pass",
+        "test": "webview_behavior_smoke::delete_cookie"
+      },
+      {
+        "assertion": "clears seeded localStorage, IndexedDB and CacheStorage plus renderer/session cookies and the actual HTTP Cookie header in an isolated child session",
+        "kind": "behavior",
+        "member": "WebviewDispatch::clear_all_browsing_data",
+        "status": "pass",
+        "test": "webview_behavior_smoke::clear_all_browsing_data"
+      },
+      {
+        "assertion": "ordinary main webview retains physical bounds, document nonce, HTTP load number and nested JS state through same/other-parent migration; unknown target fails without damage; original Rust IPC and renderer survive old-parent destruction, new-parent destruction invalidates both bounds and evaluation",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reparent",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reparent_main"
+      },
+      {
+        "assertion": "real child keeps physical bounds, HTTP load counter, JS nonce and Rust IPC across native host migration; old-parent destruction leaves it alive, target destruction cleans it; same-parent succeeds and unknown-parent migration fails explicitly",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reparent",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reparent"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "desktop_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "run exits its isolated process with requested code 29 after Ready/ExitRequested/Exit",
+        "kind": "behavior",
+        "member": "Runtime::run",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "run exits its isolated process with requested code 29 after Ready/ExitRequested/Exit",
+        "kind": "behavior",
+        "member": "RuntimeHandle::request_exit",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::create_proxy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_proxy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "EventLoopProxy::send_event",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::run_iteration",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::available_monitors",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "Runtime::create_window",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "Runtime::create_webview",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "WindowBuilder::new",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a handle moved to a distinct worker schedules a callback on the recorded runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::handle",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a handle moved to a distinct worker schedules a callback on the recorded runtime thread",
+        "kind": "behavior",
+        "member": "RuntimeHandle::run_on_main_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a webview scheduled from a worker invokes its closure on the runtime thread",
+        "kind": "behavior",
+        "member": "WebviewDispatch::run_on_main_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle-created native child loads its own unique proof page",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_webview",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "closing the handle-created child makes it unevaluable while the independent root page remains alive",
+        "kind": "behavior",
+        "member": "WebviewDispatch::close",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "window-dispatch creation makes a separate native window and live proof page",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_window",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "destroy removes a live window and emits Destroyed despite an active close veto, without another CloseRequested",
+        "kind": "behavior",
+        "member": "WindowDispatch::destroy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::available_monitors",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "WindowDispatch::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "WindowDispatch::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::outer_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the actual outer-frame center matches the current monitor work-area center within 15 logical pixels",
+        "kind": "behavior",
+        "member": "WindowDispatch::center",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "setting the minimum clamps real content to 280x200; clearing it permits 190x150",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_min_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "setting maximum clamps actual content to 470x350; clearing it permits 520x390",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_max_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "mixed-axis logical minimum width and physical maximum height constrain actual content; clearing restores a 420x320 page viewport",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_size_constraints",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "enter/leave fullscreen changes native state, spans the actual monitor and restores the prior normal position and size",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "enter/leave fullscreen changes native state, spans the actual monitor and restores the prior normal position and size",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "fullscreen physically selects each of 1 available monitors and restores the prior normal frame on exit; outside all monitors changes neither state nor frame; cross-screen selection only exercised when more than one is present",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_fullscreen_on_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "simple fullscreen spans the monitor and restores the previous normal position and size on exit",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_simple_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a window created by center() has its live frame centered in its monitor work area",
+        "kind": "behavior",
+        "member": "WindowBuilder::center",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an explicitly positioned new window starts at its requested logical-pixel location within 8 physical pixels",
+        "kind": "behavior",
+        "member": "WindowBuilder::position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::min_inner_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::max_inner_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::inner_size_constraints",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an oversized initial window is actually clamped inside the monitor work area, with the requested margin when enabled",
+        "kind": "behavior",
+        "member": "WindowBuilder::prevent_overflow",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an oversized initial window is actually clamped inside the monitor work area, with the requested margin when enabled",
+        "kind": "behavior",
+        "member": "WindowBuilder::prevent_overflow_with_margin",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::resizable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::title",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::visible",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the live new window is already topmost before calling a topmost dispatcher setter",
+        "kind": "behavior",
+        "member": "WindowBuilder::always_on_top",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the newly created native window is maximized before any maximize dispatcher call",
+        "kind": "behavior",
+        "member": "WindowBuilder::maximized",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the newly created native window is fullscreen and its actual outer frame spans the current monitor",
+        "kind": "behavior",
+        "member": "WindowBuilder::fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a focused(false) new window stays unfocused while a separate focused(true) new window acquires native focus",
+        "kind": "behavior",
+        "member": "WindowBuilder::focused",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowBuilder::focusable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_focusable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_focus",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two separately constructed theme(Light)/theme(Dark) windows produce false/true from the live page matchMedia prefers-color-scheme query",
+        "kind": "behavior",
+        "member": "WindowBuilder::theme",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "within real window creation has_icon changes false to true and get_theme changes None to Light to Dark; this does not assert native icon rendering",
+        "kind": "behavior",
+        "member": "WindowBuilder::has_icon",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "within real window creation has_icon changes false to true and get_theme changes None to Light to Dark; this does not assert native icon rendering",
+        "kind": "behavior",
+        "member": "WindowBuilder::get_theme",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "macos_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "external NSRunningApplication reports Accessory, Prohibited and Regular after each mutation",
+        "kind": "behavior",
+        "member": "Runtime::set_activation_policy",
+        "status": "pass",
+        "test": "macos_behavior_smoke::activation_policy"
+      },
+      {
+        "assertion": "complete external Dock AX traversal observes the Electron bundle disappear and reappear after a stable positive baseline",
+        "kind": "behavior",
+        "member": "Runtime::set_dock_visibility",
+        "status": "pass",
+        "test": "macos_behavior_smoke::dock_visibility"
+      },
+      {
+        "assertion": "NSRunningApplication becomes hidden/inactive and both positively observed Electron CGWindowNumbers disappear",
+        "kind": "behavior",
+        "member": "Runtime::hide",
+        "status": "pass",
+        "test": "macos_behavior_smoke::app_hide"
+      },
+      {
+        "assertion": "the same two Electron CGWindowNumbers return, isHidden clears and Finder retains foreground ownership",
+        "kind": "behavior",
+        "member": "Runtime::show",
+        "status": "pass",
+        "test": "macos_behavior_smoke::app_show"
+      },
+      {
+        "assertion": "external NSRunningApplication reports Accessory, Prohibited and Regular after each mutation",
+        "kind": "behavior",
+        "member": "RuntimeHandle::set_activation_policy",
+        "status": "pass",
+        "test": "macos_behavior_smoke::activation_policy"
+      },
+      {
+        "assertion": "complete external Dock AX traversal observes the Electron bundle disappear and reappear after a stable positive baseline",
+        "kind": "behavior",
+        "member": "RuntimeHandle::set_dock_visibility",
+        "status": "pass",
+        "test": "macos_behavior_smoke::dock_visibility"
+      },
+      {
+        "assertion": "NSRunningApplication becomes hidden/inactive and both positively observed Electron CGWindowNumbers disappear",
+        "kind": "behavior",
+        "member": "RuntimeHandle::hide",
+        "status": "pass",
+        "test": "macos_behavior_smoke::app_hide"
+      },
+      {
+        "assertion": "the same two Electron CGWindowNumbers return, isHidden clears and Finder retains foreground ownership",
+        "kind": "behavior",
+        "member": "RuntimeHandle::show",
+        "status": "pass",
+        "test": "macos_behavior_smoke::app_show"
+      },
+      {
+        "assertion": "Visible/Transparent retain native AXWebArea caption inset; Overlay extends beneath the caption, with all three native controls retained",
+        "kind": "behavior",
+        "member": "WindowBuilder::title_bar_style",
+        "status": "pass",
+        "test": "macos_behavior_smoke::title_bar_style"
+      },
+      {
+        "assertion": "Transparent/Overlay/Transparent moves the same real AXWebArea below/under/below the caption while retaining all three native controls",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title_bar_style",
+        "status": "pass",
+        "test": "macos_behavior_smoke::dispatch_title_bar_style"
+      },
+      {
+        "assertion": "independent WindowServer caption pixels change for visible title A/B/A, stay unchanged for hidden title A/B/A, while native controls and content inset remain fixed",
+        "kind": "behavior",
+        "member": "WindowBuilder::hidden_title",
+        "status": "pass",
+        "test": "macos_behavior_smoke::hidden_title"
+      },
+      {
+        "assertion": "two fresh Overlay windows' three native AX control frames differ by the requested 26x16 logical delta",
+        "kind": "behavior",
+        "member": "WindowBuilder::traffic_light_position",
+        "status": "pass",
+        "test": "macos_behavior_smoke::builder_traffic_light_position"
+      },
+      {
+        "assertion": "logical and physical requests move all three native AX control frames by distinct correct logical deltas",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_traffic_light_position",
+        "status": "pass",
+        "test": "macos_behavior_smoke::dispatch_traffic_light_position"
+      },
+      {
+        "assertion": "the independently located target Dock item reports two distinct AXStatusLabel strings, then an empty label after clear",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_badge_label",
+        "status": "pass",
+        "test": "macos_behavior_smoke::dock_badge_label"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "new_window_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "默认 Allow、自定义 Allow/Create/Deny、真实 WindowProxy/opener、命名复用、跨源隔离与消息、noopener/noreferrer、POST/referrer、关闭及 opener 生命周期",
+        "kind": "behavior",
+        "member": "ElectronWebviewDispatcher::on_new_window",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      },
+      {
+        "assertion": "同请求接管 Chromium guest；过期 opener 拒绝，未重新导航目标页",
+        "kind": "behavior",
+        "member": "tauri_runtime_electron::with_opener",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      },
+      {
+        "assertion": "原生请求一次性令牌用于构建目标；尺寸333×222和位置40,50保持",
+        "kind": "behavior",
+        "member": "NewWindowFeatures::opener",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "rendering_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two fresh builder background_color calls produce distinct opaque RGB pixels on the actual desktop with their webviews hidden",
+        "kind": "behavior",
+        "member": "WindowBuilder::background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "two distinct dispatcher colors change actual native backing screen pixels; alpha-zero then reveals two changing lower-window colors; no getters/config echoes",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "transparent(true) reveals two changing lower-window colors through native alpha-zero backing; a fresh transparent(false) control does not follow both colors",
+        "kind": "behavior",
+        "member": "WindowBuilder::transparent",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "empty transparent target page shows two API-selected opaque colors, then alpha-zero exposes two controlled lower-window colors in native desktop pixels",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "the native bridge has no observable WebviewEvent source; lifecycle/RunEvent is not listener proof",
+        "kind": "behavior",
+        "member": "WebviewDispatch::on_webview_event",
+        "status": "unknown",
+        "test": "rendering_behavior_smoke::native_pixels"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "runtime_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "a worker-scheduled closure ran on the runtime UI ThreadId, changed/read the first real window title, and left the second window unchanged",
+        "kind": "behavior",
+        "member": "WindowDispatch::run_on_main_thread",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with decorations(false) and decorations(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::decorations",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with decorations(false) and decorations(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_decorated",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with maximizable(false) and maximizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with maximizable(false) and maximizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with minimizable(false) and minimizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with minimizable(false) and minimizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with closable(false) and closable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with closable(false) and closable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true requests disable/enable the real Electron window's native decorations button, observed outside Electron",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_decorations",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true reads agree with the independently observed native decorations button",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_decorated",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true requests disable/enable the real Electron window's native maximizable button, observed outside Electron",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true reads agree with the independently observed native maximizable button",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true requests disable/enable the real Electron window's native minimizable button, observed outside Electron",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true reads agree with the independently observed native minimizable button",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true requests disable/enable the real Electron window's native closable button, observed outside Electron",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "false/true reads agree with the independently observed native closable button",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "registered listener receives two actual resize payloads and CloseRequested/Destroyed on the UI thread; veto preserves the real page, final Destroyed occurs once, and the peer listener/page stays isolated",
+        "kind": "behavior",
+        "member": "WindowDispatch::on_window_event",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "runtime-tests",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "create_window returned a webview whose real custom-protocol document title is smoke-page and emitted page-load Finished",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_window",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "live window title() == smoke-1 after set_title",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title",
+        "status": "pass",
+        "test": "smoke::title_checks"
+      },
+      {
+        "assertion": "live window title() == smoke-1 after set_title",
+        "kind": "behavior",
+        "member": "WindowDispatch::title",
+        "status": "pass",
+        "test": "smoke::title_checks"
+      },
+      {
+        "assertion": "live Electron geometry reports a finite scale factor greater than zero",
+        "kind": "behavior",
+        "member": "WindowDispatch::scale_factor",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "Electron screen.getDisplayMatching for the live window returns a monitor",
+        "kind": "behavior",
+        "member": "WindowDispatch::current_monitor",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "Electron screen.getAllDisplays returns a nonempty monitor list",
+        "kind": "behavior",
+        "member": "WindowDispatch::available_monitors",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+        "kind": "behavior",
+        "member": "WindowBuilder::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live content size matches set_size(420x320 logical pixels in physical units) within 8px",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live content size matches set_size(420x320 logical pixels in physical units) within 8px",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live outer frame size contains the live content size in both dimensions",
+        "kind": "behavior",
+        "member": "WindowDispatch::outer_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "with_config min_width=250/min_height=180 keeps the live outer frame above the scaled minimum after requesting 120x100 physical pixels",
+        "kind": "behavior",
+        "member": "WindowBuilder::with_config",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live isResizable reads false then true after set_resizable(false) then set_resizable(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_resizable",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isResizable reads false then true after set_resizable(false) then set_resizable(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_resizable",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_enabled",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_enabled",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live Electron isFocused reports true",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_focused",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state is true from creation config before the setter is called",
+        "kind": "behavior",
+        "member": "WindowBuilder::with_config",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state is true from creation config before the setter is called",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state changes false then true after set_always_on_top(false) then true",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state changes false then true after set_always_on_top(false) then true",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::maximize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::unmaximize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximized",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_theme",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))",
+        "kind": "behavior",
+        "member": "WindowDispatch::theme",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::minimize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::unminimize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimized",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::hide",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::show",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_visible",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "physical and logical client offsets reach two distinct screen points and NaN is rejected; on Windows a unique visible Electron HWND supplies ClientToScreen targets and GetPhysicalCursorPos independently agrees with the runtime getter",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_position",
+        "status": "pass",
+        "test": "smoke::cursor_checks"
+      },
+      {
+        "assertion": "physical and logical client offsets reach two distinct screen points and NaN is rejected; on Windows a unique visible Electron HWND supplies ClientToScreen targets and GetPhysicalCursorPos independently agrees with the runtime getter",
+        "kind": "behavior",
+        "member": "RuntimeHandle::cursor_position",
+        "status": "pass",
+        "test": "smoke::cursor_checks"
+      },
+      {
+        "assertion": "same-session child loads smoke-page, reads localStorage=a, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_webview",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "same-session child loads smoke-page, reads localStorage=a, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "other-session child loads smoke-page, reads localStorage=empty, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_webview",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "other-session child loads smoke-page, reads localStorage=empty, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "the real page evaluates 1 + 1 and invokes the callback with JSON 2",
+        "kind": "behavior",
+        "member": "WebviewDispatch::eval_script_with_callback",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "callback evaluation reads executed from the page global written by fire-and-forget eval_script",
+        "kind": "behavior",
+        "member": "WebviewDispatch::eval_script",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "url() and the real page location.href both equal the initial custom-protocol URL",
+        "kind": "behavior",
+        "member": "WebviewDispatch::url",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href",
+        "kind": "behavior",
+        "member": "WebviewDispatch::url",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::open_devtools",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::close_devtools",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::is_devtools_open",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "page devicePixelRatio doubles after set_zoom(2) and returns to its initial value after set_zoom(1)",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_zoom",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "page computed root cursor is pointer after set_cursor_icon(Hand)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_icon",
+        "status": "pass",
+        "test": "smoke::cursor_style_checks"
+      },
+      {
+        "assertion": "page computed cursor changes to none when hidden and returns to pointer when shown",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_visible",
+        "status": "pass",
+        "test": "smoke::cursor_style_checks"
+      },
+      {
+        "assertion": "title() == smoke-idle after set_title following 61 seconds of idle IPC",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "title() == smoke-idle after set_title following 61 seconds of idle IPC",
+        "kind": "behavior",
+        "member": "WindowDispatch::title",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "close emitted Destroyed and the last window caused the event loop to request exit",
+        "kind": "behavior",
+        "member": "WindowDispatch::close",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+        "kind": "behavior",
+        "member": "Runtime::new",
+        "status": "pass",
+        "test": "smoke::main"
+      },
+      {
+        "assertion": "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+        "kind": "behavior",
+        "member": "Runtime::run_return",
+        "status": "pass",
+        "test": "smoke::main"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "system_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two distinct real OS pointer movements are independently read by Win32/CoreGraphics/X11 and agree with this API's physical screen coordinates; original cursor restored",
+        "kind": "behavior",
+        "member": "Runtime::cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two independently loaded pages both switch dark/light matchMedia values and receive change events for opposite app-theme requests; system theme selection is restored",
+        "kind": "behavior",
+        "member": "Runtime::set_theme",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two independently loaded pages both switch dark/light matchMedia values and receive change events for opposite app-theme requests; system theme selection is restored",
+        "kind": "behavior",
+        "member": "RuntimeHandle::set_theme",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct real OS pointer movements are independently read by Win32/CoreGraphics/X11 and agree with this API's physical screen coordinates; original cursor restored",
+        "kind": "behavior",
+        "member": "RuntimeHandle::cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "physical and logical client offsets move the real OS pointer to two distinct expected screen points, confirmed independently rather than through IPC; original cursor restored",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "tauri_new_window_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "ordinary worker registration reaches native popup callback; UI-thread reentrant registration, Deny/Allow, native WindowProxy/opener, child policy isolation and close cleanup",
+        "kind": "behavior",
+        "member": "tauri_runtime_electron::on_new_window",
+        "status": "pass",
+        "test": "tauri_new_window_smoke::exercise"
+      },
+      {
+        "assertion": "ordinary WebviewWindowBuilder destination selected in UI callback and resolved from worker; original destination URL and before-page initializer preserved, native opener/message routing, unrelated target denied, remote IPC ACL denied and no Node globals",
+        "kind": "behavior",
+        "member": "NewWindowResponse::create",
+        "status": "pass",
+        "test": "tauri_new_window_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "macos",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "webview_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "native child bounds equal requested parent-relative rect and physical renderer viewport, not the host window rect",
+        "kind": "behavior",
+        "member": "WebviewDispatch::bounds",
+        "status": "pass",
+        "test": "webview_behavior_smoke::bounds"
+      },
+      {
+        "assertion": "child position is the requested parent-relative physical offset rather than the parent's screen position",
+        "kind": "behavior",
+        "member": "WebviewDispatch::position",
+        "status": "pass",
+        "test": "webview_behavior_smoke::position"
+      },
+      {
+        "assertion": "child native physical size corresponds to its real 240x160 renderer viewport",
+        "kind": "behavior",
+        "member": "WebviewDispatch::size",
+        "status": "pass",
+        "test": "webview_behavior_smoke::size"
+      },
+      {
+        "assertion": "changes native child rect to 40,50/280x180 and the renderer ResizeObserver observes the new viewport",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_bounds",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_bounds"
+      },
+      {
+        "assertion": "changes renderer viewport and ResizeObserver to 300x200 while preserving native child position",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_size",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_size"
+      },
+      {
+        "assertion": "physical child offset moves to logical 60,70 without resizing or replacing the renderer document",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_position",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_position"
+      },
+      {
+        "assertion": "HTTP load counter advances, renderer nonce changes and ephemeral JS state is gone after child reload",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reload",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reload"
+      },
+      {
+        "assertion": "focus moves from host page to native child, independently confirmed by both real documents' hasFocus()",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_focus",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_focus"
+      },
+      {
+        "assertion": "native child renderer becomes hidden and emits visibilitychange while its parent window/page remain visible",
+        "kind": "behavior",
+        "member": "WebviewDispatch::hide",
+        "status": "pass",
+        "test": "webview_behavior_smoke::hide"
+      },
+      {
+        "assertion": "previously hidden child renderer becomes visible and emits the second real visibilitychange event",
+        "kind": "behavior",
+        "member": "WebviewDispatch::show",
+        "status": "pass",
+        "test": "webview_behavior_smoke::show"
+      },
+      {
+        "assertion": "enabling scales child native position/edges, renderer viewport and ResizeObserver with the parent; disabling keeps them fixed on another parent resize",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_auto_resize",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_auto_resize"
+      },
+      {
+        "assertion": "reads HTTP-set HttpOnly /scope cookie for its matching URL and excludes it for /outside",
+        "kind": "behavior",
+        "member": "WebviewDispatch::cookies_for_url",
+        "status": "pass",
+        "test": "webview_behavior_smoke::cookies_for_url"
+      },
+      {
+        "assertion": "session enumeration contains both real HTTP HttpOnly and renderer-written cookies while document.cookie hides the HttpOnly one",
+        "kind": "behavior",
+        "member": "WebviewDispatch::cookies",
+        "status": "pass",
+        "test": "webview_behavior_smoke::cookies"
+      },
+      {
+        "assertion": "domainless runtime HttpOnly cookie is sent in a real child HTTP Cookie header but is not exposed to document.cookie",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_cookie",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_cookie"
+      },
+      {
+        "assertion": "selected runtime cookie disappears from real HTTP requests and cookie enumeration while both unrelated cookies remain",
+        "kind": "behavior",
+        "member": "WebviewDispatch::delete_cookie",
+        "status": "pass",
+        "test": "webview_behavior_smoke::delete_cookie"
+      },
+      {
+        "assertion": "clears seeded localStorage, IndexedDB and CacheStorage plus renderer/session cookies and the actual HTTP Cookie header in an isolated child session",
+        "kind": "behavior",
+        "member": "WebviewDispatch::clear_all_browsing_data",
+        "status": "pass",
+        "test": "webview_behavior_smoke::clear_all_browsing_data"
+      },
+      {
+        "assertion": "ordinary main webview retains physical bounds, document nonce, HTTP load number and nested JS state through same/other-parent migration; unknown target fails without damage; original Rust IPC and renderer survive old-parent destruction, new-parent destruction invalidates both bounds and evaluation",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reparent",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reparent_main"
+      },
+      {
+        "assertion": "real child keeps physical bounds, HTTP load counter, JS nonce and Rust IPC across native host migration; old-parent destruction leaves it alive, target destruction cleans it; same-parent succeeds and unknown-parent migration fails explicitly",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reparent",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reparent"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "desktop_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "run exits its isolated process with requested code 29 after Ready/ExitRequested/Exit",
+        "kind": "behavior",
+        "member": "Runtime::run",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "run exits its isolated process with requested code 29 after Ready/ExitRequested/Exit",
+        "kind": "behavior",
+        "member": "RuntimeHandle::request_exit",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a non-main thread initializes real Electron, receives its user event and returns the requested exit code",
+        "kind": "behavior",
+        "member": "Runtime::new_any_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::create_proxy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_proxy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "EventLoopProxy::send_event",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "one iteration returns to its caller after delivering two distinct proxy nonces exactly once, in order, on the runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::run_iteration",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::available_monitors",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "1 actual displays have usable physical geometry; primary belongs to the list, each interior query returns its display and outside all displays returns None",
+        "kind": "behavior",
+        "member": "Runtime::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "Runtime::create_window",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "Runtime::create_webview",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "both direct Runtime creation entries produce independently evaluable native pages with their own proof values",
+        "kind": "behavior",
+        "member": "WindowBuilder::new",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a handle moved to a distinct worker schedules a callback on the recorded runtime thread",
+        "kind": "behavior",
+        "member": "Runtime::handle",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a handle moved to a distinct worker schedules a callback on the recorded runtime thread",
+        "kind": "behavior",
+        "member": "RuntimeHandle::run_on_main_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a webview scheduled from a worker invokes its closure on the runtime thread",
+        "kind": "behavior",
+        "member": "WebviewDispatch::run_on_main_thread",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle-created native child loads its own unique proof page",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_webview",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "closing the handle-created child makes it unevaluable while the independent root page remains alive",
+        "kind": "behavior",
+        "member": "WebviewDispatch::close",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "window-dispatch creation makes a separate native window and live proof page",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_window",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "destroy removes a live window and emits Destroyed despite an active close veto, without another CloseRequested",
+        "kind": "behavior",
+        "member": "WindowDispatch::destroy",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::available_monitors",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "RuntimeHandle::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "WindowDispatch::primary_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "handle/window queries observe all 1 actual displays; interior points select their containing displays and exterior points return None",
+        "kind": "behavior",
+        "member": "WindowDispatch::monitor_from_point",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::outer_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct physical positions are reached within 8px and the live client rectangle fits inside the actual outer frame at both positions",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the actual outer-frame center matches the current monitor work-area center within 15 logical pixels",
+        "kind": "behavior",
+        "member": "WindowDispatch::center",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "setting the minimum clamps real content to 280x200; clearing it permits 190x150",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_min_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "setting maximum clamps actual content to 470x350; clearing it permits 520x390",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_max_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "mixed-axis logical minimum width and physical maximum height constrain actual content; clearing restores a 420x320 page viewport",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_size_constraints",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "enter/leave fullscreen changes native state, spans the actual monitor and restores the prior normal position and size",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "enter/leave fullscreen changes native state, spans the actual monitor and restores the prior normal position and size",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "fullscreen physically selects each of 1 available monitors and restores the prior normal frame on exit; outside all monitors changes neither state nor frame; cross-screen selection only exercised when more than one is present",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_fullscreen_on_monitor",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a window created by center() has its live frame centered in its monitor work area",
+        "kind": "behavior",
+        "member": "WindowBuilder::center",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an explicitly positioned new window starts at its requested logical-pixel location within 8 physical pixels",
+        "kind": "behavior",
+        "member": "WindowBuilder::position",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::min_inner_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::max_inner_size",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the explicitly called builder constraint changes the actual content size when a later resize exceeds its limit",
+        "kind": "behavior",
+        "member": "WindowBuilder::inner_size_constraints",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an oversized initial window is actually clamped inside the monitor work area, with the requested margin when enabled",
+        "kind": "behavior",
+        "member": "WindowBuilder::prevent_overflow",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "an oversized initial window is actually clamped inside the monitor work area, with the requested margin when enabled",
+        "kind": "behavior",
+        "member": "WindowBuilder::prevent_overflow_with_margin",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::resizable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::title",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "explicit builder setters create a hidden, non-resizable native window with its requested title",
+        "kind": "behavior",
+        "member": "WindowBuilder::visible",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the live new window is already topmost before calling a topmost dispatcher setter",
+        "kind": "behavior",
+        "member": "WindowBuilder::always_on_top",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the newly created native window is maximized before any maximize dispatcher call",
+        "kind": "behavior",
+        "member": "WindowBuilder::maximized",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "the newly created native window is fullscreen and its actual outer frame spans the current monitor",
+        "kind": "behavior",
+        "member": "WindowBuilder::fullscreen",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "a focused(false) new window stays unfocused while a separate focused(true) new window acquires native focus",
+        "kind": "behavior",
+        "member": "WindowBuilder::focused",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowBuilder::focusable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_focusable",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "focusable(false) prevents native focus; enabling it permits a real transfer from another window, disabling prevents focus again",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_focus",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "two separately constructed theme(Light)/theme(Dark) windows produce false/true from the live page matchMedia prefers-color-scheme query",
+        "kind": "behavior",
+        "member": "WindowBuilder::theme",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "within real window creation has_icon changes false to true and get_theme changes None to Light to Dark; this does not assert native icon rendering",
+        "kind": "behavior",
+        "member": "WindowBuilder::has_icon",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      },
+      {
+        "assertion": "within real window creation has_icon changes false to true and get_theme changes None to Light to Dark; this does not assert native icon rendering",
+        "kind": "behavior",
+        "member": "WindowBuilder::get_theme",
+        "status": "pass",
+        "test": "desktop_behavior_smoke"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "new_window_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "默认 Allow、自定义 Allow/Create/Deny、真实 WindowProxy/opener、命名复用、跨源隔离与消息、noopener/noreferrer、POST/referrer、关闭及 opener 生命周期",
+        "kind": "behavior",
+        "member": "ElectronWebviewDispatcher::on_new_window",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      },
+      {
+        "assertion": "同请求接管 Chromium guest；过期 opener 拒绝，未重新导航目标页",
+        "kind": "behavior",
+        "member": "tauri_runtime_electron::with_opener",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      },
+      {
+        "assertion": "原生请求一次性令牌用于构建目标；尺寸333×222和位置40,50保持",
+        "kind": "behavior",
+        "member": "NewWindowFeatures::opener",
+        "status": "pass",
+        "test": "new_window_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "rendering_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two fresh builder background_color calls produce distinct opaque RGB pixels on the actual desktop with their webviews hidden",
+        "kind": "behavior",
+        "member": "WindowBuilder::background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "two distinct dispatcher colors change actual native backing screen pixels; alpha-zero then reveals two changing lower-window colors; no getters/config echoes",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "transparent(true) reveals two changing lower-window colors through native alpha-zero backing; a fresh transparent(false) control does not follow both colors",
+        "kind": "behavior",
+        "member": "WindowBuilder::transparent",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "empty transparent target page shows two API-selected opaque colors, then alpha-zero exposes two controlled lower-window colors in native desktop pixels",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_background_color",
+        "status": "pass",
+        "test": "rendering_behavior_smoke::native_pixels"
+      },
+      {
+        "assertion": "the native bridge has no observable WebviewEvent source; lifecycle/RunEvent is not listener proof",
+        "kind": "behavior",
+        "member": "WebviewDispatch::on_webview_event",
+        "status": "unknown",
+        "test": "rendering_behavior_smoke::native_pixels"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "runtime_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "a worker-scheduled closure ran on the runtime UI ThreadId, changed/read the first real window title, and left the second window unchanged",
+        "kind": "behavior",
+        "member": "WindowDispatch::run_on_main_thread",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with decorations(false) and decorations(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::decorations",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with decorations(false) and decorations(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_decorated",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with maximizable(false) and maximizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with maximizable(false) and maximizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with minimizable(false) and minimizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with minimizable(false) and minimizable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "fresh windows built with closable(false) and closable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowBuilder::closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "builder native comparison: fresh windows built with closable(false) and closable(true) override opposite config values; native frame/button state and getter both match",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "real Electron HWND WS_MAXIMIZEBOX clears then sets after false/true requests",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "getter reports false then true matching independently read WS_MAXIMIZEBOX on the real Electron HWND",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "real Electron HWND WS_MINIMIZEBOX clears then sets after false/true requests",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "getter reports false then true matching independently read WS_MINIMIZEBOX on the real Electron HWND",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimizable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "real Electron HWND system-menu SC_CLOSE disables then enables after false/true requests",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "getter reports false then true matching independently read system-menu SC_CLOSE state",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_closable",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "real Electron HWND caption style and actual client caption inset clear/restore while WS_THICKFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU and SC_CLOSE stay unchanged with both enabled and disabled capabilities",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_decorations",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "getter reports false/true matching independently read native caption insets on the real Electron HWND",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_decorated",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      },
+      {
+        "assertion": "registered listener receives two actual resize payloads and CloseRequested/Destroyed on the UI thread; veto preserves the real page, final Destroyed occurs once, and the peer listener/page stays isolated",
+        "kind": "behavior",
+        "member": "WindowDispatch::on_window_event",
+        "status": "pass",
+        "test": "runtime_behavior_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "runtime-tests",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "create_window returned a webview whose real custom-protocol document title is smoke-page and emitted page-load Finished",
+        "kind": "behavior",
+        "member": "RuntimeHandle::create_window",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "live window title() == smoke-1 after set_title",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title",
+        "status": "pass",
+        "test": "smoke::title_checks"
+      },
+      {
+        "assertion": "live window title() == smoke-1 after set_title",
+        "kind": "behavior",
+        "member": "WindowDispatch::title",
+        "status": "pass",
+        "test": "smoke::title_checks"
+      },
+      {
+        "assertion": "live Electron geometry reports a finite scale factor greater than zero",
+        "kind": "behavior",
+        "member": "WindowDispatch::scale_factor",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "Electron screen.getDisplayMatching for the live window returns a monitor",
+        "kind": "behavior",
+        "member": "WindowDispatch::current_monitor",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "Electron screen.getAllDisplays returns a nonempty monitor list",
+        "kind": "behavior",
+        "member": "WindowDispatch::available_monitors",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+        "kind": "behavior",
+        "member": "WindowBuilder::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "created content size is 320x240 logical pixels converted to physical pixels within 10px after builder inner_size overrides config 400x300",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live content size matches set_size(420x320 logical pixels in physical units) within 8px",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live content size matches set_size(420x320 logical pixels in physical units) within 8px",
+        "kind": "behavior",
+        "member": "WindowDispatch::inner_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live outer frame size contains the live content size in both dimensions",
+        "kind": "behavior",
+        "member": "WindowDispatch::outer_size",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "with_config min_width=250/min_height=180 keeps the live outer frame above the scaled minimum after requesting 120x100 physical pixels",
+        "kind": "behavior",
+        "member": "WindowBuilder::with_config",
+        "status": "pass",
+        "test": "smoke::geometry_checks"
+      },
+      {
+        "assertion": "live isResizable reads false then true after set_resizable(false) then set_resizable(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_resizable",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isResizable reads false then true after set_resizable(false) then set_resizable(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_resizable",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_enabled",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isEnabled reads false then true after set_enabled(false) then set_enabled(true)",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_enabled",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live Electron isFocused reports true",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_focused",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state is true from creation config before the setter is called",
+        "kind": "behavior",
+        "member": "WindowBuilder::with_config",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state is true from creation config before the setter is called",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state changes false then true after set_always_on_top(false) then true",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live always-on-top state changes false then true after set_always_on_top(false) then true",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_always_on_top",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::maximize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::unmaximize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live maximized state reads true after maximize and false after unmaximize",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_maximized",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_theme",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "theme reads Light then Dark after set_theme(Some(Light)) then set_theme(Some(Dark))",
+        "kind": "behavior",
+        "member": "WindowDispatch::theme",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::minimize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::unminimize",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live minimized state reads true after minimize and false after unminimize",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_minimized",
+        "status": "pass",
+        "test": "smoke::state_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::hide",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::show",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "live isVisible reads false after hide and true after show",
+        "kind": "behavior",
+        "member": "WindowDispatch::is_visible",
+        "status": "pass",
+        "test": "smoke::visibility_checks"
+      },
+      {
+        "assertion": "physical and logical client offsets reach two distinct screen points and NaN is rejected; on Windows a unique visible Electron HWND supplies ClientToScreen targets and GetPhysicalCursorPos independently agrees with the runtime getter",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_position",
+        "status": "pass",
+        "test": "smoke::cursor_checks"
+      },
+      {
+        "assertion": "physical and logical client offsets reach two distinct screen points and NaN is rejected; on Windows a unique visible Electron HWND supplies ClientToScreen targets and GetPhysicalCursorPos independently agrees with the runtime getter",
+        "kind": "behavior",
+        "member": "RuntimeHandle::cursor_position",
+        "status": "pass",
+        "test": "smoke::cursor_checks"
+      },
+      {
+        "assertion": "same-session child loads smoke-page, reads localStorage=a, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_webview",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "same-session child loads smoke-page, reads localStorage=a, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "other-session child loads smoke-page, reads localStorage=empty, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WindowDispatch::create_webview",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "other-session child loads smoke-page, reads localStorage=empty, then loads smoke-second and emits its own navigation callback",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::session_checks"
+      },
+      {
+        "assertion": "the real page evaluates 1 + 1 and invokes the callback with JSON 2",
+        "kind": "behavior",
+        "member": "WebviewDispatch::eval_script_with_callback",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "callback evaluation reads executed from the page global written by fire-and-forget eval_script",
+        "kind": "behavior",
+        "member": "WebviewDispatch::eval_script",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "url() and the real page location.href both equal the initial custom-protocol URL",
+        "kind": "behavior",
+        "member": "WebviewDispatch::url",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href",
+        "kind": "behavior",
+        "member": "WebviewDispatch::navigate",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "navigate loads smoke-second, emits the matching navigation callback, and url() agrees with the page location.href",
+        "kind": "behavior",
+        "member": "WebviewDispatch::url",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::open_devtools",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::close_devtools",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "Electron isDevToolsOpened reads true after open_devtools and false after close_devtools",
+        "kind": "behavior",
+        "member": "WebviewDispatch::is_devtools_open",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "page devicePixelRatio doubles after set_zoom(2) and returns to its initial value after set_zoom(1)",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_zoom",
+        "status": "pass",
+        "test": "smoke::webview_checks"
+      },
+      {
+        "assertion": "page computed root cursor is pointer after set_cursor_icon(Hand)",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_icon",
+        "status": "pass",
+        "test": "smoke::cursor_style_checks"
+      },
+      {
+        "assertion": "page computed cursor changes to none when hidden and returns to pointer when shown",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_visible",
+        "status": "pass",
+        "test": "smoke::cursor_style_checks"
+      },
+      {
+        "assertion": "title() == smoke-idle after set_title following 61 seconds of idle IPC",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_title",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "title() == smoke-idle after set_title following 61 seconds of idle IPC",
+        "kind": "behavior",
+        "member": "WindowDispatch::title",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "close emitted Destroyed and the last window caused the event loop to request exit",
+        "kind": "behavior",
+        "member": "WindowDispatch::close",
+        "status": "pass",
+        "test": "smoke::run_checks"
+      },
+      {
+        "assertion": "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+        "kind": "behavior",
+        "member": "Runtime::new",
+        "status": "pass",
+        "test": "smoke::main"
+      },
+      {
+        "assertion": "real Electron loaded the custom-protocol page, dispatched window events and returned exit code 0 after the last window closed",
+        "kind": "behavior",
+        "member": "Runtime::run_return",
+        "status": "pass",
+        "test": "smoke::main"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "system_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two distinct real OS pointer movements are independently read by Win32/CoreGraphics/X11 and agree with this API's physical screen coordinates; original cursor restored",
+        "kind": "behavior",
+        "member": "Runtime::cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two independently loaded pages both switch dark/light matchMedia values and receive change events for opposite app-theme requests; system theme selection is restored",
+        "kind": "behavior",
+        "member": "Runtime::set_theme",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two independently loaded pages both switch dark/light matchMedia values and receive change events for opposite app-theme requests; system theme selection is restored",
+        "kind": "behavior",
+        "member": "RuntimeHandle::set_theme",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "two distinct real OS pointer movements are independently read by Win32/CoreGraphics/X11 and agree with this API's physical screen coordinates; original cursor restored",
+        "kind": "behavior",
+        "member": "RuntimeHandle::cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      },
+      {
+        "assertion": "physical and logical client offsets move the real OS pointer to two distinct expected screen points, confirmed independently rather than through IPC; original cursor restored",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_position",
+        "status": "pass",
+        "test": "system_behavior_smoke"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "tauri_new_window_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "ordinary worker registration reaches native popup callback; UI-thread reentrant registration, Deny/Allow, native WindowProxy/opener, child policy isolation and close cleanup",
+        "kind": "behavior",
+        "member": "tauri_runtime_electron::on_new_window",
+        "status": "pass",
+        "test": "tauri_new_window_smoke::exercise"
+      },
+      {
+        "assertion": "ordinary WebviewWindowBuilder destination selected in UI callback and resolved from worker; original destination URL and before-page initializer preserved, native opener/message routing, unrelated target denied, remote IPC ACL denied and no Node globals",
+        "kind": "behavior",
+        "member": "NewWindowResponse::create",
+        "status": "pass",
+        "test": "tauri_new_window_smoke::exercise"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "webview_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "native child bounds equal requested parent-relative rect and physical renderer viewport, not the host window rect",
+        "kind": "behavior",
+        "member": "WebviewDispatch::bounds",
+        "status": "pass",
+        "test": "webview_behavior_smoke::bounds"
+      },
+      {
+        "assertion": "child position is the requested parent-relative physical offset rather than the parent's screen position",
+        "kind": "behavior",
+        "member": "WebviewDispatch::position",
+        "status": "pass",
+        "test": "webview_behavior_smoke::position"
+      },
+      {
+        "assertion": "child native physical size corresponds to its real 240x160 renderer viewport",
+        "kind": "behavior",
+        "member": "WebviewDispatch::size",
+        "status": "pass",
+        "test": "webview_behavior_smoke::size"
+      },
+      {
+        "assertion": "changes native child rect to 40,50/280x180 and the renderer ResizeObserver observes the new viewport",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_bounds",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_bounds"
+      },
+      {
+        "assertion": "changes renderer viewport and ResizeObserver to 300x200 while preserving native child position",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_size",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_size"
+      },
+      {
+        "assertion": "physical child offset moves to logical 60,70 without resizing or replacing the renderer document",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_position",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_position"
+      },
+      {
+        "assertion": "HTTP load counter advances, renderer nonce changes and ephemeral JS state is gone after child reload",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reload",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reload"
+      },
+      {
+        "assertion": "focus moves from host page to native child, independently confirmed by both real documents' hasFocus()",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_focus",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_focus"
+      },
+      {
+        "assertion": "native child renderer becomes hidden and emits visibilitychange while its parent window/page remain visible",
+        "kind": "behavior",
+        "member": "WebviewDispatch::hide",
+        "status": "pass",
+        "test": "webview_behavior_smoke::hide"
+      },
+      {
+        "assertion": "previously hidden child renderer becomes visible and emits the second real visibilitychange event",
+        "kind": "behavior",
+        "member": "WebviewDispatch::show",
+        "status": "pass",
+        "test": "webview_behavior_smoke::show"
+      },
+      {
+        "assertion": "enabling scales child native position/edges, renderer viewport and ResizeObserver with the parent; disabling keeps them fixed on another parent resize",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_auto_resize",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_auto_resize"
+      },
+      {
+        "assertion": "reads HTTP-set HttpOnly /scope cookie for its matching URL and excludes it for /outside",
+        "kind": "behavior",
+        "member": "WebviewDispatch::cookies_for_url",
+        "status": "pass",
+        "test": "webview_behavior_smoke::cookies_for_url"
+      },
+      {
+        "assertion": "session enumeration contains both real HTTP HttpOnly and renderer-written cookies while document.cookie hides the HttpOnly one",
+        "kind": "behavior",
+        "member": "WebviewDispatch::cookies",
+        "status": "pass",
+        "test": "webview_behavior_smoke::cookies"
+      },
+      {
+        "assertion": "domainless runtime HttpOnly cookie is sent in a real child HTTP Cookie header but is not exposed to document.cookie",
+        "kind": "behavior",
+        "member": "WebviewDispatch::set_cookie",
+        "status": "pass",
+        "test": "webview_behavior_smoke::set_cookie"
+      },
+      {
+        "assertion": "selected runtime cookie disappears from real HTTP requests and cookie enumeration while both unrelated cookies remain",
+        "kind": "behavior",
+        "member": "WebviewDispatch::delete_cookie",
+        "status": "pass",
+        "test": "webview_behavior_smoke::delete_cookie"
+      },
+      {
+        "assertion": "clears seeded localStorage, IndexedDB and CacheStorage plus renderer/session cookies and the actual HTTP Cookie header in an isolated child session",
+        "kind": "behavior",
+        "member": "WebviewDispatch::clear_all_browsing_data",
+        "status": "pass",
+        "test": "webview_behavior_smoke::clear_all_browsing_data"
+      },
+      {
+        "assertion": "ordinary main webview retains physical bounds, document nonce, HTTP load number and nested JS state through same/other-parent migration; unknown target fails without damage; original Rust IPC and renderer survive old-parent destruction, new-parent destruction invalidates both bounds and evaluation",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reparent",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reparent_main"
+      },
+      {
+        "assertion": "real child keeps physical bounds, HTTP load counter, JS nonce and Rust IPC across native host migration; old-parent destruction leaves it alive, target destruction cleans it; same-parent succeeds and unknown-parent migration fails explicitly",
+        "kind": "behavior",
+        "member": "WebviewDispatch::reparent",
+        "status": "pass",
+        "test": "webview_behavior_smoke::reparent"
+      }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "commit": "4fb041d9854a3a2f7a4051f83df530c74082ef8c",
+    "platform": "windows",
+    "run": {
+      "id": "40483922198/1",
+      "url": "https://github.com/hairyf/tauri-runtime-electron/actions/runs/40483922198/attempts/1"
+    },
+    "testRun": {
+      "id": "windows_behavior_smoke",
+      "executor": "real-electron",
+      "status": "pass"
+    },
+    "results": [
+      {
+        "assertion": "two fresh opposite final owner setters produce exact external GW_OWNER without WS_CHILD; each owned HWND is destroyed only with its final owner",
+        "kind": "behavior",
+        "member": "WindowBuilder::owner",
+        "status": "pass",
+        "test": "windows_behavior_smoke::owner"
+      },
+      {
+        "assertion": "opposite fresh final parents create external WS_CHILD/non-WS_POPUP HWNDs with exact GetParent and no GW_OWNER; parent-client offsets follow native parent movement unlike an owner control, and destruction removes only the final parent's children",
+        "kind": "behavior",
+        "member": "WindowBuilder::parent",
+        "status": "pass",
+        "test": "windows_behavior_smoke::parent"
+      },
+      {
+        "assertion": "at two distinct native client screen rectangles GetClipCursor matches grab bounds, outside physical pointer attempts clamp to opposite edges, false releases the clip and permits outside positions; original clip and pointer are restored",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_cursor_grab",
+        "status": "pass",
+        "test": "windows_behavior_smoke::cursor_grab"
+      },
+      {
+        "assertion": "two fresh opposite icon replacements expose the final RGB color in every native ICON_SMALL and ICON_BIG resource pixel",
+        "kind": "behavior",
+        "member": "WindowBuilder::icon",
+        "status": "pass",
+        "test": "windows_behavior_smoke::builder_icons"
+      },
+      {
+        "assertion": "native WM_GETICON resource pixels change blue to red to blue in both small and big slots after opposite set_icon calls",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_icon",
+        "status": "pass",
+        "test": "windows_behavior_smoke::dispatch_icons"
+      },
+      {
+        "assertion": "WindowDispatch::window_handle returns a live current-process menu-proxy HWND, not Electron's top-level HWND",
+        "kind": "behavior",
+        "member": "WindowDispatch::window_handle",
+        "status": "pass",
+        "test": "windows_behavior_smoke::window_handle"
+      },
+      {
+        "assertion": "two fresh content_protected setters override opposite WindowConfig values with native WDA_EXCLUDEFROMCAPTURE and WDA_NONE",
+        "kind": "behavior",
+        "member": "WindowBuilder::content_protected",
+        "status": "pass",
+        "test": "windows_behavior_smoke::builder_protection"
+      },
+      {
+        "assertion": "external GetWindowDisplayAffinity changes WDA_NONE to WDA_EXCLUDEFROMCAPTURE to WDA_NONE after opposite dispatcher setters",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_content_protected",
+        "status": "pass",
+        "test": "windows_behavior_smoke::dispatch_protection"
+      },
+      {
+        "assertion": "not verified: cross-process extended-style mutation failed with Win32 error 87; no native setter evidence",
+        "kind": "behavior",
+        "member": "WindowBuilder::no_redirection_bitmap",
+        "status": "unknown",
+        "test": "windows_behavior_smoke::uncovered"
+      },
+      {
+        "assertion": "not asserted: current creation bridge does not apply a custom native class; logged GetClassNameW is diagnostic only",
+        "kind": "behavior",
+        "member": "WindowBuilder::window_classname",
+        "status": "unknown",
+        "test": "windows_behavior_smoke::uncovered"
+      },
+      {
+        "assertion": "not asserted: Electron and Tao use ITaskbarList; APPWINDOW/TOOLWINDOW observations alone cannot prove an actual shell tab",
+        "kind": "behavior",
+        "member": "WindowBuilder::skip_taskbar",
+        "status": "unknown",
+        "test": "windows_behavior_smoke::uncovered"
+      },
+      {
+        "assertion": "not asserted: opposite dispatcher calls need an independent shell-tab observer, not unchanged extended styles or an Ok result",
+        "kind": "behavior",
+        "member": "WindowDispatch::set_skip_taskbar",
+        "status": "unknown",
+        "test": "windows_behavior_smoke::uncovered"
+      }
+    ]
+  }
+]

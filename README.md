@@ -50,7 +50,7 @@ tauri::Builder::<ElectronRuntime>::new().run(context)?;
 
 Output is `target/electron/<platform>-<arch>`, such as `target/electron/win32-x64`, with **no version directory**. If your target root differs, adjust the source path and keep the destination `runtime`. Bundle the entire distribution, including libraries, metadata and generated scripts.
 
-Native icons use `.ico` on Windows and `.icns` on macOS; Linux currently supports executable renaming only. Apply release signing/notarization after branding. macOS building and execution have not been verified in this environment.
+Native icons use `.ico` on Windows and `.icns` on macOS; Linux currently supports executable renaming only. Apply release signing/notarization after branding. The [member report](docs/coverage.md) records real Windows/macOS/Linux CI runs; release signing, notarization and installed-package behavior require separate validation.
 
 Startup locates prepared files beside the app (`runtime`, `resources/runtime` or macOS `Resources/runtime`) and standard Linux package locations derived from `productName`: `../lib/<productName>/runtime`, `$APPDIR/usr/lib/<productName>/runtime` and `/usr/lib/<productName>/runtime`. Only debug builds can fall back to the build machine's staging path. **Startup never downloads, extracts or patches Electron.** Missing runtime files or scripts are errors.
 
@@ -99,13 +99,13 @@ Calls use normal Tauri IPC/ACL. Only Acrylic, Mica and Tabbed on Windows 11 22H2
 
 ## Limits
 
-See the [method coverage](docs/coverage.md) for each member's purpose and exact-commit CI results. Unverified, skipped and failed members do not count as supported.
+See the [method coverage](docs/coverage.md) for each member's purpose and exact-commit CI results. Commit `4fb041d9854a3a2f7a4051f83df530c74082ef8c` passed 27 real desktop suites: **154/192 (80.2%)** official members passed on every applicable platform, with five Electron extensions counted separately. Unverified, skipped and failed members do not count as supported.
 
 - Windows attached Tauri menus are mirrored to Electron; commands and accelerators dispatch through a Rust UI-thread menu owner. Menu changes synchronize during the event pump. Native menu integration on macOS/Linux and popup placement remain unverified. Cross-process IDs do not provide local WebView2, GTK or AppKit objects: `with_webview` errors without calling the callback; macOS native window handles and WKWebView data-store operations are unavailable.
 - Page `window.open` defaults to native Chromium popups, retaining the original `WindowProxy`, opener, POST data and lifecycle. Use this crate's [new-window API](src/new_window.rs) for `Allow`/`Deny`/`Create`; the Tauri facade requires `features = ["tauri"]`. For `Create`, build inside `with_opener(features.opener(), || ...)` and return `NewWindowResponse::create(&window)`. Official `new_window_handler` still fails explicitly because its process-local WebView handles cannot cross processes; the original API example is not stripped or rewritten to hide that limitation. Accepted navigation resumes the original request; a subframe veto affects only that frame.
 - Initialization scripts keep their frame scope; IPC is main-frame-only. `convertFileSrc` still needs `protocol-asset` and an `assetProtocol` scope. Matching resolved `data_directory` paths share a session; incognito webviews have separate in-memory sessions.
 - Downloads stay private until complete and first approved by the host, then publish without overwriting. Publication failures retain the staged file and report its path; denial, timeout and destruction clean it up. Exit vetoes/codes are respected: `run_return` returns the code, while `run` exits the Rust process.
-- Configured title-bar styles and hidden titles map to Electron window options; runtime title-bar-style changes remain unsupported. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
+- On macOS, configured title-bar styles and hidden titles map to native window options; runtime title-bar style and traffic-light position changes have independent native CI assertions. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
 
 ## Examples and checks
 
@@ -137,7 +137,7 @@ Tests follow code ownership:
 | `pnpm run test:bridge` | Use that prepared distribution for handshake, subscriptions, loaded-page preload/protocol IPC, native window/child webview RPCs and shutdown. Requires a desktop; see the [bridge setup](electron-rs/README.md#checks) for Linux sandbox permissions. |
 | `pnpm run test:runtime` | All root Cargo tests, including acquisition, [window smoke](tests/runtime_smoke.rs) and [exit lifecycle](tests/runtime_lifecycle.rs). Requires a desktop; Linux uses Xvfb and a window manager. |
 | `pnpm run test:examples helloworld state` | Build and check the selected original examples serially; `pnpm check` is an alias. Requires a desktop and example dependencies. |
-| `pnpm run test:coverage` | Check that the generated method-coverage document is current; regenerate with `node tests/checks/coverage.mjs --write`. |
+| `pnpm run test:coverage` | Check the member report against its archived exact-commit CI records; regenerate with `node tests/checks/coverage.mjs --write`. New CI runs use their own `--evidence`, `--commit` and `--run`, without inheriting archived passes. |
 
 The [example runner](scripts/example.mjs) adapts copies under `target/example/tauri`, preserving framework sources and original pages/commands/CSP/ACL/Isolation. Run examples serially; `--prepare-only` keeps the generated app. The [checker](tests/checks/examples.mjs) saves assertions, logs and original screenshots under `target/example-checks/<name>/`; missing platform/device prerequisites are `blocked`, and both `blocked` and `failed` exit nonzero. Visual review remains `pending` until screenshots are inspected and recorded in `visual-review.json`.
 
