@@ -12,7 +12,7 @@
     "@tauri-apps/api": "^2.0.0"
   },
   "scripts": {
-    "build:electron": "pnpm --dir electron-rs exec tsdown",
+    "build:electron": "cd electron-rs && tsdown",
     "example": "node scripts/example.mjs",
     "test": "pnpm run test:bridge:regressions && pnpm run test:adapter && pnpm run test:checks",
     "test:bridge:regressions": "cargo test --manifest-path electron-rs/Cargo.toml --locked",
