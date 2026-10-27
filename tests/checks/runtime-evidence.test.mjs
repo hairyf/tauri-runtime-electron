@@ -219,7 +219,7 @@ impl<T: UserEvent> Runtime<T> for App<T> {
 }
 // Static wiring assertions are regression checks, never runtime evidence.
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
-assert.match(workflow, /dbus-run-session -- sh -c 'xfwm4 --compositor=off & xcompmgr & sleep 1; node tests\/checks\/runtime-suites\.mjs "\$1"' sh "\$output"/)
+assert.match(workflow, /dbus-run-session -- sh -c 'set -eu; xfwm4 --compositor=off & xcompmgr & sleep 1; xfconf-query -c xfwm4 -p \/general\/button_layout -n -t string -s "\|C"; test "\$\(xfconf-query -c xfwm4 -p \/general\/button_layout\)" = "\|C"; node tests\/checks\/runtime-suites\.mjs "\$1"' sh "\$output"/)
 assert.match(workflow, /apt-get install[^\n]*xfwm4[^\n]*dbus-x11/)
 assert.match(workflow, /else\s+node tests\/checks\/runtime-suites\.mjs "\$output"\s+fi/)
 assert.match(workflow, /name: runtime-evidence-\$\{\{ matrix\.os \}\}-\$\{\{ github\.run_attempt \}\}/)

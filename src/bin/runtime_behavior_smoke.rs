@@ -5,6 +5,8 @@ use std::{
   thread::{self, ThreadId},
   time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use tauri_runtime::{
   ExitRequestedEventAction, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs,
   WebviewDispatch, WindowDispatch,
@@ -379,18 +381,42 @@ fn native_flag(window: &Window, flag: &str) -> Result<bool, String> {
     if name.lines().any(|line| line.ends_with(&format!("\"{title}\""))) { found.push(id.to_owned()); }
   }
   if found.len() != 1 { return Err(format!("expected one X11 WM-managed window named {title}, found {found:?}")); }
-  let property = match flag {
-    "decorations" => "_NET_FRAME_EXTENTS",
-    "closable" => "_NET_WM_ALLOWED_ACTIONS",
-    _ => return Err("official Linux maximize/minimize button API is unsupported".into()),
-  };
-  let actual = probe("xprop", &["-id", &found[0], property])?;
-  let (_, value) = actual.split_once('=').ok_or_else(|| format!("WM did not supply {property}: {actual}"))?;
-  if flag == "closable" { return Ok(value.split(',').any(|action| action.trim() == "_NET_WM_ACTION_CLOSE")); }
+  if flag == "closable" {
+    let layout = probe("xfconf-query", &["-c", "xfwm4", "-p", "/general/button_layout"])?;
+    if layout != "|C" { return Err(format!("expected Xfwm caption layout |C, got {layout:?}")); }
+    let binary = linux_caption_observer()?;
+    let actual = probe(binary.to_str().ok_or("invalid observer path")?, &[&found[0]])?;
+    return match actual.as_str() {
+      "0" => Ok(false),
+      "1" => Ok(true),
+      _ => Err(format!("ambiguous Xfwm caption control count: {actual:?}")),
+    };
+  }
+  if flag != "decorations" { return Err("official Linux maximize/minimize button API is unsupported".into()); }
+  let actual = probe("xprop", &["-id", &found[0], "_NET_FRAME_EXTENTS"])?;
+  let (_, value) = actual.split_once('=').ok_or_else(|| format!("WM did not supply frame extents: {actual}"))?;
   let extents = value.split(',').map(|axis| axis.trim().parse::<u32>()).collect::<Result<Vec<_>, _>>()
     .map_err(|error| format!("invalid WM frame extents: {error}"))?;
   if extents.len() != 4 { return Err(format!("invalid WM frame extents: {actual}")); }
   Ok(extents.iter().any(|&axis| axis != 0))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_caption_observer() -> Result<&'static std::path::Path, String> {
+  static OBSERVER: OnceLock<Result<std::path::PathBuf, String>> = OnceLock::new();
+  OBSERVER.get_or_init(|| {
+    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    let root = std::env::temp_dir().join(format!("electron-linux-caption-{}-{}", std::process::id(),
+      SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos()));
+    fs::create_dir(&root).map_err(|error| format!("create observer directory: {error}"))?;
+    let source = root.join("observer.c");
+    let binary = root.join("observer");
+    fs::write(&source, include_str!("../../tests/assets/linux-caption-observer.c"))
+      .map_err(|error| format!("write observer source: {error}"))?;
+    probe("cc", &[source.to_str().ok_or("invalid observer source path")?, "-o",
+      binary.to_str().ok_or("invalid observer binary path")?, "-lX11"])?;
+    Ok(binary)
+  }).as_ref().map(|path| path.as_path()).map_err(Clone::clone)
 }
 
 #[cfg(windows)]

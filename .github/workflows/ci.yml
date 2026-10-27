@@ -91,7 +91,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf openbox xfwm4 dbus-x11 x11-utils xdotool xcompmgr
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libx11-dev libayatana-appindicator3-dev librsvg2-dev patchelf openbox xfwm4 xfconf dbus-x11 x11-utils xdotool xcompmgr
 
       - name: Cache cargo and Electron
         uses: actions/cache@v6
@@ -155,9 +155,9 @@ jobs:
           # One process per suite, no parallel GUI; failed commands remain failed.
           output="target/runtime-evidence/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           if [ "$RUNNER_OS" = Linux ]; then
-            # Openbox ignores Motif CLOSE; Xfwm enforces it and publishes real WM allowed actions.
+            # Xfwm's close-only caption makes the mapped native control count unambiguous.
             xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
-              dbus-run-session -- sh -c 'xfwm4 --compositor=off & xcompmgr & sleep 1; node tests/checks/runtime-suites.mjs "$1"' sh "$output"
+              dbus-run-session -- sh -c 'set -eu; xfwm4 --compositor=off & xcompmgr & sleep 1; xfconf-query -c xfwm4 -p /general/button_layout -n -t string -s "|C"; test "$(xfconf-query -c xfwm4 -p /general/button_layout)" = "|C"; node tests/checks/runtime-suites.mjs "$1"' sh "$output"
           else
             node tests/checks/runtime-suites.mjs "$output"
           fi

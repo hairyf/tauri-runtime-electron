@@ -83,7 +83,7 @@ static AXUIElementRef webArea(AXUIElementRef element, int depth, int *budget) {
   }
   return NULL;
 }
-static BOOL dockItems(AXUIElementRef element, NSString *bundle, int depth, int *budget, int *urls, int *matches) {
+static BOOL dockItems(AXUIElementRef element, NSString *bundle, int depth, int *budget, int *urls, int *matches, NSMutableArray *badges) {
   if (depth > 8 || --*budget <= 0) return NO;
   AXError error;
   id url = axRead(element, CFSTR("AXURL"), &error);
@@ -93,12 +93,19 @@ static BOOL dockItems(AXUIElementRef element, NSString *bundle, int depth, int *
   else if ([url isKindOfClass:[NSString class]]) path = [[NSURL URLWithString:url] path];
   if (path) {
     ++*urls;
-    if ([[path stringByResolvingSymlinksInPath] isEqual:bundle]) ++*matches;
+    if ([[path stringByResolvingSymlinksInPath] isEqual:bundle]) {
+      ++*matches;
+      AXError badgeError;
+      id badge = axRead(element, CFSTR("AXStatusLabel"), &badgeError);
+      if (badgeError == kAXErrorNoValue || (badgeError == kAXErrorSuccess && !badge)) [badges addObject:@""];
+      else if (badgeError == kAXErrorSuccess && [badge isKindOfClass:[NSString class]]) [badges addObject:badge];
+      else [badges addObject:[NSNull null]];
+    }
   }
   id children = axRead(element, kAXChildrenAttribute, &error);
   if (error != kAXErrorSuccess && error != kAXErrorNoValue && error != kAXErrorAttributeUnsupported) return NO;
   if (children && ![children isKindOfClass:[NSArray class]]) return NO;
-  for (id child in children) if (!dockItems((__bridge AXUIElementRef)child, bundle, depth + 1, budget, urls, matches)) return NO;
+  for (id child in children) if (!dockItems((__bridge AXUIElementRef)child, bundle, depth + 1, budget, urls, matches, badges)) return NO;
   return YES;
 }
 int main(int argc, const char **argv) {
@@ -133,7 +140,7 @@ int main(int argc, const char **argv) {
       @"policy":@(app.activationPolicy), @"hidden":@(app.hidden), @"active":@(app.active),
       @"frontPID":front ? @(front.processIdentifier) : (id)[NSNull null],
       @"cgWindows":[NSNull null], @"cgError":[NSNull null], @"windows":[NSNull null], @"axError":[NSNull null],
-      @"dockMatches":[NSNull null], @"dockError":[NSNull null]} mutableCopy];
+      @"dockMatches":[NSNull null], @"dockBadges":[NSNull null], @"dockError":[NSNull null]} mutableCopy];
     NSArray *cg = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
     NSMutableArray *rectangles = [NSMutableArray array];
     if (!cg) result[@"cgError"] = @"CGWindowList is unavailable";
@@ -162,9 +169,13 @@ int main(int argc, const char **argv) {
         AXUIElementRef dockAX = AXUIElementCreateApplication(dock.processIdentifier);
         AXUIElementSetMessagingTimeout(dockAX, 2.0);
         int budget = 1500, urls = 0, matches = 0;
-        BOOL complete = dockItems(dockAX, bundle, 0, &budget, &urls, &matches);
+        NSMutableArray *badges = [NSMutableArray array];
+        BOOL complete = dockItems(dockAX, bundle, 0, &budget, &urls, &matches, badges);
         CFRelease(dockAX);
-        if (complete && urls) result[@"dockMatches"] = @(matches);
+        if (complete && urls) {
+          result[@"dockMatches"] = @(matches);
+          result[@"dockBadges"] = badges;
+        }
         else result[@"dockError"] = @"Dock AX traversal incomplete, failed or URL attributes unavailable";
       }
       AXError windowsError;
@@ -325,6 +336,26 @@ int main(int argc, const char **argv) {
         if started.elapsed() >= WAIT { return Err(format!("FAIL: {description}; actual external system observation: {got}")) }
         thread::sleep(Duration::from_millis(100));
       }
+    }
+    fn caption_pixels(&self, window: &Value) -> Check<String> {
+      let binary = self.root.join("caption-observer");
+      if !binary.exists() {
+        let source = self.root.join("caption-observer.m");
+        fs::write(&source, include_str!("../../tests/assets/macos-caption-observer.m"))
+          .map_err(|error| format!("UNKNOWN: write caption observer: {error}"))?;
+        output(Command::new("/usr/bin/clang").args(["-fobjc-arc", "-framework", "Foundation", "-framework", "ApplicationServices"])
+          .arg(&source).arg("-o").arg(&binary), Duration::from_secs(45))?;
+      }
+      let rect = numbers(&window["frame"])?;
+      let state = self.sample()?;
+      let candidates = state["cgWindows"].as_array().ok_or("UNKNOWN: missing CG caption windows")?;
+      let ids = candidates.iter().filter(|candidate| numbers(&candidate["frame"]).is_ok_and(|frame|
+        frame.iter().zip(rect).all(|(a,b)| (a-b).abs() <= 2.0)))
+        .filter_map(|candidate| candidate["id"].as_u64()).collect::<Vec<_>>();
+      if ids.len() != 1 { return Err(format!("UNKNOWN: caption CG identity is ambiguous: {ids:?}")); }
+      let bytes = output(Command::new(&binary).arg(self.pid.to_string()).arg(ids[0].to_string()).arg(inset(window)?.to_string()), WAIT)?;
+      let value: Value = serde_json::from_slice(&bytes).map_err(|error| format!("UNKNOWN: caption pixels JSON: {error}"))?;
+      value["signature"].as_str().map(str::to_owned).ok_or_else(|| format!("UNKNOWN: caption signature unavailable: {value}"))
     }
     fn activate(&self, pid: u32) -> Check {
       output(Command::new(&self.binary).arg("activate").arg(pid.to_string()), WAIT).map(|_| ())
@@ -493,11 +524,53 @@ int main(int argc, const char **argv) {
     }
     Ok(())
   }
+  fn title_signature(observer: &Observer, window: &Window, title: &str) -> Check<(Value, String)> {
+    WindowDispatch::<()>::set_title(&window.dispatcher, title).map_err(|error| error.to_string())?;
+    let native = caption(observer, title)?;
+    let signature = stable_caption_pixels(observer, &native)?;
+    Ok((native, signature))
+  }
+  fn stable_caption_pixels(observer: &Observer, native: &Value) -> Check<String> {
+    let started = Instant::now();
+    let mut previous = None;
+    let mut stable = 0;
+    loop {
+      let signature = observer.caption_pixels(native)?;
+      stable = if previous.as_ref() == Some(&signature) { stable + 1 } else { 0 };
+      if stable >= 3 { return Ok(signature); }
+      if started.elapsed() >= WAIT { return Err("UNKNOWN: native caption pixels never stabilized".into()); }
+      previous = Some(signature);
+      thread::sleep(Duration::from_millis(150));
+    }
+  }
+  fn badge_label(observer: &Observer, window: &Window) -> Check {
+    let result = (|| {
+      // Positive nonempty labels establish that AXStatusLabel is actually readable.
+      for label in [Some("qa37"), Some("proof82"), None] {
+        WindowDispatch::<()>::set_badge_label(&window.dispatcher, label.map(str::to_owned)).map_err(|error| error.to_string())?;
+        let wanted = label.unwrap_or("");
+        observer.wait_for("the target bundle's actual Dock AXStatusLabel must change and clear", &["dockMatches", "dockBadges"], |state| {
+          state["dockMatches"] == 1 && state["dockBadges"].as_array().is_some_and(|badges|
+            badges.len() == 1 && badges[0].as_str() == Some(wanted))
+        }).map_err(|error| {
+          // An unsupported status attribute is missing observation, not a failed API.
+          match observer.sample() {
+            Ok(state) if state["dockBadges"].as_array().is_some_and(|badges| badges.iter().any(Value::is_null)) =>
+              format!("UNKNOWN: target Dock AXStatusLabel unavailable: {state}"),
+            _ => error,
+          }
+        })?;
+      }
+      Ok(())
+    })();
+    let cleared = WindowDispatch::<()>::set_badge_label(&window.dispatcher, None).map_err(|error| format!("FAIL: restore Dock badge: {error}"));
+    result.and(cleared)
+  }
   fn titlebars(handle: &ElectronRuntimeHandle, observer: &Observer, failures: &mut Vec<String>) {
     for (case, member, assertion) in [
       ("title_bar_style", "WindowBuilder::title_bar_style", "Visible/Transparent retain native AXWebArea caption inset; Overlay extends beneath the caption, with all three native controls retained"),
       ("dispatch_title_bar_style", "WindowDispatch::set_title_bar_style", "Transparent/Overlay/Transparent moves the same real AXWebArea below/under/below the caption while retaining all three native controls"),
-      ("hidden_title", "WindowBuilder::hidden_title", "a readable visible-title baseline changes to confirmed absent/hidden native title text without moving controls or changing content inset"),
+      ("hidden_title", "WindowBuilder::hidden_title", "independent WindowServer caption pixels change for visible title A/B/A, stay unchanged for hidden title A/B/A, while native controls and content inset remain fixed"),
       ("builder_traffic_light_position", "WindowBuilder::traffic_light_position", "two fresh Overlay windows' three native AX control frames differ by the requested 26x16 logical delta"),
       ("dispatch_traffic_light_position", "WindowDispatch::set_traffic_light_position", "logical and physical requests move all three native AX control frames by distinct correct logical deltas"),
     ] {
@@ -540,20 +613,28 @@ int main(int argc, const char **argv) {
             }
           }
           "hidden_title" => {
-            let _visible = make("title-visible", builder("title-visible").title_bar_style(TitleBarStyle::Visible).hidden_title(false))?;
-            let normal = caption(observer, "title-visible")?;
-            if normal["titleStatus"] != "present" || normal["titleText"].is_null() || normal["titleFrame"].is_null() {
-              return Err(format!("UNKNOWN: visible native title baseline unavailable: {normal}"));
-            }
-            require(normal["titleText"] == "title-visible", "visible native title must match the requested title")?;
-            let _hidden = make("title-hidden", builder("title-hidden").title_bar_style(TitleBarStyle::Visible).hidden_title(true))?;
-            let hidden = caption(observer, "title-hidden")?;
-            if hidden["titleStatus"] == "unavailable" || (hidden["titleStatus"] == "present" && (hidden["titleText"].is_null() || hidden["titleFrame"].is_null())) {
-              return Err(format!("UNKNOWN: hidden-title AX query unavailable, not proof of absence: {hidden}"));
-            }
-            require(hidden["titleStatus"] == "absent" || hidden["titleText"] == "", "hidden_title(true) must remove the actual native title text")?;
-            require((inset(&hidden)? - inset(&normal)?).abs() <= 2.0, "hiding title text must preserve Visible content layout")?;
-            controls_shift(&normal, &hidden, 0.0, 0.0)?;
+            let visible = make("title-visible", builder("title-visible").title_bar_style(TitleBarStyle::Visible).hidden_title(false))?;
+            WindowDispatch::<()>::set_focus(&visible.dispatcher).map_err(|error| error.to_string())?;
+            let (normal, a) = title_signature(observer, &visible, "Native caption WWWWWWWWW")?;
+            let (_, b) = title_signature(observer, &visible, "Native caption iiiiiiiii")?;
+            let (_, again) = title_signature(observer, &visible, "Native caption WWWWWWWWW")?;
+            require(a != b && a == again, "visible native caption pixels must follow title A/B/A exactly")?;
+            // Keep the already-observed native frame identity: an empty AXTitle
+            // can legitimately be replaced by the application name by macOS.
+            WindowDispatch::<()>::set_title(&visible.dispatcher, "").map_err(|error| error.to_string())?;
+            let empty = stable_caption_pixels(observer, &normal)?;
+            require(empty != a && empty != b, "an empty visible title must remove both observed caption texts")?;
+            WindowDispatch::<()>::hide(&visible.dispatcher).map_err(|error| error.to_string())?;
+            // The same position and active appearance keep vibrancy/background
+            // pixels identical when comparing the hidden title to the control.
+            let hidden = make("title-hidden", builder("title-hidden").title_bar_style(TitleBarStyle::Visible).hidden_title(true))?;
+            WindowDispatch::<()>::set_focus(&hidden.dispatcher).map_err(|error| error.to_string())?;
+            let (hidden_native, a) = title_signature(observer, &hidden, "Hidden caption WWWWWWWWW")?;
+            let (_, b) = title_signature(observer, &hidden, "Hidden caption iiiiiiiii")?;
+            let (_, again) = title_signature(observer, &hidden, "Hidden caption WWWWWWWWW")?;
+            require(a == b && a == again && a == empty, "hidden native caption pixels must equal the empty-title control across title A/B/A")?;
+            require((inset(&hidden_native)? - inset(&normal)?).abs() <= 2.0, "hiding title text must preserve Visible content layout")?;
+            controls_shift(&normal, &hidden_native, 0.0, 0.0)?;
           }
           "builder_traffic_light_position" => {
             let _a = make("buttons-a", builder("buttons-a").title_bar_style(TitleBarStyle::Overlay).traffic_light_position(LogicalPosition::new(12.0,14.0)))?;
@@ -613,6 +694,8 @@ int main(int argc, const char **argv) {
     let worker = thread::spawn(move || {
       handle_checks(&worker_handle, &observer, &first, &mut failures);
       titlebars(&worker_handle, &observer, &mut failures);
+      let badge = badge_label(&observer, &first);
+      record("WindowDispatch::set_badge_label", "dock_badge_label", "the independently located target Dock item reports two distinct AXStatusLabel strings, then an empty label after clear", badge, &mut failures);
       restore_app(&worker_handle, &mut failures);
       if initial_front != 0 && initial_front != observer.pid {
         if let Err(error) = observer.activate(initial_front) { eprintln!("{error}"); }
