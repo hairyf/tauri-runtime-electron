@@ -217,6 +217,7 @@ int main(int argc, const char **argv) {
             }
           }
           [observed addObject:@{@"title":title, @"frame":rect, @"buttons":buttons,
+            @"main":ax(w, kAXMainAttribute) ?: (id)[NSNull null],
             @"content":content ?: (id)[NSNull null], @"onScreen":onScreen,
             @"titleFrame":titleRect ?: (id)[NSNull null], @"titleText":titleText ?: (id)[NSNull null],
             @"titleStatus":titleStatus, @"titleError":@(titleError)}];
@@ -526,8 +527,18 @@ int main(int argc, const char **argv) {
   }
   fn title_signature(observer: &Observer, window: &Window, title: &str) -> Check<(Value, String)> {
     WindowDispatch::<()>::set_title(&window.dispatcher, title).map_err(|error| error.to_string())?;
-    let native = caption(observer, title)?;
+    // Active and inactive AppKit captions have different pixels even for the same title.
+    let state = observer.wait_for("caption target must own native foreground and main-window status", &["windows", "cgWindows", "frontPID"], |state| {
+      if native_window(state, title).is_some_and(|window| window["main"].is_null()) { return true; }
+      state["active"] == true && state["frontPID"].as_u64() == Some(u64::from(observer.pid))
+        && native_window(state, title).is_some_and(|window| window["onScreen"] == true && window["main"] == true)
+    })?;
+    let native = native_window(&state, title).unwrap().clone();
+    if native["main"].as_bool().is_none() {
+      return Err(format!("UNKNOWN: native main-window observation unavailable: {native}"));
+    }
     let signature = stable_caption_pixels(observer, &native)?;
+    eprintln!("native caption title={title:?}, signature={signature}, state={native}");
     Ok((native, signature))
   }
   fn stable_caption_pixels(observer: &Observer, native: &Value) -> Check<String> {
