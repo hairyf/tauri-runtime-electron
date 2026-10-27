@@ -142,20 +142,21 @@ downloads.on('finished', (payload) => transport.send('download.finished', payloa
 
 // ── 生命周期 ───────────────────────────────────────────────────────────────
 // 每一条都对应一个所有权判断，所以集中在这里。
-// 握手：socket 连上后才交出凭据（Rust 先 accept 再校验）。
-transport.onConnect(() => {
-  transport.send('ready', { electron: process.versions.electron, token: credential })
-})
-
-// 连接断开即退出：窗口寿命归 Rust，socket 断了就没有继续存在的理由。
-transport.onClose(() => app.quit())
-
-app.whenReady().then(() => {
+const ready = app.whenReady().then(() => {
   if (identifier) app.setAppUserModelId(identifier)
   // Tauri 应用自绘窗口装饰；Electron 默认菜单只会造成干扰。
   Menu.setApplicationMenu(null)
   policies.install(session.defaultSession)
 })
+
+// 握手后 Rust 即可调用原生 API，必须先完成 Electron 初始化。
+transport.onConnect(async () => {
+  await ready
+  transport.send('ready', { electron: process.versions.electron, token: credential })
+})
+
+// 连接断开即退出：窗口寿命归 Rust，socket 断了就没有继续存在的理由。
+transport.onClose(() => app.quit())
 
 // 没有窗口时继续运行，直到 socket 断开。
 app.on('window-all-closed', noop)

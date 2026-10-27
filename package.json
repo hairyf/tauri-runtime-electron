@@ -19,7 +19,7 @@
     "test:bridge:prepare": "cargo test --manifest-path electron-rs/Cargo.toml --locked --test bridge prepare_bridge -- --ignored --exact --test-threads=1 --nocapture",
     "test:bridge": "cargo test --manifest-path electron-rs/Cargo.toml --locked --test bridge real_bridge -- --ignored --exact --test-threads=1 --nocapture",
     "test:adapter": "cargo test --locked --lib --test build_config --test window_api --test coverage",
-    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs && node tests/checks/transport.mjs",
+    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs && node tests/checks/transport.mjs && node tests/checks/startup.mjs",
     "typecheck": "tsc -p tsconfig.electron.json",
     "test:runtime": "cargo test --locked -- --nocapture --test-threads=1",
     "test:examples": "node tests/checks/examples.mjs",
