@@ -236,10 +236,7 @@ fn builder_frame_checks(handle: &ElectronRuntimeHandle) {
         }
         Ok(actual) => {
           let reason = format!("{flag}({wanted}) produced native {actual}; platform behavior is not verified");
-          #[cfg(windows)]
           panic!("{member}: {reason}");
-          #[cfg(not(windows))]
-          { unknown = Some(reason); }
         }
         Err(reason) => { unknown = Some(reason); }
       }
@@ -270,14 +267,14 @@ fn unix_frame_checks(window: &Window) {
       continue;
     }
     // These known runtime gaps cannot become passes by echoing a config/WeakMap.
-    if flag == "decorations" || (cfg!(target_os = "linux") && flag == "closable")
-      || (cfg!(target_os = "macos") && flag == "maximizable") {
+    if flag == "decorations" || (cfg!(target_os = "linux") && flag == "closable") {
       report(setter, "this backend does not implement this platform's native frame/button mutation", "unknown");
       continue;
     }
     let mut unknown = None;
     for wanted in [false, true] {
       match flag {
+        "maximizable" => WindowDispatch::<()>::set_maximizable(window, wanted),
         "minimizable" => WindowDispatch::<()>::set_minimizable(window, wanted),
         "closable" => WindowDispatch::<()>::set_closable(window, wanted),
         _ => unreachable!(),

@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import { runtimeModules } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const handlers = new Map()
@@ -52,8 +53,9 @@ const context = vm.createContext({
     },
   },
 })
+context.require = runtimeModules(context, context.require)
 vm.runInContext(`${readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8')}
-;socket = testSocket`, context)
+;state.socket = testSocket`, context)
 for (const scheme of ['tauri', 'ipc', 'asset', 'isolation-test', 'tauri']) {
   context.handle('protocol.register', { scheme })
 }
@@ -122,7 +124,7 @@ switch (process.argv[2]) {
       senderEvents.push({ sender, senderFrame: frame })
       context.senderId = contentsId
       context.webviewId = webviewId
-      vm.runInContext('webviewByContents.set(senderId, webviewId)', context)
+      vm.runInContext('state.webviewByContents.set(senderId, webviewId)', context)
       listeners.get('tauri-ipc')({ sender, senderFrame: frame }, 'ping')
     }
     const acceptedMessages = messages.slice()

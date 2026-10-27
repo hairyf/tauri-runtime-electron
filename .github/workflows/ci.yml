@@ -42,12 +42,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install typecheck dependencies without Electron binaries
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
       # Rust owns expectations; Node executes production JavaScript against
-      # native doubles. This job needs no source submodules, Electron or GUI.
-      - name: Check Electron script syntax
+      # native doubles. This job needs no source submodules or GUI.
+      - name: Check Electron script syntax and types
         run: |
           node --check electron-rs/assets/main.cjs
+          node --check electron-rs/assets/internal.cjs
+          node --check electron-rs/assets/commands.cjs
+          node --check electron-rs/assets/ipc.cjs
           node --check electron-rs/assets/preload.cjs
+          pnpm run typecheck
 
       - name: Test Electron bridge regressions
         run: pnpm run test:bridge:regressions

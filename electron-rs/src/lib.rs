@@ -275,8 +275,10 @@ fn validate_version(version: &str) -> Result<(), Error> {
   Ok(())
 }
 
-const ASSETS: [(&str, &[u8]); 3] = [
+const ASSETS: [(&str, &[u8]); 5] = [
   ("main.cjs", include_bytes!("../assets/main.cjs")),
+  ("internal.cjs", include_bytes!("../assets/internal.cjs")),
+  ("commands.cjs", include_bytes!("../assets/commands.cjs")),
   ("ipc.cjs", include_bytes!("../assets/ipc.cjs")),
   ("preload.cjs", include_bytes!("../assets/preload.cjs")),
 ];
@@ -340,9 +342,12 @@ mod tests {
     assert_eq!(marker["electronVersion"], DEFAULT_VERSION);
     fs::write(output.join("main.cjs"), b"stale").unwrap();
     fs::remove_file(output.join("preload.cjs")).unwrap();
+    fs::write(output.join("commands.cjs"), b"stale commands").unwrap();
+    fs::remove_file(output.join("internal.cjs")).unwrap();
     builder.build().unwrap();
-    assert_eq!(fs::read(output.join("main.cjs")).unwrap(), include_bytes!("../assets/main.cjs"));
-    assert!(output.join("preload.cjs").is_file());
+    for (name, bytes) in ASSETS {
+      assert_eq!(fs::read(output.join(name)).unwrap(), bytes, "staged asset {name}");
+    }
     assert_eq!(find_binary(root.join("runtime")).unwrap(), builder.binary().unwrap());
     assert!(find_binary(root.join("missing")).is_err());
     assert!(validate_version("../escape").is_err());

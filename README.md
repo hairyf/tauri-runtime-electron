@@ -132,6 +132,7 @@ Tests follow code ownership:
 | Command | Scope and prerequisites |
 | --- | --- |
 | `pnpm test` | Bridge regressions, adapter unit/build/API/document tests and effects/evidence checks. No desktop is needed; the root build script still prepares Electron and the coverage check reads the Tauri submodule. |
+| `pnpm run typecheck` | TypeScript checks all Electron CJS assets with Electron/Node declarations and shared runtime-state types. Run `pnpm install --frozen-lockfile --ignore-scripts` first; no Electron binary download or desktop is needed. |
 | `pnpm run test:bridge:prepare` | Stage a private real Electron distribution under `target/electron-bridge`, exercise builder/resource/branding/Node operations and keep it for the next command. |
 | `pnpm run test:bridge` | Use that prepared distribution for handshake, subscriptions, loaded-page preload/protocol IPC, native window/child webview RPCs and shutdown. Requires a desktop; see the [bridge setup](electron-rs/README.md#checks) for Linux sandbox permissions. |
 | `pnpm run test:runtime` | All root Cargo tests, including acquisition, [window smoke](tests/runtime_smoke.rs) and [exit lifecycle](tests/runtime_lifecycle.rs). Requires a desktop; Linux uses Xvfb and a window manager. |

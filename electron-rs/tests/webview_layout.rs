@@ -330,6 +330,16 @@ fn clearing_background_effects_restores_transparency_and_updated_color() {
 }
 
 #[test]
+fn native_client_background_preserves_alpha_and_independent_webview_colors() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["backgrounds"],
+    ))
+    .unwrap();
+    assert_eq!(observed, json!({ "independent": true, "opaque": true }));
+}
+
+#[test]
 fn creation_uses_nested_config_and_applies_webview_preferences_before_navigation() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),

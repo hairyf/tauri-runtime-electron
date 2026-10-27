@@ -4,6 +4,7 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
+import { runtimeModules } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const root = path.resolve('download-fixture')
@@ -69,9 +70,10 @@ const context = vm.createContext({
   clearTimeout: (timer) => timers.delete(timer),
   testSocket: { send: (message) => messages.push(message) },
 })
+context.require = runtimeModules(context, context.require)
 vm.runInContext(`${readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8')}
-;socket = testSocket; installPolicyHandlers();
-webviewByContents.set(7, 70); handlerPolicy.set(70, { download: true });`, context)
+;state.socket = testSocket; installPolicyHandlers();
+state.webviewByContents.set(7, 70); state.handlerPolicy.set(70, { download: true });`, context)
 const inspect = (expression) => vm.runInContext(expression, context)
 class Item extends EventEmitter {
   savePath = ''
@@ -152,7 +154,7 @@ switch (process.argv[2]) {
       stage(download)
       done(download, state)
       const before = finished().length
-      const pendingBeforeDecision = inspect(`downloadRequests.has(${download.request.id})`)
+      const pendingBeforeDecision = inspect(`state.downloadRequests.has(${download.request.id})`)
       answer(download, true, path.join(root, `${state}.bin`))
       failures.push({ state, pendingBeforeDecision, finishedDelta: finished().length - before,
         result: finished().at(-1), clean: clean(download) })
@@ -220,7 +222,7 @@ switch (process.argv[2]) {
     const download = begin()
     stage(download)
     done(download)
-    const pendingBeforeTimeout = inspect('downloadRequests.size')
+    const pendingBeforeTimeout = inspect('state.downloadRequests.size')
     const finishedBeforeTimeout = finished().length
     const timer = [...timers][0]
     const timerPresent = timer !== undefined
@@ -242,4 +244,4 @@ switch (process.argv[2]) {
   default: throw new Error(`unknown scenario ${process.argv[2]}`)
 }
 console.log(JSON.stringify({ ...result, copyFlags, cleanupOptions, renames, timerDelays, savePathDuringCallback,
-  pending: inspect('downloadRequests.size'), timers: timers.size }))
+  pending: inspect('state.downloadRequests.size'), timers: timers.size }))

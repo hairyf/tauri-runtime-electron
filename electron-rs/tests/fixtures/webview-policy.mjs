@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
+import { runtimeModules } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
 const electronDirectory = fileURLToPath(new URL('../../assets/', import.meta.url))
@@ -106,6 +107,7 @@ class Window extends EventEmitter {
     this.bounds = { x: 0, y: 0, width: options.width, height: options.height }
     const views = []
     this.contentView = {
+      setBackgroundColor() {},
       children: views,
       addChildView(view) { views.push(view) },
       removeChildView(view) { const index = views.indexOf(view); if (index >= 0) views.splice(index, 1) },
@@ -123,6 +125,7 @@ class Window extends EventEmitter {
 }
 class ChildView {
   constructor(options) { this.options = options; this.webContents = new Contents(options) }
+  setBackgroundColor(color) { this.color = color }
   setBounds(bounds) { this.bounds = bounds }
   getBounds() { return this.bounds }
 }
@@ -423,9 +426,10 @@ async function sessions() {
     targets, cleanup: cleanup(),
   }
 }
+context.require = runtimeModules(context, context.require)
 try {
-  vm.runInContext(`${fs.readFileSync(path.join(electronDirectory, 'main.cjs'), 'utf8')}\n;socket = testSocket; installPolicyHandlers();`, context)
-  runtime = vm.runInContext('({ handle, sessionFor, installPolicyHandlers, navigationRequests, permissionRequests, windows, childWebviews })', context)
+  vm.runInContext(`${fs.readFileSync(path.join(electronDirectory, 'main.cjs'), 'utf8')}\n;state.socket = testSocket; installPolicyHandlers();`, context)
+  runtime = vm.runInContext('({ handle, sessionFor, installPolicyHandlers, ...state })', context)
   const scripts = [
     { script: 'globalThis.mainScript = (globalThis.mainScript ?? 0) + 1', mainFrameOnly: true },
     { script: 'globalThis.everyFrameScript = (globalThis.everyFrameScript ?? 0) + 1', mainFrameOnly: false },

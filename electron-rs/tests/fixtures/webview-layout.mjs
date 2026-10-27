@@ -7,6 +7,7 @@ import { MessageChannel, receiveMessageOnPort } from 'node:worker_threads'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
+import { runtimeModules } from './runtime-modules.mjs'
 
 const require = createRequire(import.meta.url)
 let nextId = 0
@@ -153,6 +154,7 @@ class Window extends EventEmitter {
   parentCalls = []
   nativeCalls = []
   contentView = {
+    setBackgroundColor: (color) => { this.contentColor = color },
     addChildView: (view) => {
       if (faults.attach) throw new Error('attach failed')
       this.children.push(view)
@@ -168,7 +170,12 @@ class Window extends EventEmitter {
     this.minimizable = options.minimizable ?? true
     this.closable = options.closable ?? true
   }
-  getBackgroundColor() { return this.color ?? this.options.backgroundColor ?? '#ffffff' }
+  getBackgroundColor() {
+    const color = this.color ?? this.options.backgroundColor ?? '#ffffff'
+    const rgb = color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/)
+    if (rgb) return '#' + rgb.slice(1).map(value => Number(value).toString(16).padStart(2, '0')).join('')
+    return /^#[0-9a-f]{8}$/i.test(color) ? color.slice(0, 7) : color
+  }
   setBackgroundColor(color) { this.color = color }
   setBackgroundMaterial(material) { this.material = material; this.color = material === 'none' ? '#ffffff' : '#00000000' }
   getNormalBounds() { return this.getBounds() }
@@ -242,6 +249,7 @@ const context = vm.createContext({
   setImmediate: (callback) => tasks.push(callback),
   __dirname: fileURLToPath(new URL('../../assets/', import.meta.url)),
 })
+context.require = runtimeModules(context, context.require)
 vm.runInContext(readFileSync(new URL('../../assets/main.cjs', import.meta.url), 'utf8'), context)
 const inspect = (expression) => vm.runInContext(expression, context)
 const call = (method, params) => context.handle(method, params)
@@ -251,7 +259,7 @@ const settle = async () => {
   while (tasks.length) await tasks.shift()()
   await new Promise(setImmediate)
 }
-const mainViewOf = (window) => inspect('mainViews').get(window)?.view
+const mainViewOf = (window) => inspect('state.mainViews').get(window)?.view
 const mainContentsOf = (window) => context.mainContents(window)
 const cursorStyles = (contents) => [...(contents?.styles.values() ?? [])]
 const constraintsOf = (window) => ({ min: window.minimum, max: window.maximum })
@@ -263,7 +271,7 @@ const createHost = async (main = false) => {
   await call('window.create', main
     ? { windowId: 2, width: 640, height: 480, webview: { webviewId: 20, url: 'tauri://localhost/main' } }
     : { windowId: 1, width: 800, height: 600 })
-  return inspect(`windows.get(${main ? 2 : 1})`)
+  return inspect(`state.windows.get(${main ? 2 : 1})`)
 }
 const createChildren = async () => {
   const host = await createHost()
@@ -356,7 +364,7 @@ switch (process.argv[2]) {
     for (const [index, view] of host.children.entries()) {
       children.push({ contentsId: view.webContents.id, url: view.webContents.url,
         preferences: { ...view.options.webPreferences, preload: path.basename(view.options.webPreferences.preload) },
-        owner: inspect(`webviewByContents.get(${view.webContents.id})`),
+        owner: inspect(`state.webviewByContents.get(${view.webContents.id})`),
         bounds: (await call('webview.bounds', { webviewId: index + 10 })).bounds })
     }
     host.resize(1001, 701)
@@ -417,13 +425,13 @@ switch (process.argv[2]) {
       focused: first.webContents.focused, visible: first.visible, color: first.color }
     await call('webview.close', { webviewId: 10 })
     const closed = { destroyed: first.webContents.isDestroyed(), children: host.children.length,
-      mapped: inspect(`webviewByContents.has(${first.webContents.id})`),
+      mapped: inspect(`state.webviewByContents.has(${first.webContents.id})`),
       error: await errorFrom(() => call('webview.eval', { webviewId: 10, script: '' })) }
     const remaining = [...host.children]
     host.destroy()
     result = { evalScripts, cursors, hidden, child, closed,
       remainingDestroyed: remaining.map((view) => view.webContents.isDestroyed()),
-      childWebviews: inspect('childWebviews.size'), webviews: inspect('webviews.size'), policies: inspect('handlerPolicy.size') }
+      childWebviews: inspect('state.childWebviews.size'), webviews: inspect('state.webviews.size'), policies: inspect('state.handlerPolicy.size') }
     break
   }
   case 'devtools': {
@@ -449,7 +457,7 @@ switch (process.argv[2]) {
     const interrupted = context.openDevtools(destroyed)
     destroyed.emit('destroyed')
     result = { before, after, destroyedError: await errorFrom(() => interrupted),
-      destroyedPending: inspect('openingDevtools').has(destroyed), timers: timers.size }
+      destroyedPending: inspect('state.openingDevtools').has(destroyed), timers: timers.size }
     break
   }
   case 'rpc': {
@@ -492,7 +500,7 @@ switch (process.argv[2]) {
     const beforeTasks = { closeCalls, replies: replies.length }
     await settle()
     await settle()
-    inspect('socket').close()
+    inspect('state.socket').close()
     result = { closedSynchronously, directReplies, invalidReplies, contentsId: contents.id,
       beforeTasks, closeCalls, closeDuringRead, framedReplies: replies }
     break
@@ -518,11 +526,11 @@ switch (process.argv[2]) {
     const hostVisible = main.visible
     await call('webview.close', { webviewId: 20 })
     result = { attachError, failedContentsDestroyed: allContents.at(-1).isDestroyed(),
-      failedChildMapped: inspect('childWebviews.has(21) || webviews.has(21)'), children: main.children.length,
+      failedChildMapped: inspect('state.childWebviews.has(21) || state.webviews.has(21)'), children: main.children.length,
       url: contents.url, evalResult, contentsId: contents.id,
       script: contents.script, cursor: cursorStyles(contents), unrelatedCursor,
       visible, hostVisible, closeRequested: main.closeRequested ?? false,
-      contentsDestroyed: contents.isDestroyed(), mainMapped: inspect('childWebviews.has(20) || webviews.has(20)'),
+      contentsDestroyed: contents.isDestroyed(), mainMapped: inspect('state.childWebviews.has(20) || state.webviews.has(20)'),
       hostAlive: !main.isDestroyed(), hostHasWebContents: 'webContents' in main }
     break
   }
@@ -530,14 +538,14 @@ switch (process.argv[2]) {
     const main = await createHost(true)
     await call('window.backgroundColor', { windowId: 2, color: '#00000000' })
     await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
-    const initialClear = main.getBackgroundColor()
+    const initialClear = main.color
     const materials = []
     for (const material of ['acrylic', 'mica', 'tabbed']) {
       await call('window.backgroundMaterial', { windowId: 2, material })
-      materials.push({ material: main.material, color: main.getBackgroundColor() })
+      materials.push({ material: main.material, color: main.color })
     }
     await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
-    const cleared = main.getBackgroundColor()
+    const cleared = main.color
     await call('window.backgroundMaterial', { windowId: 2, material: 'acrylic' })
     await call('window.backgroundColor', { windowId: 2, color: '#123456' })
     await call('window.backgroundMaterial', { windowId: 2, material: 'none' })
@@ -548,30 +556,56 @@ switch (process.argv[2]) {
       unsupported: await errorFrom(() => call('window.backgroundMaterial', { windowId: 2, material: 'acrylic' })) }
     break
   }
+  case 'backgrounds': {
+    context.process.platform = 'linux'
+    await call('window.create', { windowId: 80, window: { transparent: true, backgroundColor: [10, 20, 30, 128] },
+      webview: { webviewId: 800, url: 'tauri://localhost/background', transparent: true } })
+    const host = inspect('state.windows.get(80)')
+    const view = inspect('state.childWebviews.get(800).view')
+    assert.equal(host.contentColor, 'rgba(10, 20, 30, 0.502)')
+    assert.equal(view.color, 'rgba(10, 20, 30, 0.502)')
+    await call('webview.backgroundColor', { webviewId: 800, color: '#112233' })
+    await call('window.backgroundColor', { windowId: 80, color: '#55667788' })
+    assert.equal(host.contentColor, '#55667788')
+    assert.equal(view.color, '#112233', 'window backing must not overwrite independent webview color')
+    await call('window.backgroundColor', { windowId: 80, color: null })
+    assert.equal(host.contentColor, '#00000000')
+    await call('window.create', { windowId: 81, window: { transparent: false },
+      webview: { webviewId: 810, url: 'tauri://localhost/opaque' } })
+    const opaque = inspect('state.windows.get(81)')
+    assert.equal(opaque.contentColor, '#ffffff')
+    assert.equal(inspect('state.childWebviews.get(810).view.color'), '#ffffff')
+    await call('window.backgroundColor', { windowId: 81, color: '#12345600' })
+    assert.equal(opaque.contentColor, '#123456', 'nontransparent client backing must remain opaque')
+    await call('window.backgroundColor', { windowId: 81, color: null })
+    assert.equal(opaque.contentColor, '#ffffff')
+    result = { independent: view.color === '#112233', opaque: opaque.contentColor === '#ffffff' }
+    break
+  }
   case 'configuration': {
     await call('window.create', { windowId: 30, title: 'ignored flat title', width: 999,
       window: { title: 'Nested window', width: 640, height: 480, acceptFirstMouse: true,
-        backgroundColor: [10, 20, 30, 128], titleBarStyle: 'overlay',
+        backgroundColor: [10, 20, 30, 128], titleBarStyle: 'Overlay',
         userAgent: 'config-agent', javascriptDisabled: false, devtools: true, backgroundThrottling: 'enabled' },
       webview: { webviewId: 300, url: 'tauri://localhost/main', userAgent: 'main-agent',
         javascriptDisabled: true, devtools: false, backgroundThrottling: 'disabled' } })
-    const main = inspect('windows.get(30)')
+    const main = inspect('state.windows.get(30)')
     await call('webview.create', { windowId: 30, webviewId: 301, url: 'tauri://localhost/child',
       userAgent: 'child-agent', javascriptDisabled: true, devtools: false, backgroundThrottling: 'disabled' })
-    const child = inspect('childWebviews.get(301).view')
+    const child = inspect('state.childWebviews.get(301).view')
     await call('webview.create', { windowId: 30, webviewId: 302, url: 'tauri://localhost/defaults' })
     await call('window.create', { windowId: 31,
       window: { userAgent: 'fallback-agent', javascriptDisabled: true, devtools: false, backgroundThrottling: 'disabled' },
       webview: { webviewId: 310, url: 'tauri://localhost/fallback', userAgent: null,
         javascriptDisabled: null, devtools: null, backgroundThrottling: null } })
-    const fallback = inspect('windows.get(31)')
+    const fallback = inspect('state.windows.get(31)')
     await call('window.create', { windowId: 32, title: 'Flat window', width: 360, height: 240,
       acceptFirstMouse: true, backgroundColor: '#123456', titleBarHidden: true })
-    const flat = inspect('windows.get(32)')
+    const flat = inspect('state.windows.get(32)')
     const titleStyles = []
-    for (const [index, config] of [{ titleBarStyle: 'transparent' }, { hiddenTitle: true }, {}].entries()) {
+    for (const [index, config] of [{ titleBarStyle: 'Transparent' }, { hiddenTitle: true }, { titleBarStyle: 'Visible' }].entries()) {
       await call('window.create', { windowId: 33 + index, window: config })
-      titleStyles.push(inspect(`windows.get(${33 + index}).options.titleBarStyle`))
+      titleStyles.push(inspect(`state.windows.get(${33 + index}).options.titleBarStyle`))
     }
     result = {
       nested: { title: main.options.title, width: main.options.width, height: main.options.height,
@@ -579,7 +613,7 @@ switch (process.argv[2]) {
         backgroundColor: main.options.backgroundColor, titleBarStyle: main.options.titleBarStyle },
       main: { preferences: preferencesOf(mainViewOf(main).options), calls: mainContentsOf(main).calls },
       child: { preferences: preferencesOf(child.options), calls: child.webContents.calls },
-      defaults: preferencesOf(inspect('childWebviews.get(302).view.options')),
+      defaults: preferencesOf(inspect('state.childWebviews.get(302).view.options')),
       fallback: { preferences: preferencesOf(mainViewOf(fallback).options), calls: mainContentsOf(fallback).calls },
       flat: { title: flat.options.title, width: flat.options.width, height: flat.options.height,
         acceptFirstMouse: flat.options.acceptFirstMouse, backgroundColor: flat.options.backgroundColor,
@@ -590,7 +624,7 @@ switch (process.argv[2]) {
   case 'constraints': {
     await call('window.create', { windowId: 40,
       window: { width: 800, height: 600, minWidth: 240, minHeight: 180, maxWidth: 1000, maxHeight: 800 } })
-    const host = inspect('windows.get(40)')
+    const host = inspect('state.windows.get(40)')
     const creation = constraintsOf(host)
     host.frame = { width: 16, height: 38 }
     host.emit('resize')
@@ -676,9 +710,9 @@ switch (process.argv[2]) {
   case 'parent-menu': {
     await call('window.create', { windowId: 50, title: 'Parent' })
     await call('window.create', { windowId: 51, title: 'Child' })
-    const host = inspect('windows.get(51)')
+    const host = inspect('state.windows.get(51)')
     await call('window.setParentWindow', { windowId: 51, parentId: 50 })
-    const attached = host.parent === inspect('windows.get(50)')
+    const attached = host.parent === inspect('state.windows.get(50)')
     await call('window.setParentWindow', { windowId: 51, parentId: null })
     const detached = host.parent === null
     const unknown = await errorFrom(() => call('window.setParentWindow', { windowId: 51, parentId: 999 }))
@@ -756,29 +790,29 @@ switch (process.argv[2]) {
     break
   }
   case 'native-policy': {
-    inspect('socket = {closed:false}')
+    inspect('state.socket = {closed:false}')
     const events = []
     context.send = (message) => {
-      if (inspect('socket && !socket.closed')) events.push(JSON.parse(JSON.stringify(message)))
+      if (inspect('state.socket && !state.socket.closed')) events.push(JSON.parse(JSON.stringify(message)))
     }
     const main = await createHost(true)
     const mainView = mainViewOf(main)
     await call('webview.create', { windowId: 2, webviewId: 21, url: 'about:blank' })
-    const child = inspect('childWebviews.get(21).view')
+    const child = inspect('state.childWebviews.get(21).view')
     const roots = {
       mainOptions: main.options.webPreferences.webviewTag,
       mainView: mainView.options.webPreferences.webviewTag,
       child: child.options.webPreferences.webviewTag,
     }
 
-    inspect('activePopupRequest = 7')
-    inspect('activePopupContents = {session:undefined}')
+    inspect('state.activePopupRequest = 7')
+    inspect('state.activePopupContents = {session:undefined}')
     await call('window.create', {
       windowId: 3, newWindowRequest: 7,
       webview: { webviewId: 30, url: 'about:blank' },
     })
-    const staged = inspect('pendingPopups.get(7)')
-    inspect('pendingPopups.delete(7)')
+    const staged = inspect('state.pendingPopups.get(7)')
+    inspect('state.pendingPopups.delete(7)')
     staged.attach(new Contents())
     const popup = staged.window
     const view = mainViewOf(popup)
@@ -800,10 +834,10 @@ switch (process.argv[2]) {
       guestDestroyed: guest.isDestroyed(),
       viewContentsCleared: view.webContents === undefined,
       shellDestroyed: popup.isDestroyed(),
-      windowMapped: inspect('windows.has(3)'),
-      childMapped: inspect('childWebviews.has(30)'),
-      webviewMapped: inspect('webviews.has(30)'),
-      mainMapped: inspect('mainViews').has(popup),
+      windowMapped: inspect('state.windows.has(3)'),
+      childMapped: inspect('state.childWebviews.has(30)'),
+      webviewMapped: inspect('state.webviews.has(30)'),
+      mainMapped: inspect('state.mainViews').has(popup),
       events: events.splice(0),
     }
     assert.deepEqual(nativeDestroy, {
@@ -815,14 +849,14 @@ switch (process.argv[2]) {
       ],
     })
 
-    inspect('activePopupRequest = 8')
-    inspect('activePopupContents = {session:undefined}')
+    inspect('state.activePopupRequest = 8')
+    inspect('state.activePopupContents = {session:undefined}')
     await call('window.create', {
       windowId: 4, newWindowRequest: 8,
       webview: { webviewId: 31, url: 'about:blank' },
     })
-    const stagedExplicit = inspect('pendingPopups.get(8)')
-    inspect('pendingPopups.delete(8)')
+    const stagedExplicit = inspect('state.pendingPopups.get(8)')
+    inspect('state.pendingPopups.delete(8)')
     stagedExplicit.attach(new Contents())
     const popupExplicit = stagedExplicit.window
     const explicitView = mainViewOf(popupExplicit)
@@ -836,10 +870,10 @@ switch (process.argv[2]) {
       guestDestroyed: explicitGuest.isDestroyed(),
       viewContentsCleared: explicitView.webContents === undefined,
       shellDestroyed: popupExplicit.isDestroyed(),
-      windowMapped: inspect('windows.has(4)'),
-      childMapped: inspect('childWebviews.has(31)'),
-      webviewMapped: inspect('webviews.has(31)'),
-      mainMapped: inspect('mainViews').has(popupExplicit),
+      windowMapped: inspect('state.windows.has(4)'),
+      childMapped: inspect('state.childWebviews.has(31)'),
+      webviewMapped: inspect('state.webviews.has(31)'),
+      mainMapped: inspect('state.mainViews').has(popupExplicit),
       events: events.splice(0),
     }
     assert.deepEqual(explicitClose, {
@@ -849,16 +883,16 @@ switch (process.argv[2]) {
     })
 
     await call('window.create', { windowId: 5, window: { closable: false } })
-    const noSocket = inspect('windows.get(5)')
-    inspect('socket = undefined')
+    const noSocket = inspect('state.windows.get(5)')
+    inspect('state.socket = undefined')
     events.length = 0
     noSocket.close()
     const noSocketClose = {
       prevented: noSocket.lastClosePrevented, destroyed: noSocket.isDestroyed(), events: events.splice(0),
     }
-    inspect('socket = {closed:true}')
+    inspect('state.socket = {closed:true}')
     await call('window.create', { windowId: 6, window: { closable: false } })
-    const closedSocket = inspect('windows.get(6)')
+    const closedSocket = inspect('state.windows.get(6)')
     events.length = 0
     closedSocket.close()
     const closedSocketClose = {
@@ -871,10 +905,10 @@ switch (process.argv[2]) {
   }
   case 'linux-state': {
     context.process.platform = 'linux'
-    inspect('socket = {closed:false}')
+    inspect('state.socket = {closed:false}')
     await call('window.create', { windowId: 60,
       window: { maximizable: false, minimizable: false, closable: false } })
-    const host = inspect('windows.get(60)')
+    const host = inspect('state.windows.get(60)')
     const state = async () => {
       const { maximizable, minimizable, closable } = await call('window.geometry', { windowId: 60 })
       return { maximizable, minimizable, closable }
@@ -899,8 +933,8 @@ switch (process.argv[2]) {
     await call('window.destroy', { windowId: 60 })
     const closedEvents = events.splice(0)
     await call('window.create', { windowId: 61, window: { closable: false } })
-    const disconnected = inspect('windows.get(61)')
-    inspect('socket.closed = true')
+    const disconnected = inspect('state.windows.get(61)')
+    inspect('state.socket.closed = true')
     disconnected.close()
     result = { initial, vetoed, enabled, requested, disabled, vetoedAgain,
       destroyed: host.isDestroyed(), closedEvents,
@@ -910,7 +944,7 @@ switch (process.argv[2]) {
   case 'linux-focus': {
     context.process.platform = 'linux'
     await call('window.create', { windowId: 62, window: { focusable: false, focus: false } })
-    const host = inspect('windows.get(62)')
+    const host = inspect('state.windows.get(62)')
     const configured = { constructor: host.options.focusable, setterCalls: [...host.nativeCalls], focused: host.focused }
     await call('window.focus', { windowId: 62 })
     const blocked = host.focused
@@ -929,7 +963,7 @@ switch (process.argv[2]) {
     screen.getDisplayMatching = () => displays[1]
     await call('window.create', { windowId: 63,
       window: { width: 640, height: 400, center: true, focus: false } })
-    const host = inspect('windows.get(63)')
+    const host = inspect('state.windows.get(63)')
     const builder = host.getBounds()
     host.frame = { width: 20, height: 40 }
     host.setBounds({ x: 2000, y: 50, width: 480, height: 340 })
@@ -978,11 +1012,13 @@ switch (process.argv[2]) {
     host.setSimpleFullScreen = (value) => simpleCalls.push(value)
     host.isFullScreen = () => native
     let acknowledged = false
+    const normalBounds = host.getBounds()
     const entering = call('window.fullscreen', { windowId: 1, fullscreen: true }).then(() => { acknowledged = true })
     await settle()
     const beforeEnter = { acknowledged, fullscreen: (await call('window.geometry', { windowId: 1 })).fullscreen,
       simpleCalls: [...simpleCalls] }
     native = true
+    host.setBounds({ x: 0, y: 0, width: 1920, height: 1080 })
     host.emit('enter-full-screen')
     await entering
     const entered = (await call('window.geometry', { windowId: 1 })).fullscreen
@@ -993,6 +1029,7 @@ switch (process.argv[2]) {
     native = false
     host.emit('leave-full-screen')
     await leaving
+    assert.deepEqual(host.getBounds(), normalBounds, 'ordinary fullscreen must restore its frame, not only monitor-selected fullscreen')
     const exited = (await call('window.geometry', { windowId: 1 })).fullscreen
     const reentering = call('window.fullscreen', { windowId: 1, fullscreen: true })
     native = true
@@ -1038,7 +1075,7 @@ switch (process.argv[2]) {
   }
   default: throw new Error(`unknown scenario ${process.argv[2]}`)
 }
-for (const view of inspect('childWebviews').values()) {
+for (const view of inspect('state.childWebviews').values()) {
   assert.equal(view.view.options.webPreferences.webviewTag, false, 'native views must not enable DOM webview popups')
 }
 console.log(JSON.stringify(result))
