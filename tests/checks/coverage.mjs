@@ -301,7 +301,6 @@ const limitations = {
   gtk_window: '无本地 GTK 窗口；返回错误不算功能通过',
   default_vbox: '无本地 GTK 控件树；返回错误不算功能通过',
   with_webview: '报错且不调用回调，不算功能通过',
-  set_title_bar_style: '不支持运行时变更',
   set_device_event_filter: '本库仅警告；Windows 仍留在分母',
   set_cursor_position: 'Linux 仅警告，不得改为平台 N/A',
   reparent: '迁移原生视图及 Rust 所属关系；需保留页面状态、IPC 和父窗销毁语义',

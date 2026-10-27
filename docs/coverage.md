@@ -46,8 +46,8 @@
 | [`is_minimizable`](<../src/window.rs#L211>) | 查询原生最小化按钮是否可用 | 未验证 | 未验证 | N/A：官方契约：Linux 不支持最小化按钮查询 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L739>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1914>) |
 | [`is_closable`](<../src/window.rs#L215>) | 查询原生关闭按钮是否可用 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L746>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1919>) |
 | [`is_visible`](<../src/window.rs#L223>) | 查询窗口当前是否可见 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L749>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1923>) |
-| [`is_enabled`](<../src/window.rs#L702>) | 查询窗口是否允许用户交互 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L752>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1958>) |
-| [`is_always_on_top`](<../src/window.rs#L710>) | 查询窗口是否置顶 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L759>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1962>) |
+| [`is_enabled`](<../src/window.rs#L703>) | 查询窗口是否允许用户交互 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L752>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1958>) |
+| [`is_always_on_top`](<../src/window.rs#L711>) | 查询窗口是否置顶 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L759>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1962>) |
 | [`title`](<../src/window.rs#L227>) | 获取窗口标题 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L762>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1927>) |
 | [`current_monitor`](<../src/window.rs#L236>) | 获取窗口当前所在显示器 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L767>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1931>) |
 | [`primary_monitor`](<../src/window.rs#L242>) | 获取系统主显示器 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L772>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L1935>) |
@@ -62,7 +62,7 @@
 | [`create_window`](<../src/window.rs#L346>) | 创建原生窗口，可附带初始 webview | 未验证 | 未验证 | 未验证 | 官方 new_window_handler 仍需进程内原生 opener；扩展回调另表 [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L827>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2025>) |
 | [`create_webview`](<../src/window.rs#L354>) | 在指定窗口中创建 webview | 未验证 | 未验证 | 未验证 | 官方 new_window_handler 不能以 Electron 扩展通过替代 [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L834>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2035>) |
 | [`set_resizable`](<../src/window.rs#L361>) | 设置是否允许用户调整窗口大小 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L840>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2042>) |
-| [`set_enabled`](<../src/window.rs#L698>) | 启用或禁用窗口交互 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L847>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2049>) |
+| [`set_enabled`](<../src/window.rs#L699>) | 启用或禁用窗口交互 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L847>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2049>) |
 | [`set_maximizable`](<../src/window.rs#L365>) | 启用或禁用原生最大化按钮 | 未验证 | 未验证 | N/A：官方契约：Linux 不支持设置最大化按钮 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L855>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2056>) |
 | [`set_minimizable`](<../src/window.rs#L369>) | 启用或禁用原生最小化按钮 | 未验证 | 未验证 | N/A：官方契约：Linux 不支持设置最小化按钮 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L862>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2063>) |
 | [`set_closable`](<../src/window.rs#L373>) | 启用或禁用原生关闭按钮 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L871>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2070>) |
@@ -80,12 +80,12 @@
 | [`set_always_on_bottom`](<../src/window.rs#L464>) | 设置窗口是否始终位于其他窗口下方 | 未验证 | 未验证 | 未验证 | 非 Windows 无操作；Windows 仅 true 单次置底 [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L907>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2152>) |
 | [`set_always_on_top`](<../src/window.rs#L474>) | 设置窗口是否始终位于其他窗口上方 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L910>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2159>) |
 | [`set_visible_on_all_workspaces`](<../src/window.rs#L486>) | 设置窗口是否显示在所有虚拟桌面 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L913>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2166>) |
-| [`set_background_color`](<../src/window.rs#L717>) | 设置窗口或 webview 的背景色 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L916>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2363>) |
+| [`set_background_color`](<../src/window.rs#L718>) | 设置窗口或 webview 的背景色 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L916>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2363>) |
 | [`set_content_protected`](<../src/window.rs#L493>) | 请求阻止其他应用截取窗口内容 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L919>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2173>) |
 | [`set_size`](<../src/window.rs#L497>) | 调整窗口内容区或 webview 的尺寸 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L922>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2180>) |
 | [`set_min_size`](<../src/window.rs#L507>) | 设置或清除窗口内容区最小尺寸 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L925>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2187>) |
 | [`set_max_size`](<../src/window.rs#L511>) | 设置或清除窗口内容区最大尺寸 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L928>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2194>) |
-| [`set_size_constraints`](<../src/window.rs#L683>) | 设置各轴的最小和最大尺寸约束 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L931>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2201>) |
+| [`set_size_constraints`](<../src/window.rs#L684>) | 设置各轴的最小和最大尺寸约束 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L931>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2201>) |
 | [`set_position`](<../src/window.rs#L515>) | 移动窗口或窗口内的 webview | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L934>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2208>) |
 | [`set_fullscreen`](<../src/window.rs#L528>) | 进入或退出全屏 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L937>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2222>) |
 | [`set_fullscreen_on_monitor`](<../src/window.rs#L532>) | 在指定桌面坐标所在的显示器全屏 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L942>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2215>) |
@@ -105,9 +105,9 @@
 | [`set_badge_label`](<../src/window.rs#L659>) | 设置或清除 macOS Dock 图标角标文字 | N/A：官方契约：仅 macOS | 未验证 | N/A：官方契约：仅 macOS |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L996>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2319>) |
 | [`set_overlay_icon`](<../src/window.rs#L663>) | 设置或清除 Windows 任务栏叠加图标 | 未验证 | N/A：官方契约：仅 Windows | N/A：官方契约：仅 Windows |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1001>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2326>) |
 | [`set_progress_bar`](<../src/window.rs#L635>) | 设置任务栏或 Dock 的进度与状态 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1009>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2335>) |
-| [`set_title_bar_style`](<../src/window.rs#L671>) | 修改 macOS 标题栏样式 | N/A：官方契约：仅 macOS | 未验证 | N/A：官方契约：仅 macOS | 不支持运行时变更 [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1016>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2342>) |
-| [`set_traffic_light_position`](<../src/window.rs#L679>) | 移动 macOS 标题栏红黄绿按钮 | N/A：官方契约：仅 macOS | 未验证 | N/A：官方契约：仅 macOS |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1025>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2349>) |
-| [`set_theme`](<../src/window.rs#L689>) | 设置明暗主题，或跟随系统 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1033>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2356>) |
+| [`set_title_bar_style`](<../src/window.rs#L670>) | 修改 macOS 标题栏样式 | N/A：官方契约：仅 macOS | 未验证 | N/A：官方契约：仅 macOS |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1016>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2342>) |
+| [`set_traffic_light_position`](<../src/window.rs#L680>) | 移动 macOS 标题栏红黄绿按钮 | N/A：官方契约：仅 macOS | 未验证 | N/A：官方契约：仅 macOS |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1025>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2349>) |
+| [`set_theme`](<../src/window.rs#L690>) | 设置明暗主题，或跟随系统 | 未验证 | 未验证 | 未验证 |  [契约](<../source/tauri/crates/tauri-runtime/src/lib.rs#L1033>) / [wry](<../source/tauri/crates/tauri-runtime-wry/src/lib.rs#L2356>) |
 
 ## WebviewDispatch（31）
 

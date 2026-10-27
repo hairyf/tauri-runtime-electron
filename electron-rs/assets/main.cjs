@@ -476,15 +476,24 @@ function configureWindowStyle(window, changes = {}) {
   if (!['visible', 'transparent', 'overlay'].includes(style)) throw new Error('invalid title bar style')
   appKit().configureStyle(window.getNativeWindowHandle(), config.decorations !== false, style, config.hiddenTitle === true || config.titleBarHidden === true)
   state.windowConfigs.set(window, config)
+  applyMaximizable(window)
   if (config.trafficLightPosition) setTrafficLights(window, config.trafficLightPosition)
   resizeChildWebviews(window)
 }
 
-function setTrafficLights(window, position) {
+function applyMaximizable(window) {
   if (process.platform === 'darwin') {
-    appKit().trafficLights(window.getNativeWindowHandle(), position.x, position.y)
+    // Electron enables zoom for fullscreen too; Tauri exposes maximize separately.
+    appKit().setMaximizable(window.getNativeWindowHandle(), state.maximizableState.get(window) !== false)
+  }
+}
+
+function setTrafficLights(window, position) {
+  if (typeof window.setWindowButtonPosition === 'function') {
+    // Electron retains this inset and reapplies it after AppKit relayouts.
+    window.setWindowButtonPosition(position)
     state.windowConfigs.set(window, { ...state.windowConfigs.get(window), trafficLightPosition: position })
-  } else if (typeof window.setWindowButtonPosition === 'function') window.setWindowButtonPosition(position)
+  }
 }
 
 function webviewConfig(config, webview = {}) {
@@ -1234,7 +1243,7 @@ function readGeometry(window) {
     alwaysOnTop: window.isAlwaysOnTop(),
     decorated: process.platform === 'darwin' ? appKit().isDecorated(window.getNativeWindowHandle()) : window.__tauriDecorations ?? true,
     title: window.getTitle(),
-    maximizable: window.isMaximizable(),
+    maximizable: process.platform === 'darwin' ? appKit().isMaximizable(window.getNativeWindowHandle()) : window.isMaximizable(),
     minimizable: window.isMinimizable(),
     // Linux has no native close-button getter; retain its close-request policy.
     closable: process.platform === 'linux' ? state.closableState.get(window) ?? true : window.isClosable(),
@@ -1441,6 +1450,7 @@ const commandContext = {
   serializeError,
   setWindowBackgroundColor,
   configureWindowStyle,
+  applyMaximizable,
   setTrafficLights,
   applyWindowCursorCss,
   setWindowCursor,

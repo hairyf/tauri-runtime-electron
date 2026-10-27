@@ -667,13 +667,14 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     )
   }
 
-  // Electron applies the title bar style only while creating the window.
-  fn set_title_bar_style(&self, _style: tauri_utils::TitleBarStyle) -> Result<()> {
-    crate::runtime::unsupported(
-      "WindowDispatch::set_title_bar_style",
-      "Electron only reads titleBarStyle while creating the window",
-    );
-    Ok(())
+  fn set_title_bar_style(&self, style: tauri_utils::TitleBarStyle) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return self.window_call("window.titleBarStyle", json!({ "style": style }));
+    #[cfg(not(target_os = "macos"))]
+    {
+      let _ = style;
+      Ok(())
+    }
   }
 
   fn set_traffic_light_position(&self, position: Position) -> Result<()> {

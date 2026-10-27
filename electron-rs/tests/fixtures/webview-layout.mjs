@@ -209,7 +209,8 @@ class Window extends EventEmitter {
   isFocused() { return true }
   isFullScreen() { return false }
   isSimpleFullScreen() { return false }
-  isResizable() { return true }
+  isResizable() { return this.resizable !== false }
+  setResizable(value) { this.resizable = value }
   isMaximizable() { return this.maximizable }
   isMinimizable() { return this.minimizable }
   isClosable() { return this.closable }
@@ -245,7 +246,8 @@ const appkit = {
     window.appkitStyle = { decorated, style, hidden }
   },
   isDecorated(handle) { return this.window(handle).appkitStyle?.decorated ?? true },
-  trafficLights(handle, x, y) { this.window(handle).setWindowButtonPosition({ x, y }) },
+  setMaximizable(handle, enabled) { this.window(handle).nativeMaximizable = enabled },
+  isMaximizable(handle) { return this.window(handle).nativeMaximizable !== false },
 }
 const context = vm.createContext({
   require: (name) => name === 'electron' ? {
@@ -995,12 +997,22 @@ switch (process.argv[2]) {
     host.setWindowButtonPosition = (position) => trafficLights.push(position)
     await call('window.trafficLight', { windowId: 63, x: 42, y: 34, physical: false })
     await call('window.trafficLight', { windowId: 63, x: 52, y: 44, physical: true })
+    const initialTrafficLights = [...trafficLights]
+    await call('window.maximizable', { windowId: 63, maximizable: false })
+    assert.equal(host.nativeMaximizable, false)
+    await call('window.titleBarStyle', { windowId: 63, style: 'Overlay' })
+    assert.equal(host.appkitStyle.style, 'overlay')
+    assert.equal(host.nativeMaximizable, false)
+    await call('window.resizable', { windowId: 63, resizable: true })
+    assert.equal(host.nativeMaximizable, false)
+    await call('window.maximizable', { windowId: 63, maximizable: true })
+    assert.equal(host.nativeMaximizable, true)
     context.process.platform = 'linux'
     let nativeCenters = 0
     host.center = () => { nativeCenters++ }
     await call('window.center', { windowId: 63 })
     result = { builder, centered, focus, nativeCenters,
-      fullscreen: host.options.fullscreen, fullscreenable: host.options.fullscreenable, trafficLights }
+      fullscreen: host.options.fullscreen, fullscreenable: host.options.fullscreenable, trafficLights: initialTrafficLights }
     break
   }
   case 'lifecycle': {

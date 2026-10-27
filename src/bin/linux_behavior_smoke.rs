@@ -41,7 +41,7 @@ mod linux {
         ElectronWindowDispatcher as Window,
     };
 
-    type Check = Result<(), String>;
+    type Check<T = ()> = Result<T, String>;
     const WAIT: Duration = Duration::from_secs(4);
     const XPROP_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_XPROP_OUTPUT: usize = 16 * 1024;

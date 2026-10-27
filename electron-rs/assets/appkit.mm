@@ -2,7 +2,6 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
-#include <cmath>
 
 // Stable Node-API ABI; no Electron/V8 headers or renderer access is required.
 extern "C" {
@@ -79,8 +78,9 @@ napi_value configure_style(napi_env env, napi_callback_info info) {
   @try {
     NSButton* buttons[] = { [window standardWindowButton:NSWindowCloseButton],
       [window standardWindowButton:NSWindowMiniaturizeButton], [window standardWindowButton:NSWindowZoomButton] };
-    bool enabled[3], concealed[3];
+    bool present[3], enabled[3], concealed[3];
     for (int i = 0; i < 3; ++i) {
+      present[i] = buttons[i] != nil;
       enabled[i] = buttons[i].enabled;
       concealed[i] = buttons[i].hidden;
     }
@@ -88,8 +88,8 @@ napi_value configure_style(napi_env env, napi_callback_info info) {
     NSWindowStyleMask mask = window.styleMask;
     if (decorated) mask |= NSWindowStyleMaskTitled;
     else mask &= ~NSWindowStyleMaskTitled;
-    // Match Tao: Visible and Overlay use full-size content, Transparent does not.
-    if (strcmp(style, "transparent")) mask |= NSWindowStyleMaskFullSizeContentView;
+    // Only Overlay extends content behind the title bar; Visible keeps the native caption inset.
+    if (!strcmp(style, "overlay")) mask |= NSWindowStyleMaskFullSizeContentView;
     else mask &= ~NSWindowStyleMaskFullSizeContentView;
     window.styleMask = mask;
     window.titlebarAppearsTransparent = strcmp(style, "visible") != 0;
@@ -97,11 +97,48 @@ napi_value configure_style(napi_env env, napi_callback_info info) {
     [window setFrame:frame display:YES];
     for (int i = 0; i < 3; ++i) {
       NSButton* button = [window standardWindowButton:(NSWindowButton)i];
-      button.enabled = enabled[i];
-      button.hidden = concealed[i];
+      if (present[i] && button) {
+        button.enabled = enabled[i];
+        button.hidden = concealed[i];
+      }
     }
     [window.contentView layoutSubtreeIfNeeded];
     return done(env);
+  } @catch (NSException* exception) { return fail(env, exception.reason.UTF8String); }
+}
+
+napi_value set_maximizable(napi_env env, napi_callback_info info) {
+  napi_value args[2];
+  bool maximizable = false;
+  if (!args_for(env, info, 2, args) || napi_get_value_bool(env, args[1], &maximizable) != 0) {
+    return fail(env, "setMaximizable expects a native window handle and boolean");
+  }
+  NSWindow* window = window_for_view(env, args[0]);
+  if (!window) return nullptr;
+  @try {
+    NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
+    if (!zoom) {
+      if (!(window.styleMask & NSWindowStyleMaskTitled)) return done(env);
+      return fail(env, "native zoom button is unavailable");
+    }
+    zoom.enabled = maximizable && (window.styleMask & NSWindowStyleMaskResizable) != 0;
+    return done(env);
+  } @catch (NSException* exception) { return fail(env, exception.reason.UTF8String); }
+}
+
+napi_value is_maximizable(napi_env env, napi_callback_info info) {
+  napi_value args[1], result = nullptr;
+  if (!args_for(env, info, 1, args)) return fail(env, "isMaximizable expects a native window handle");
+  NSWindow* window = window_for_view(env, args[0]);
+  if (!window) return nullptr;
+  @try {
+    NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
+    if (!zoom) {
+      if (!(window.styleMask & NSWindowStyleMaskTitled)) return napi_get_boolean(env, false, &result) == 0 ? result : fail(env, "cannot read native zoom button state");
+      return fail(env, "native zoom button is unavailable");
+    }
+    if (napi_get_boolean(env, zoom.enabled, &result) != 0) return fail(env, "cannot read native zoom button state");
+    return result;
   } @catch (NSException* exception) { return fail(env, exception.reason.UTF8String); }
 }
 
@@ -116,42 +153,12 @@ napi_value is_decorated(napi_env env, napi_callback_info info) {
   return result;
 }
 
-napi_value traffic_lights(napi_env env, napi_callback_info info) {
-  napi_value args[3];
-  double x = 0, y = 0;
-  if (!args_for(env, info, 3, args) || napi_get_value_double(env, args[1], &x) != 0
-      || napi_get_value_double(env, args[2], &y) != 0 || !std::isfinite(x) || !std::isfinite(y)) {
-    return fail(env, "invalid traffic light position");
-  }
-  NSWindow* window = window_for_view(env, args[0]);
-  if (!window) return nullptr;
-  @try {
-    NSButton* close = [window standardWindowButton:NSWindowCloseButton];
-    NSButton* mini = [window standardWindowButton:NSWindowMiniaturizeButton];
-    NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
-    NSView* container = close.superview.superview;
-    if (!close || !mini || !zoom || !container) return fail(env, "native window controls are unavailable");
-    // Same window-relative inset as Tao, preserving the native button spacing.
-    NSRect frame = container.frame;
-    frame.size.height = close.frame.size.height + y;
-    frame.origin.y = window.frame.size.height - frame.size.height;
-    [container setFrame:frame];
-    double spacing = mini.frame.origin.x - close.frame.origin.x;
-    NSButton* buttons[] = { close, mini, zoom };
-    for (int i = 0; i < 3; ++i) {
-      NSPoint origin = buttons[i].frame.origin;
-      origin.x = x + i * spacing;
-      [buttons[i] setFrameOrigin:origin];
-    }
-    return done(env);
-  } @catch (NSException* exception) { return fail(env, exception.reason.UTF8String); }
-}
 } // namespace
 
 extern "C" __attribute__((visibility("default"))) napi_value napi_register_module_v1(napi_env env, napi_value exports) {
-  const char* names[] = { "configureStyle", "isDecorated", "trafficLights" };
-  napi_callback callbacks[] = { configure_style, is_decorated, traffic_lights };
-  for (int i = 0; i < 3; ++i) {
+  const char* names[] = { "configureStyle", "isDecorated", "setMaximizable", "isMaximizable" };
+  napi_callback callbacks[] = { configure_style, is_decorated, set_maximizable, is_maximizable };
+  for (int i = 0; i < 4; ++i) {
     napi_value function = nullptr;
     if (napi_create_function(env, names[i], static_cast<size_t>(-1), callbacks[i], nullptr, &function) != 0
         || napi_set_named_property(env, exports, names[i], function) != 0) return nullptr;

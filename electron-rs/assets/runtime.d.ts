@@ -3,7 +3,8 @@ import type { BaseWindow, BrowserWindowConstructorOptions, DownloadItem, Protoco
 export interface AppKit {
   configureStyle(handle: Buffer, decorated: boolean, style: string, hiddenTitle: boolean): void
   isDecorated(handle: Buffer): boolean
-  trafficLights(handle: Buffer, x: number, y: number): void
+  setMaximizable(handle: Buffer, enabled: boolean): void
+  isMaximizable(handle: Buffer): boolean
 }
 
 export interface IpcFetchRequest {
