@@ -169,6 +169,8 @@ mod linux {
     fn xprop_window(xid: u32, properties: &[&str]) -> Result<String, String> {
         let xid = format!("0x{xid:x}");
         let child = Command::new("xprop")
+            // Override xprop's built-in ASCII icon renderer: inspect the actual ARGB cardinals.
+            .args(["-f", "_NET_WM_ICON", "32c"])
             .arg("-len")
             .arg("64")
             .arg("-id")
