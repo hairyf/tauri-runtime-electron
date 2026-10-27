@@ -1,23 +1,25 @@
 # tauri-runtime-electron
 
-Experimental Electron backend for Tauri, replacing the system WebView.
+An experimental Tauri 2 runtime that runs windows and webviews in Electron instead of the system WebView.
 
-- Rust keeps the event loop, commands, CSP and ACL.
+- Rust owns Tauri's event loop, commands, CSP, and ACL.
 - Electron runs windows and webviews in a child process over local JSON-RPC.
-- The build prepares Electron and app metadata from your existing Tauri config.
+- Build-time configuration prepares a private Electron distribution.
 
-`main` targets **Tauri 2 / tauri-runtime 2.12**; `next` tracks **Tauri 3.0.0-alpha** with an incompatible runtime contract. Not published to crates.io; pin a Git revision or tag for releases.
+`main` targets **Tauri 2 / tauri-runtime 2.12**. `next` tracks **Tauri 3.0.0-alpha** with an incompatible runtime contract. This project is Git-only and not published to crates.io; pin a revision or tag for releases.
+
+## Install
 
 ```toml
 [dependencies]
 tauri = { version = "2", default-features = false }
-tauri-runtime-electron = { git = "https://github.com/hairyf/tauri-runtime-electron", branch = "main" }
+tauri-runtime-electron = { git = "https://github.com/hairyf/tauri-runtime-electron.git" }
 
 [build-dependencies]
 tauri-build = "2"
 ```
 
-Keep `tauri_build::build()` in your application's build script, then select the runtime through Tauri's generic builder:
+Keep `tauri_build::build()` in the application's `build.rs`, then select the runtime through Tauri's generic builder:
 
 ```rust
 use tauri_runtime_electron::ElectronRuntime;
@@ -29,38 +31,31 @@ fn main() {
 }
 ```
 
-The crate's [build script](build.rs) merges the base, platform and CLI Tauri config and reads `productName`, `identifier` and `bundle.icon`. It uses the pinned `electron_rs::DEFAULT_VERSION` (currently `45.0.0`), a local install/cache or the official Electron release download with SHA-256 verification. No Electron environment variables or extra application builder call are needed. Automatic config discovery covers standard single-app layouts; ambiguous app selection fails explicitly. See the [discovery limits](docs/handoff.md) for workspaces and external target directories.
+The build reads `productName`, `identifier`, and `bundle.icon` from the consuming Tauri config, then uses the independent [electron-rs project](https://github.com/hairyf/electron-rs) to prepare Electron `45.0.0` by default. It may use a local install/cache or download the verified official release. Runtime startup never downloads, extracts, brands, or repairs Electron.
 
-For Isolation or a custom protocol, register its scheme **before creating the runtime, on the same thread**, and keep the original context:
+## Bundle
+
+Map the complete prepared distribution into the application resources:
+
+```json
+{"bundle":{"resources":{"target/electron":"runtime"}}}
+```
+
+The output is `target/electron/<platform>-<arch>` with no version directory. Bundle all libraries, resources, metadata, and generated scripts. Startup searches adjacent `runtime` locations and standard Linux package paths; only debug builds can fall back to the build-machine staging path.
+
+For Isolation or a custom protocol, register its scheme before creating the runtime, on the same thread:
 
 ```rust
 let context = tauri::generate_context!();
 if let tauri::Pattern::Isolation { schema, .. } = context.pattern() {
     tauri_runtime_electron::register_custom_protocol_scheme(schema)?;
 }
-// Register other schemes here, e.g. register_custom_protocol_scheme("my-scheme")?.
 tauri::Builder::<ElectronRuntime>::new().run(context)?;
 ```
 
-## Bundling
+## Electron bridge
 
-```json
-{"bundle":{"resources":{"target/electron":"runtime"}}}
-```
-
-Output is `target/electron/<platform>-<arch>`, such as `target/electron/win32-x64`, with **no version directory**. If your target root differs, adjust the source path and keep the destination `runtime`. Bundle the entire distribution, including libraries, metadata and generated scripts.
-
-Native icons use `.ico` on Windows and `.icns` on macOS; Linux currently supports executable renaming only. Apply release signing/notarization after branding. The [member report](docs/coverage.md) records real Windows/macOS/Linux CI runs; release signing, notarization and installed-package behavior require separate validation.
-
-Startup locates prepared files beside the app (`runtime`, `resources/runtime` or macOS `Resources/runtime`) and standard Linux package locations derived from `productName`: `../lib/<productName>/runtime`, `$APPDIR/usr/lib/<productName>/runtime` and `/usr/lib/<productName>/runtime`. Only debug builds can fall back to the build machine's staging path. **Startup never downloads, extracts or patches Electron.** Missing runtime files or scripts are errors.
-
-For use without Tauri, see the separate [electron-rs README](electron-rs/README.md).
-
-## Node and Electron commands
-
-`Electron::new().node(&args)` runs a separate Node-mode process; `.electron(&args)` runs a separate normal Electron process. Both use the configured/resolved binary, block until exit, and return `std::io::Result<std::process::Output>`. Nonzero exits retain their status and raw stdout/stderr. Neither starts an RPC bridge.
-
-To reuse the application's **current** Electron process, enable `features = ["tauri"]` and obtain its client from a Tauri webview:
+Enable `features = ["tauri"]` to access the authenticated client of the current Electron process:
 
 ```rust
 use tauri_runtime_electron::{main_bridge, CommandOutput, ElectronRuntime};
@@ -69,107 +64,42 @@ async fn run_task(
     webview: &tauri::Webview<ElectronRuntime>,
 ) -> Result<CommandOutput, Box<dyn std::error::Error>> {
     let bridge = main_bridge(webview).await?;
-    let output = bridge.node_in_main(
-        "console.log(args[0]); return { answer: 42 };", &["hello from Rust"],
-    ).await?;
+    let output = bridge
+        .node_in_main("console.log(args[0]); return { answer: 42 };", &["hello"])
+        .await?;
     assert_eq!(output.result["answer"], 42);
-    let main = bridge.electron_in_main(
-        "return { ready: require('electron').app.isReady() };", &[],
-    ).await?;
-    assert_eq!(main.result["ready"], true);
     Ok(output)
 }
 ```
 
-The returned `ElectronBridge` is an `Arc` of the existing authenticated client; keep it for subsequent commands if desired. Direct runtime users can call `ElectronWebviewDispatcher::main_bridge()`. Node tasks use short-lived Workers in that same process; Electron tasks run on the current main thread. These methods take async JavaScript function bodies, not command-line argument lists.
+`main_bridge` returns an `Arc` client for the existing process; `ElectronWebviewDispatcher::main_bridge()` is the direct runtime form. `node_in_main` uses a short-lived Worker, while `electron_in_main` runs on Electron's main thread. Both accept async JavaScript function bodies, preserve raw `stdout`/`stderr` separately from JSON `result`, and support `.on_output(...)`, `.timeout(...)`, and `.max_output_bytes(...)`. Defaults are 30 seconds and 16 MiB. Main-thread cancellation cannot interrupt synchronous JavaScript, and no generic renderer execution endpoint is registered.
 
-Both async variants return `CommandOutput { code, stdout, stderr, result }`; logs remain raw bytes, separate from the JSON value. Add `.on_output(...)` for continuous `CommandChunk { sequence, stream, data }` notifications before completion, and `.timeout(...)` / `.max_output_bytes(...)` for bounds. Defaults are 30 seconds and 16 MiB; nonzero exit codes remain results, while transport/output-limit failures are errors. Logs are isolated by task and bypass the runtime event queue. Worker cancellation terminates the Worker; main-thread cancellation is cooperative and cannot interrupt synchronous JavaScript. Await work inside an Electron task before returning. See the [command API and streaming example](electron-rs/README.md#command-execution) for exit codes, cleanup and limits. No generic renderer execution endpoint is registered.
+For lower-level acquisition, RPC, events, and command APIs, see [electron-rs](https://github.com/hairyf/electron-rs).
 
-<a id="2-window-api-and-native-effects"></a>
-<details>
-<summary>Optional native window effects</summary>
+## Native process helpers
 
-Enable `features = ["tauri"]` on the runtime dependency to use its [window extension](src/window/extension.rs):
+`Electron::node(&args)` and `Electron::electron(&args)` run separate processes using the resolved binary. They do not start an RPC bridge; nonzero exits are `Ok(std::process::Output)` with status and raw output preserved.
 
-```rust
-use tauri_runtime_electron::window::{Effect, EffectsBuilder, Window};
-fn effects(window: tauri::Window<tauri_runtime_electron::ElectronRuntime>) -> tauri::Result<()> {
-    let window = Window::from(window);
-    window.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).build())?;
-    window.clear_effects()
-}
-```
+## Native extensions
 
-For frontend calls, register `.plugin(tauri_runtime_electron::window::init())` on the app builder and declare the inline plugin in the application's build script:
+- The optional [window effects API](src/window/extension.rs) supports Acrylic, Mica, and Tabbed on Windows 11 22H2 (build 22621)+. Unsupported platforms or effect lists return errors; official Tauri effects are not redirected here.
+- Windows attached Tauri menus are mirrored through a Rust UI-thread owner. Native menu integration on macOS/Linux and popup placement remain unverified.
+- `with_webview` cannot expose another process's WebView2, GTK, or AppKit objects and returns an error without calling the callback. macOS native window handles and WKWebView data-store operations are unavailable.
+- Page `window.open` uses native Chromium popups by default. Use this crate's `new_window` API for `Allow`/`Deny`/`Create`; the official process-local `new_window_handler` remains unsupported.
+- Native icons use `.ico` on Windows and `.icns` on macOS. Linux currently supports executable renaming only. Apply release signing and macOS notarization after branding.
 
-```rust
-fn main() {
-    tauri_build::try_build(tauri_build::Attributes::new().plugin(
-        "electron-window",
-        tauri_build::InlinedPlugin::new().commands(&["set_effects"]),
-    )).expect("failed to build application");
-}
-```
+## Status
 
-In a capability, grant `electron-window:allow-set-effects` to the intended windows, for example `{"identifier":"main-window","windows":["main"],"permissions":["electron-window:allow-set-effects"]}`.
-
-Link the private, unpublished frontend package from this checkout with its `@tauri-apps/api` v2 peer:
-
-```ts
-import { Effect, getCurrentWindow } from 'tauri-runtime-electron/api/window'
-const window = getCurrentWindow()
-await window.setEffects({ effects: [Effect.Acrylic] })
-await window.clearEffects()
-```
-
-Calls use normal Tauri IPC/ACL. Only Acrylic, Mica and Tabbed on Windows 11 22H2 (build 22621)+ are supported; the first supported entry wins. Unsupported platforms/lists return errors; clearing restores background color and alpha. `state`, `radius`, `interactive` and `color` have no effect here. Official Tauri window effects are not redirected to this extension.
-
-</details>
-
-## Limits
-
-See the [method coverage](docs/coverage.md) for each member's purpose and exact-commit CI results. Commit `4fb041d9854a3a2f7a4051f83df530c74082ef8c` passed 27 real desktop suites: **154/192 (80.2%)** official members passed on every applicable platform, with five Electron extensions counted separately. Unverified, skipped and failed members do not count as supported.
-
-- Windows attached Tauri menus are mirrored to Electron; commands and accelerators dispatch through a Rust UI-thread menu owner. Menu changes synchronize during the event pump. Native menu integration on macOS/Linux and popup placement remain unverified. Cross-process IDs do not provide local WebView2, GTK or AppKit objects: `with_webview` errors without calling the callback; macOS native window handles and WKWebView data-store operations are unavailable.
-- Page `window.open` defaults to native Chromium popups, retaining the original `WindowProxy`, opener, POST data and lifecycle. Use this crate's [new-window API](src/new_window.rs) for `Allow`/`Deny`/`Create`; the Tauri facade requires `features = ["tauri"]`. For `Create`, build inside `with_opener(features.opener(), || ...)` and return `NewWindowResponse::create(&window)`. Official `new_window_handler` still fails explicitly because its process-local WebView handles cannot cross processes; the original API example is not stripped or rewritten to hide that limitation. Accepted navigation resumes the original request; a subframe veto affects only that frame.
-- Initialization scripts keep their frame scope; IPC is main-frame-only. `convertFileSrc` still needs `protocol-asset` and an `assetProtocol` scope. Matching resolved `data_directory` paths share a session; incognito webviews have separate in-memory sessions.
-- Downloads stay private until complete and first approved by the host, then publish without overwriting. Publication failures retain the staged file and report its path; denial, timeout and destruction clean it up. Exit vetoes/codes are respected: `run_return` returns the code, while `run` exits the Rust process.
-- On macOS, configured title-bar styles and hidden titles map to native window options; runtime title-bar style and traffic-light position changes have independent native CI assertions. Non-Windows native dragging usually needs `-webkit-app-region: drag`. `DebugEnvironment::Auto` permits diagnostic environment variables only in debug builds. OS composition settings affect native materials; RPC success and CSS `backdrop-filter` do not establish desktop blur.
+Historical CI evidence for commit [`4fb041d9854a3a2f7a4051f83df530c74082ef8c`](https://github.com/hairyf/tauri-runtime-electron/commit/4fb041d9854a3a2f7a4051f83df530c74082ef8c) recorded **154/192 (80.2%)** applicable official members across Windows, macOS, and Linux. That result is tied to that exact archived commit and does not describe the current build; skipped, failed, and unverified members remain unsupported. See the [method coverage](docs/coverage.md) and [acceptance notes](docs/acceptance.md).
 
 ## Examples and checks
 
-With Node.js 24+, pnpm, Rust and platform dependencies installed:
-
 ```bash
-git submodule update --init source/tauri source/electron
-pnpm example                         # list examples
 pnpm example helloworld
-pnpm example transparent
-pnpm example commands --prepare-only
 pnpm test
 cargo check --locked --all-targets --all-features
 ```
 
-Tests follow code ownership:
-
-- [electron-rs tests](electron-rs/tests/) own acquisition, metadata and bridge behavior. Protocol/IPC, downloads, child layout and webview policy stay here, with Rust assertions over small Node VM fixtures executing the production JavaScript against native doubles.
-- [Root tests](tests/) own the Tauri adapter, library window API and examples. JavaScript checks live in [tests/checks](tests/checks/), and [tests/common](tests/common/mod.rs) supplies the root Rust helper. Module unit tests stay beside their implementation under [src](src/).
-- [scripts](scripts/) contains environment/native helpers and the example launch entry. It does not own test assertions.
-
-[package.json](package.json) provides the shared entry points used by CI:
-
-| Command | Scope and prerequisites |
-| --- | --- |
-| `pnpm test` | Bridge regressions, adapter unit/build/API/document tests and effects/evidence checks. No desktop is needed; the root build script still prepares Electron and the coverage check reads the Tauri submodule. |
-| `pnpm run typecheck` | TypeScript checks all Electron CJS assets with Electron/Node declarations and shared runtime-state types. Run `pnpm install --frozen-lockfile --ignore-scripts` first; no Electron binary download or desktop is needed. |
-| `pnpm run test:bridge:prepare` | Stage a private real Electron distribution under `target/electron-bridge`, exercise builder/resource/branding/Node operations and keep it for the next command. |
-| `pnpm run test:bridge` | Use that prepared distribution for handshake, subscriptions, loaded-page preload/protocol IPC, native window/child webview RPCs and shutdown. Requires a desktop; see the [bridge setup](electron-rs/README.md#checks) for Linux sandbox permissions. |
-| `pnpm run test:runtime` | All root Cargo tests, including acquisition, [window smoke](tests/runtime_smoke.rs) and [exit lifecycle](tests/runtime_lifecycle.rs). Requires a desktop; Linux uses Xvfb and a window manager. |
-| `pnpm run test:examples helloworld state` | Build and check the selected original examples serially; `pnpm check` is an alias. Requires a desktop and example dependencies. |
-| `pnpm run test:coverage` | Check the member report against its archived exact-commit CI records; regenerate with `node tests/checks/coverage.mjs --write`. New CI runs use their own `--evidence`, `--commit` and `--run`, without inheriting archived passes. |
-
-The [example runner](scripts/example.mjs) adapts copies under `target/example/tauri`, preserving framework sources and original pages/commands/CSP/ACL/Isolation. Run examples serially; `--prepare-only` keeps the generated app. The [checker](tests/checks/examples.mjs) saves assertions, logs and original screenshots under `target/example-checks/<name>/`; missing platform/device prerequisites are `blocked`, and both `blocked` and `failed` exit nonzero. Visual review remains `pending` until screenshots are inspected and recorded in `visual-review.json`.
-
-The real bridge tests are explicitly ignored by default and run separately in CI. Desktop tests cover named subsets and report platform skips; the coverage test checks generated documentation. CI configuration is not proof of a passing run or three-platform/native-device validation. Development file arguments do not verify installed file associations. See [acceptance guidance](docs/acceptance.md).
+Run desktop examples serially. Missing platform prerequisites are reported as blocked or failed; screenshots still need visual review.
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE-2.0).

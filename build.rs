@@ -12,9 +12,7 @@ fn main() {
 }
 
 fn prepare() -> Result<(), String> {
-  for path in ["build_support.rs", "electron-rs/assets", "electron-rs/native/appkit.mm"] {
-    println!("cargo:rerun-if-changed={path}");
-  }
+  println!("cargo:rerun-if-changed=build_support.rs");
   for key in ["CARGO_TARGET_DIR", "INIT_CWD", "PWD", "TAURI_CONFIG"] {
     println!("cargo:rerun-if-env-changed={key}");
   }

@@ -12,24 +12,13 @@
     "@tauri-apps/api": "^2.0.0"
   },
   "scripts": {
-    "build:electron": "cd electron-rs && tsdown",
     "example": "node scripts/example.mjs",
-    "test": "pnpm run test:bridge:regressions && pnpm run test:adapter && pnpm run test:checks",
-    "test:bridge:regressions": "cargo test --manifest-path electron-rs/Cargo.toml --locked",
-    "test:bridge:prepare": "cargo test --manifest-path electron-rs/Cargo.toml --locked --test bridge prepare_bridge -- --ignored --exact --test-threads=1 --nocapture",
-    "test:bridge": "cargo test --manifest-path electron-rs/Cargo.toml --locked --test bridge real_bridge -- --ignored --exact --test-threads=1 --nocapture",
+    "test": "pnpm run test:adapter && pnpm run test:checks",
     "test:adapter": "cargo test --locked --lib --test build_config --test window_api --test coverage",
-    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs && node tests/checks/transport.mjs && node tests/checks/startup.mjs && node tests/checks/commands.mjs",
-    "typecheck": "tsc -p tsconfig.electron.json",
+    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs",
     "test:runtime": "cargo test --locked -- --nocapture --test-threads=1",
     "test:examples": "node tests/checks/examples.mjs",
     "test:coverage": "node tests/checks/coverage.mjs --check",
     "check": "node tests/checks/examples.mjs"
-  },
-  "devDependencies": {
-    "@types/node": "^24.19.2",
-    "electron": "45.0.0",
-    "tsdown": "^0.23.2",
-    "typescript": "5.9.3"
   }
 }

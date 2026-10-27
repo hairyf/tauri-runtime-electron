@@ -13,16 +13,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Every platform has to stay warning-free, not just the one being developed.
   RUSTFLAGS: -D warnings
-  # Keep `actions/checkout`'s `git init` from hinting about the initial branch.
   GIT_CONFIG_COUNT: 1
   GIT_CONFIG_KEY_0: init.defaultBranch
   GIT_CONFIG_VALUE_0: main
 
 jobs:
   regressions:
-    name: Bridge and script regressions (${{ matrix.os }})
+    name: Script regressions (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -30,36 +28,13 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-
       - uses: pnpm/action-setup@v4
         with:
           version: '10'
           run_install: false
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install typecheck dependencies without Electron binaries
-        run: pnpm install --frozen-lockfile --ignore-scripts
-
-      # Rust owns expectations; Node executes production JavaScript against
-      # native doubles. This job needs no source submodules or GUI.
-      - name: Build and check Electron scripts
-        run: |
-          pnpm run typecheck
-          pnpm run build:electron
-          node --check electron-rs/assets/main.cjs
-          node --check electron-rs/assets/runtime/commands.cjs
-          node --check electron-rs/assets/socket/ipc.cjs
-          node --check electron-rs/assets/preload.cjs
-          git diff --exit-code -- electron-rs/assets
-
-      - name: Test Electron bridge regressions
-        run: pnpm run test:bridge:regressions
-
       - name: Check example effects and evidence diagnostics
         run: pnpm run test:checks
 
@@ -75,25 +50,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-
       - uses: pnpm/action-setup@v4
         with:
           version: '10'
           run_install: false
-
       - uses: dtolnay/rust-toolchain@stable
-
-      # `tauri-runtime` 2.x exposes Linux webview types even with Electron windows.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libx11-dev libayatana-appindicator3-dev librsvg2-dev patchelf openbox xfwm4 xfconf dbus-x11 x11-utils xdotool xcompmgr
-
       - name: Cache cargo and Electron
         uses: actions/cache@v6
         with:
@@ -101,45 +70,16 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            electron-rs/target
             ~/.cache/electron
             ~/AppData/Local/electron/Cache
           key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.os }}-cargo-
-
-      - name: Build Electron scripts from TypeScript
-        run: |
-          pnpm install --frozen-lockfile --ignore-scripts
-          pnpm run typecheck
-          pnpm run build:electron
-          git diff --exit-code -- electron-rs/assets
-
+      - name: Install example tooling
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Check
         run: cargo check --locked --all-targets --all-features
-
-      # This private distribution is separate from the Tauri adapter's runtime.
-      # Prepare before chmod: branding replaces the distribution and its modes.
-      - name: Prepare real Electron bridge
-        run: pnpm run test:bridge:prepare
-
-      - name: Configure the bridge Chromium sandbox
-        if: runner.os == 'Linux'
-        run: |
-          sudo chown root:root target/electron-bridge/linux-x64/chrome-sandbox
-          sudo chmod 4755 target/electron-bridge/linux-x64/chrome-sandbox
-
-      - name: Test real Electron bridge
-        if: runner.os != 'Linux'
-        run: pnpm run test:bridge
-
-      - name: Test real Electron bridge under a virtual display
-        if: runner.os == 'Linux'
-        run: >
-          xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
-          sh -c 'openbox & sleep 1; pnpm run test:bridge'
-
-      # A build/rebrand replaces the adapter's distribution too. Reapply the
-      # sandbox owner/mode after every Cargo build and before each executable.
+      # Cargo embeds electron-rs's scripts from the pinned Git dependency.
+      # Rebranding replaces the distribution; restore sandbox modes before launch.
       - name: Configure the runtime Chromium sandbox runner
         if: runner.os == 'Linux'
         run: |
@@ -153,23 +93,18 @@ jobs:
           SH
           chmod +x "$RUNNER_TEMP/electron-runner"
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$RUNNER_TEMP/electron-runner" >> "$GITHUB_ENV"
-
-      # Explicit assertion markers only; old "ok" lines never imply member coverage.
       - name: Test runtime and collect member evidence
         shell: bash
         env:
           TAURI_RUNTIME_ELECTRON_TRACE: '1'
         run: |
-          # One process per suite, no parallel GUI; failed commands remain failed.
           output="target/runtime-evidence/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           if [ "$RUNNER_OS" = Linux ]; then
-            # Xfwm's close-only caption makes the mapped native control count unambiguous.
             xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
               dbus-run-session -- sh -c 'set -eu; xfwm4 --compositor=off & xcompmgr & sleep 1; xfconf-query -c xfwm4 -p /general/button_layout -n -t string -s "|C"; test "$(xfconf-query -c xfwm4 -p /general/button_layout)" = "|C"; node tests/checks/runtime-suites.mjs "$1"' sh "$output"
           else
             node tests/checks/runtime-suites.mjs "$output"
           fi
-
       - name: Upload runtime member evidence
         if: always()
         uses: actions/upload-artifact@v6
@@ -177,26 +112,19 @@ jobs:
           name: runtime-evidence-${{ matrix.os }}-${{ github.run_attempt }}
           path: target/runtime-evidence/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
-
       - name: Build
         run: cargo build --locked --lib
-
-      # One checker runs all six sequentially in the shared workspace.
-      # Functional assertions leave visualReview pending for human review.
       - name: Check official examples
         if: runner.os != 'Linux'
         run: pnpm run test:examples helloworld state resources commands isolation streaming
-
       - name: Check official examples under a virtual display
         if: runner.os == 'Linux'
         run: >
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
           sh -c 'openbox & sleep 1; pnpm run test:examples helloworld state resources commands isolation streaming'
-
       - name: Check transparent window example
         if: runner.os == 'Windows'
         run: pnpm run test:examples transparent
-
       - name: Upload example evidence
         if: always()
         uses: actions/upload-artifact@v6
@@ -205,7 +133,6 @@ jobs:
           path: target/example-checks/
           if-no-files-found: warn
 
-  # Generated from the checked-out `source/tauri` tree; keep the document current.
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -213,16 +140,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-
       - uses: pnpm/action-setup@v4
         with:
           version: '10'
           run_install: false
-
       - name: Check docs/coverage.md is current
         run: pnpm run test:coverage
 
@@ -235,17 +159,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-
       - name: Download this run's runtime assertions
         uses: actions/download-artifact@v5
         with:
           pattern: runtime-evidence-*-${{ github.run_attempt }}
           path: target/member-evidence
-
       - name: Report available exact-commit evidence (missing platforms stay unknown)
         run: |
           node tests/checks/coverage.mjs --md \
@@ -253,7 +174,6 @@ jobs:
             --run "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
             > target/member-coverage.md
           cat target/member-coverage.md >> "$GITHUB_STEP_SUMMARY"
-
       - name: Upload member acceptance report
         if: always()
         uses: actions/upload-artifact@v6
@@ -261,8 +181,6 @@ jobs:
           name: desktop-member-acceptance-${{ github.run_attempt }}
           path: target/member-coverage.md
           if-no-files-found: warn
-
-      # Do not silently promote the subset to production acceptance.
       - name: Require 80 percent of complete desktop members
         run: |
           node tests/checks/coverage.mjs \

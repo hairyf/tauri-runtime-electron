@@ -77,7 +77,7 @@ try {
   }
   if (-not $IsWindows) { throw 'This helper requires Windows and an interactive desktop.' }
   $repo = (Resolve-Path -LiteralPath $RepositoryPath).Path.TrimEnd('\')
-  if (-not (Test-Path -LiteralPath (Join-Path $repo 'electron-rs/assets/main.cjs')) -or
+  if (-not (Test-Path -LiteralPath (Join-Path $repo 'src/runtime.rs')) -or
       -not (Select-String -LiteralPath (Join-Path $repo 'Cargo.toml') -Pattern '^name = "tauri-runtime-electron"$' -Quiet)) {
     throw 'RepositoryPath must identify the tauri-runtime-electron repository, not a broad parent directory.'
   }
