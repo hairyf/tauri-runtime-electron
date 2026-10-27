@@ -96,7 +96,7 @@ export class Factory implements WindowFactory {
     const window = this.deps.windows.get(params.windowId)
     const init = { ...params, webviewId } as WebviewInit
     const config = { ...window.configuration, ...Object.fromEntries(Object.entries(params).filter(([, value]) => value != null)) } as WindowConfig
-    const targetSession = this.deps.webviews.main(window)?.contents.session ?? session.defaultSession
+    const targetSession = this.sessionFor(init) ?? this.deps.webviews.main(window)?.contents.session ?? session.defaultSession
     const view = new WebContentsView({ webPreferences: this.webPreferences(init, config, targetSession) })
     const webview = new Webview(window, webviewId, view, init)
     this.deps.webviews.add(webview)
@@ -111,7 +111,8 @@ export class Factory implements WindowFactory {
     }
   }
 
-  private sessionFor(params: Params = {}): Session | undefined {
+  private sessionFor(params?: Params | null): Session | undefined {
+    if (!params) return undefined
     let target: Session | undefined
     if (params.incognito) target = session.fromPartition(`tauri-private-${++Factory.nextPrivateSession}`)
     else if (params.dataDirectory) target = session.fromPath(path.resolve(params.dataDirectory))

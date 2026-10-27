@@ -65,13 +65,19 @@ export class Policies {
     contents.setWindowOpenHandler((details) => {
       const request = this.nextPopupRequest++
       const previous = this.popup; this.popup = { request, opener: webview }
+      let allowed = false
       try {
         const response = this.host.transport.request<NewWindowResponse>('webview.newWindow', { request, webviewId: webview.id, url: details.url, frameName: details.frameName, features: details.features ?? '', disposition: details.disposition, ...popupGeometry(details.features ?? '') })
         if (response.action !== 'allow' || !Number.isSafeInteger(response.windowId)) return { action: 'deny' as const }
         const selected = this.host.popups.get(request)
         if (!selected || selected.window.id !== response.windowId || selected.window.destroyed) throw new Error('missing native popup destination')
+        allowed = true
         return { action: 'allow' as const, outlivesOpener: true, overrideBrowserWindowOptions: selected.options, createWindow: (options: BrowserWindowConstructorOptions) => { const guest = (options as BrowserWindowConstructorOptions & { webContents: WebContents }).webContents; this.host.popups.delete(request); selected.attach(guest); return guest } }
-      } catch { const abandoned = this.host.popups.get(request); if (abandoned) { this.host.popups.delete(request); abandoned.window.destroy() }; return { action: 'deny' as const } } finally { this.popup = previous }
+      } catch { return { action: 'deny' as const } } finally {
+        this.popup = previous
+        const abandoned = this.host.popups.get(request)
+        if (abandoned && !allowed) { this.host.popups.delete(request); abandoned.window.destroy() }
+      }
     })
   }
   answerNavigation(id: number, allow: boolean): void { if (typeof allow !== 'boolean') throw new Error('invalid navigation decision'); this.navigations.get(id)?.finish(allow) }

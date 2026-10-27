@@ -840,6 +840,92 @@ switch (process.argv[2]) {
       afterFirstClose, afterClose, afterCloseEvents: events }
     break
   }
+  case 'popup-rejection': {
+    inspect('state.socket = {closed:false}')
+    const events = []
+    context.send = (message) => events.push(JSON.parse(JSON.stringify(message)))
+    const main = await createHost(true)
+    await call('webview.create', { windowId: 2, webviewId: 21, url: 'about:blank' })
+    const source = mainContentsOf(main)
+    const nestedSource = runtime.webviews.get(21).contents
+    const open = (contents, name) => contents.openHandler({
+      url: `about:blank#${name}`, frameName: '', features: '', disposition: 'new-window',
+    })
+    const cases = ['deny', 'invalid-action', 'missing-window-id', 'missing-destination', 'null-response', 'exception']
+    const rejected = []
+    let outer
+    let acceptedRequest
+    let staged
+    let stagedRequest
+    let destroys = 0
+    let restoredOnClose = false
+    const previous = runtime.ipc.request
+    runtime.ipc.request = (_event, params) => {
+      if (params.url.endsWith('#allow')) {
+        outer = runtime.policies.activePopup
+        acceptedRequest = params.request
+        call('window.create', { windowId: 70, newWindowRequest: params.request,
+          webview: { webviewId: 700, url: 'about:blank#must-not-load' } })
+        for (const [index, name] of cases.entries()) {
+          events.length = 0
+          destroys = 0
+          restoredOnClose = false
+          const before = allContents.length
+          assert.equal(open(nestedSource, name).action, 'deny')
+          assert.equal(staged.isDestroyed(), true, `${name} must destroy its staged destination`)
+          assert.equal(runtime.policies.activePopup, outer, `${name} must restore its outer popup`)
+          const windowId = 80 + index
+          rejected.push({ name, shellDestroyed: staged.isDestroyed(), destroys, restoredOnClose,
+            pending: runtime.popups.has(stagedRequest),
+            windowMapped: Boolean(runtime.windows.peek(windowId)),
+            webviewMapped: Boolean(runtime.webviews.peek(800 + index)),
+            contentsCreated: allContents.length - before, events: events.splice(0) })
+        }
+        return { action: 'allow', windowId: 70 }
+      }
+      const name = params.url.split('#')[1]
+      const index = cases.indexOf(name)
+      assert.notEqual(index, -1)
+      assert.equal(runtime.policies.activePopup.request, params.request)
+      assert.equal(runtime.policies.activePopup.opener.id, 21)
+      const windowId = 80 + index
+      call('window.create', { windowId, newWindowRequest: params.request,
+        webview: { webviewId: 800 + index, url: 'about:blank' } })
+      staged = runtime.windows.get(windowId).native
+      stagedRequest = params.request
+      staged.once('closed', () => {
+        destroys++
+        restoredOnClose = runtime.policies.activePopup === outer
+      })
+      if (name === 'exception') throw new Error('host decision failed after staging')
+      if (name === 'null-response') return null
+      if (name === 'missing-window-id') return { action: 'allow' }
+      if (name === 'missing-destination') return { action: 'allow', windowId: 2 }
+      return { action: name === 'deny' ? 'deny' : 'invalid', windowId }
+    }
+    try {
+      const reply = open(source, 'allow')
+      assert.equal(reply.action, 'allow')
+      assert.equal(runtime.policies.activePopup, undefined)
+      assert.equal(runtime.popups.size, 1, 'rejections must preserve the accepted outer plan')
+      const destination = runtime.windows.get(70).native
+      assert.equal(destination.isDestroyed(), false, 'accepted plan must survive policy cleanup')
+      const guest = new Contents()
+      assert.equal(reply.createWindow({ webContents: guest }), guest, 'adopt Chromium\'s original guest')
+      result = { rejected, accepted: {
+        shellDestroyed: destination.isDestroyed(), guestDestroyed: guest.isDestroyed(),
+        windowMapped: Boolean(runtime.windows.peek(70)),
+        guestMapped: runtime.webviews.get(700).contents === guest,
+        pending: runtime.popups.has(acceptedRequest), outlivesOpener: reply.outlivesOpener,
+        navigated: guest.calls.some((entry) => entry.method === 'loadURL'),
+      } }
+      assert.deepEqual(result.accepted, { shellDestroyed: false, guestDestroyed: false,
+        windowMapped: true, guestMapped: true, pending: false, outlivesOpener: true, navigated: false })
+    } finally {
+      runtime.ipc.request = previous
+    }
+    break
+  }
   case 'native-policy': {
     inspect('state.socket = {closed:false}')
     const events = []

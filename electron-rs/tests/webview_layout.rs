@@ -566,6 +566,43 @@ fn per_window_theme_emulates_owned_pages_and_cleans_native_listeners() {
 }
 
 #[test]
+fn rejected_popup_plans_destroy_shells_restore_nested_context_and_preserve_accepted_guests() {
+  let observed: Value = serde_json::from_str(&support::node(
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+    &["popup-rejection"],
+  ))
+  .unwrap();
+
+  let rejected = observed["rejected"].as_array().unwrap();
+  let cases = [
+    "deny",
+    "invalid-action",
+    "missing-window-id",
+    "missing-destination",
+    "null-response",
+    "exception",
+  ];
+  assert_eq!(rejected.len(), cases.len());
+  for (index, name) in cases.into_iter().enumerate() {
+    assert_eq!(
+      rejected[index],
+      json!({
+          "name": name, "shellDestroyed": true, "destroys": 1, "restoredOnClose": true,
+          "pending": false, "windowMapped": false, "webviewMapped": false, "contentsCreated": 0,
+          "events": [{ "event": "window.closed", "params": { "windowId": 80 + index } }],
+      })
+    );
+  }
+  assert_eq!(
+    observed["accepted"],
+    json!({
+        "shellDestroyed": false, "guestDestroyed": false, "windowMapped": true, "guestMapped": true,
+        "pending": false, "outlivesOpener": true, "navigated": false,
+    })
+  );
+}
+
+#[test]
 fn native_policy_covers_preferences_popup_cleanup_explicit_close_and_disconnect() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),

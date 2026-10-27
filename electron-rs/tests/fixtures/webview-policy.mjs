@@ -420,12 +420,38 @@ async function sessions() {
       tauri, asset, fallback, forwarded: target.forwarded.length, protocolMessagesDuringFallback: messages.length - before,
     })
   }
-  return {
+  const observed = {
     defaultSelection, shared: shared.id, aliases, separate: separate.id, private: [privateOne.id, privateTwo.id],
     partitions: [...partitionSessions.keys()], pathCalls: pathCalls.map((value) => ({ path: value, absolute: path.isAbsolute(value) })),
     retirement: { remaining, retired: navigationState(otherSession), active: navigationState(sameId) },
     targets, cleanup: cleanup(),
   }
+  assert.equal(runtime.state.sessionFor(null), undefined, 'null main webview selects no custom session')
+  await runtime.handle('window.create', { windowId: 3, webview: null })
+  assert.equal(runtime.windows.get(3).native.contentView.children.length, 0, 'null main webview creates a bare window')
+  await runtime.handle('webview.create', { windowId: 3, webviewId: 40, incognito: false, dataDirectory: null })
+  assert.equal(runtime.webviews.get(40).contents.session, defaultSession, 'a bare window child uses the default session')
+  await runtime.handle('window.create', { windowId: 4, webview: { webviewId: 41, dataDirectory: directory } })
+  assert.equal(runtime.webviews.get(41).contents.session, shared)
+  let webviewId = 41
+  for (const [options, expected] of [
+    [{}, shared],
+    [{ incognito: false, dataDirectory: null }, shared],
+    [{ dataDirectory: path.join(root, 'profiles', 'separate') }, separate],
+  ]) {
+    await runtime.handle('webview.create', { windowId: 4, webviewId: ++webviewId, ...options })
+    assert.equal(runtime.webviews.get(webviewId).contents.session, expected, 'explicit child profile overrides; absent or Rust-default settings inherit')
+  }
+  const privateChildren = []
+  const pathsBeforePrivate = pathCalls.length
+  for (let index = 0; index < 2; index++) {
+    await runtime.handle('webview.create', { windowId: 4, webviewId: ++webviewId, incognito: true, dataDirectory: directory })
+    const selected = runtime.webviews.get(webviewId).contents.session
+    for (const other of [defaultSession, shared, separate, ...privateChildren]) assert.notEqual(selected, other, 'explicit incognito never inherits or shares a session')
+    privateChildren.push(selected)
+  }
+  assert.equal(pathCalls.length, pathsBeforePrivate, 'incognito still takes precedence over the child data directory')
+  return observed
 }
 try {
   runtime.state.installPolicyHandlers(defaultSession)
