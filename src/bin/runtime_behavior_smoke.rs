@@ -179,8 +179,13 @@ fn exercise(handle: &ElectronRuntimeHandle, first: &(Window, Webview), second: &
 fn settled_native_flag(window: &Window, flag: &str, wanted: bool) -> Result<bool, String> {
   let start = Instant::now();
   loop {
-    let actual = native_flag(window, flag)?;
-    if actual == wanted || start.elapsed() >= WAIT { return Ok(actual); }
+    match native_flag(window, flag) {
+      Ok(actual) if actual == wanted || start.elapsed() >= WAIT => return Ok(actual),
+      Ok(_) => {}
+      // AX specifiers can go stale while newly created/destroyed windows settle.
+      Err(reason) if cfg!(target_os = "macos") && reason.contains("(-1719)") && start.elapsed() < WAIT => {}
+      Err(reason) => return Err(reason),
+    }
     thread::sleep(Duration::from_millis(100));
   }
 }
@@ -338,11 +343,14 @@ fn native_flag(window: &Window, flag: &str) -> Result<bool, String> {
       set matches to {}
       repeat with p in (application processes whose background only is false)
         repeat with w in (windows of p whose name is titleText)
-          set end of matches to w
+          set end of matches to (get unix id of p)
         end repeat
       end repeat
       if (count of matches) is not 1 then error "Expected one real Electron AX window"
-      set w to item 1 of matches
+      -- Process/window list indices change when earlier builder windows close.
+      set targetPID to item 1 of matches
+      set targetProcess to first application process whose unix id is targetPID
+      set w to first window of targetProcess whose name is titleText
       if attributeName is "native-caption-controls" then
         -- AXTitleUIElement is optional even on a normal titled window.
         -- Observe the real caption controls and their nonzero native frames.
