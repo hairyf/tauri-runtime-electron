@@ -10,6 +10,8 @@ pub(crate) use app::{
 pub(crate) use app::{SetBadgeLabel as AppBadgeLabel, SetTheme as AppTheme};
 #[cfg(target_os = "linux")]
 pub(crate) use window::Ready as WindowReady;
+#[cfg(windows)]
+pub(crate) use window::SetMenu as WindowSetMenu;
 pub(crate) use protocol::{Register as ProtocolRegister, Respond as ProtocolRespond};
 pub(crate) use webview::{
   Bounds as WebviewBounds, CanGoBack as WebviewCanGoBack, CanGoForward as WebviewCanGoForward,
@@ -38,7 +40,7 @@ pub(crate) use window::{
   SetCursorVisible as WindowCursorVisible, SetDecorations as WindowDecorations,
   SetEnabled as WindowEnabled, SetFocusable as WindowFocusable, SetFullscreen as WindowFullscreen,
   SetIcon as WindowIcon, SetMaxSize as WindowMaxSize, SetMaximizable as WindowMaximizable,
-  SetMenu as WindowSetMenu, SetMinSize as WindowMinSize, SetMinimizable as WindowMinimizable,
+  SetMinSize as WindowMinSize, SetMinimizable as WindowMinimizable,
   SetOverlayIcon as WindowOverlayIcon, SetPosition as WindowPosition,
   SetProgressBar as WindowProgressBar, SetResizable as WindowResizable, SetShadow as WindowShadow,
   SetSimpleFullscreen as WindowSimpleFullscreen, SetSize as WindowSize,
