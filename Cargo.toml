@@ -12,6 +12,7 @@ publish = false
 [features]
 # Only applications using the library-owned window API need Tauri itself.
 tauri = ["dep:tauri"]
+devtools = ["tauri-runtime/devtools"]
 
 [build-dependencies]
 electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "2ade11d710316571807567e78daf38f1ca347f44" }

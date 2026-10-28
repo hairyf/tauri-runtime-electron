@@ -107,18 +107,21 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     Ok(())
   }
 
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn open_devtools(&self) {
     if let Err(error) = crate::devtools::open(self) {
       eprintln!("[electron] open devtools failed: {error}");
     }
   }
 
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn close_devtools(&self) {
     if let Err(error) = crate::devtools::close(self) {
       eprintln!("[electron] close devtools failed: {error}");
     }
   }
 
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn is_devtools_open(&self) -> Result<bool> {
     crate::devtools::is_open(self)
   }
