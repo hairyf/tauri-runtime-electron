@@ -7,7 +7,7 @@ import vm from 'node:vm'
 const Effect = { Acrylic: 'acrylic', Mica: 'mica', Tabbed: 'tabbed', Blur: 'blur' }
 
 // Run the actual example module body against a minimal DOM and delayed native API.
-const source = readFileSync(new URL('../../example/transparent/main.js', import.meta.url), 'utf8')
+const source = readFileSync(new URL('../assets/transparent/main.js', import.meta.url), 'utf8')
 assert.match(source, /^import .* from '\.\/window-api\.js'/)
 const body = source.replace(/^import [^\n]+\n/, '')
 let nativeEffect = null

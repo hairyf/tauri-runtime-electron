@@ -844,6 +844,9 @@ impl ElectronRuntime {
     let binary = attrs
       .resolve_binary()
       .map_err(|error| create_window_err(error.to_string()))?;
+    // Report an explicitly low file label without changing deployment security.
+    #[cfg(windows)]
+    crate::platform::integrity::check_binary_label(&binary).map_err(create_window_err)?;
     eprintln!("[electron] launching {}", binary.display());
     let mut args = extra_args(&attrs.args);
     switches::warn_about_dangerous_switches(&args);

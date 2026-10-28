@@ -9,6 +9,8 @@ use tauri_runtime::{dpi::{PhysicalPosition, PhysicalRect, PhysicalSize}, monitor
 
 pub(crate) mod cursor;
 pub(crate) mod dpi;
+#[cfg(target_os = "windows")]
+pub(crate) mod integrity;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux_window;
 

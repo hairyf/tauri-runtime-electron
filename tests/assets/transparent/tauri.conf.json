@@ -35,6 +35,6 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["../.icons/icon.ico", "../.icons/icon.png"]
+    "icon": ["../../../source/tauri/examples/.icons/icon.ico", "../../../source/tauri/examples/.icons/icon.png"]
   }
 }

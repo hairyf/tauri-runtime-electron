@@ -106,11 +106,20 @@ Commit [`4fb041d`](https://github.com/hairyf/tauri-runtime-electron/commit/4fb04
 ## Examples and checks
 
 ```bash
-pnpm example helloworld
+pnpm install --frozen-lockfile
+pnpm example                 # Tauri CLI: Vite + desktop dashboard
+pnpm --dir example dev        # Vite frontend only (no desktop IPC)
+pnpm --dir example tauri build --debug --no-bundle # compile desktop app
+pnpm check                   # automated dashboard checks with screenshots
+pnpm test:examples transparent # relocated test fixture, not a public example
 pnpm test
 cargo check --locked --all-targets --all-features
 ```
 
-Run desktop examples serially; missing prerequisites are reported as blocked or failed, and screenshots still need visual review.
+The single [example package](example/package.json) follows the reference Tauri layout and lists every member in [method coverage](docs/coverage.md). It shows live readback assertions separately from archived CI evidence, with search, status filters, rerun and JSON export. Unexecuted members stay unverified; use the Rust runtime suites for the wider runtime/platform contract. The frontend uses React, Tailwind CSS and strict TypeScript. Standard scripts are `pnpm --dir example dev` (Vite), `pnpm --dir example build` (frontend assets) and `pnpm --dir example tauri dev` / `tauri build` (desktop). The [Vite config](example/vite.config.ts) generates the API inventory from the same contract and evidence as the coverage document, without a custom launcher. Run `pnpm --dir example typecheck` for TypeScript validation.
+
+Run desktop checks serially; missing prerequisites are reported as blocked or failed, and screenshots still need visual review. Results are saved under `target/example-checks/`; the [transparent fixture](tests/assets/transparent/tauri.conf.json) preserves its dedicated effects and native-drag checks. The old script-based upstream example runner has been removed.
+
+Before deleting or merging any check, read the [test suite map](docs/test-improvements.md): `tests/checks` is the evidence driver for `src/bin`, not an API test duplicate.
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE-2.0).

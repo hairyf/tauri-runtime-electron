@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+    font-family: system-ui, sans-serif;
+    @apply bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-4 outline-indigo-500;
+  }
+}

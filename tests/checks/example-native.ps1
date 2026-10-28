@@ -5,10 +5,10 @@
 # Capture requires an unobscured window and a new .png path in an existing directory.
 # Drag keeps its entire pointer path inside the original window rectangle for safety.
 # Examples:
-#   pwsh -NoProfile -File scripts/example-native.ps1 -Action List -ProcessId 1234
-#   pwsh -NoProfile -File scripts/example-native.ps1 -Action Capture -WindowHandle 0x12345 -OutputPath target/before.png -Activate
-#   pwsh -NoProfile -File scripts/example-native.ps1 -Action Drag -WindowHandle 0x12345 -StartX 400 -StartY 300 -EndX 460 -EndY 340 -Expected Moved -Activate
-#   pwsh -NoProfile -File scripts/example-native.ps1 -Action SelfTest
+#   pwsh -NoProfile -File tests/checks/example-native.ps1 -Action List -ProcessId 1234
+#   pwsh -NoProfile -File tests/checks/example-native.ps1 -Action Capture -WindowHandle 0x12345 -OutputPath target/before.png -Activate
+#   pwsh -NoProfile -File tests/checks/example-native.ps1 -Action Drag -WindowHandle 0x12345 -StartX 400 -StartY 300 -EndX 460 -EndY 340 -Expected Moved -Activate
+#   pwsh -NoProfile -File tests/checks/example-native.ps1 -Action SelfTest
 [CmdletBinding()]
 param(
   [ValidateSet('List', 'Rect', 'Capture', 'Drag', 'Click', 'DoubleClick', 'Close', 'SelfTest')]
@@ -16,7 +16,7 @@ param(
   [ValidateRange(0, 2147483647)] [int] $ProcessId = 0,
   [string] $WindowHandle,
   [string] $Title,
-  [string] $RepositoryPath = (Split-Path -Parent $PSScriptRoot),
+  [string] $RepositoryPath = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
   [string] $OutputPath,
   [int] $StartX, [int] $StartY, [int] $EndX, [int] $EndY,
   [ValidateSet('Any', 'Moved', 'Stationary')] [string] $Expected = 'Any',

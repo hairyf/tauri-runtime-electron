@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { release } from 'node:os'
 
 export default async function transparentChecks(test, { assert, click, until, native, nativeWindow, nativeWindows }) {
-  const config = JSON.parse(readFileSync(new URL('../../example/transparent/tauri.conf.json', import.meta.url), 'utf8'))
+  const config = JSON.parse(readFileSync(new URL('../assets/transparent/tauri.conf.json', import.meta.url), 'utf8'))
   assert.equal(config.app.withGlobalTauri, true)
   assert.equal(config.app.windows.length, 1)
   const configured = config.app.windows[0]

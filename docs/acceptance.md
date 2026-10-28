@@ -1,4 +1,4 @@
-# 官方案例与多平台 CI 验收
+# API 验收示例与多平台 CI 记录
 
 ## 当前逐成员结果
 
@@ -84,12 +84,19 @@ CI 验证提交：`26c17a9008edfcb83b0679cb50224b5eb5c7523b`。本报告记录�
 在仓库根目录，已初始化源码子仓库并具备 Node.js 24+、pnpm、Rust 和系统依赖后：
 
 ```bash
-pnpm example api
-pnpm example <name>
-pnpm check helloworld state resources commands isolation streaming
-pnpm check
+pnpm install --frozen-lockfile
+pnpm example                       # 唯一的交互式 API 面板
+pnpm --dir example dev             # 仅 Vite 前端；桌面 IPC 需用 tauri dev
+pnpm --dir example build           # Vite 静态构建
+pnpm --dir example typecheck
+pnpm --dir example tauri build --debug --no-bundle
+pnpm check                         # 面板真实窗口自动验收
+pnpm test:examples transparent      # tests/assets/transparent 回归夹具
+pnpm test:runtime                   # Rust 逐成员运行时套件
 ```
 
-运行器自动复制和准备案例；原源码子仓库只读。所有案例共享临时工作区，按顺序执行。`pnpm check` 尝试全部十三例，失败和阻塞均返回非零，不能期待在上述限制仍存在时全绿。
+旧的脚本和十三例运行入口已移除，上述旧轮次数据仅保留为历史记录。当前 [example](../example/package.json) 是一个 pnpm workspace 包，参考 `source/tauri` 的标准布局，编译使用相同版本的发布 crate，不再复制整个源码树或重写官方回调。前端采用 React、Tailwind CSS 和严格 TypeScript，脚本直接使用 `vite`、`vite build` 和 `tauri`。Tauri CLI 通过 [配置](../example/src-tauri/tauri.conf.json) 启动 Vite / 构建静态资源；[Vite 配置](../example/vite.config.ts) 生成与逐成员表同源的完整 API 清单，不再使用自定义启动器。透明窗口迁到 [测试夹具](../tests/assets/transparent/tauri.conf.json)，其 checks 继续验证原生效果与拖动。
+
+面板将**本次实测**和**存档 CI**分列：独立测试窗口用于读取状态、修改后读回、事件和关闭断言；未执行的平台专有、原生互操作及生命周期项目保持未验证，不计通过。所有 API 都列出不等于本次已测全。页面支持按名称/分组/状态筛选、重新运行、导出本次 JSON。自动检查保存日志、截图和结果到 `target/example-checks/coverage/`；失败、启动错误或阻塞返回非零。导出的本地结果不作为 exact-commit CI 逐成员证据导入。桌面测试按顺序执行，截图仍需人工审阅。
 
 原功能结果文件中的 `visualReview: pending` 保持原样；实际逐张目视记录位于同目录的 `visual-review.json`，分片审阅也保留。最终 [视觉审阅索引](visual-ledger.json) 校验每例结果哈希、原图顺序/数量与全部原图 SHA-256；索引的完整性检查不代替视觉结论或功能断言。

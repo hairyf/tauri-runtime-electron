@@ -76,6 +76,8 @@ jobs:
           restore-keys: ${{ matrix.os }}-cargo-
       - name: Install example tooling
         run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build and typecheck example frontend
+        run: pnpm --dir example build && pnpm --dir example typecheck
       - name: Check
         run: cargo check --locked --all-targets --all-features
       # Cargo embeds electron-rs's scripts from the pinned Git dependency.
@@ -114,15 +116,15 @@ jobs:
           if-no-files-found: warn
       - name: Build
         run: cargo build --locked --lib
-      - name: Check official examples
+      - name: Check API acceptance dashboard
         if: runner.os != 'Linux'
-        run: pnpm run test:examples helloworld state resources commands isolation streaming
-      - name: Check official examples under a virtual display
+        run: pnpm run test:examples coverage
+      - name: Check API acceptance dashboard under a virtual display
         if: runner.os == 'Linux'
         run: >
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
-          sh -c 'openbox & sleep 1; pnpm run test:examples helloworld state resources commands isolation streaming'
-      - name: Check transparent window example
+          sh -c 'openbox & sleep 1; pnpm run test:examples coverage'
+      - name: Check transparent test fixture
         if: runner.os == 'Windows'
         run: pnpm run test:examples transparent
       - name: Upload example evidence

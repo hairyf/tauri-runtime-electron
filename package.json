@@ -1,5 +1,6 @@
 {
   "name": "tauri-runtime-electron",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,10 +13,10 @@
     "@tauri-apps/api": "^2.0.0"
   },
   "scripts": {
-    "example": "node scripts/example.mjs",
+    "example": "pnpm --filter @tauri-runtime-electron/example tauri dev",
     "test": "pnpm run test:adapter && pnpm run test:checks",
     "test:adapter": "cargo test --locked --lib --test build_config --test window_api --test coverage",
-    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs",
+    "test:checks": "node tests/checks/effects.mjs && node tests/checks/evidence.mjs && node tests/checks/dashboard.mjs",
     "test:runtime": "cargo test --locked -- --nocapture --test-threads=1",
     "test:examples": "node tests/checks/examples.mjs",
     "test:coverage": "node tests/checks/coverage.mjs --check",

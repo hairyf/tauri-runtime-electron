@@ -267,7 +267,7 @@ const DESCRIPTION = {
   fetch_data_store_identifiers: '枚举 Apple webview 数据存储的标识',
   remove_data_store: '按标识删除 Apple webview 数据存储',
 }
-function description(trait, name) {
+export function description(trait, name) {
   if (trait === 'WindowBuilder') {
     const purpose = { new: '初始化窗口属性构建器', center: '设置新窗口居中', position: '设置新窗口的逻辑像素位置',
       inner_size: '设置新窗口的逻辑像素内容区尺寸', title: '设置新窗口标题', theme: '设置新窗口主题或跟随系统' }[name]
@@ -358,7 +358,7 @@ ${PLATFORMS.map(platform => `| ${platform} | ${rate(evidence.runtime[platform])}
 - **原生弹窗**：官方 PendingWebview::new_window_handler 需要同进程原生 opener；Electron 回调 Allow/Create/Deny 是独立扩展，必须分别验收。
 - **创建属性**：proxy_url、additional_browser_args、browser_extensions_enabled / extensions_path 尚需等价行为验证。
 - **原生互操作**：with_webview、GTK、AppKit、Windows 菜单代理 HWND 的限制保留；错误返回的负测不证明原生功能可用。
-- **测试范围**：菜单/托盘真实 OS 操作、安装态文件关联、截图视觉结论仍需专项证据，见 ${link('docs/acceptance.md')}；${link('scripts/example.mjs')} 不得删除官方 setup 回调绕过失败。
+- **测试范围**：菜单/托盘真实 OS 操作、安装态文件关联、截图视觉结论仍需专项证据，见 ${link('docs/acceptance.md')}。${link('example/package.json', null, '验收示例')} 的本次探测与存档 CI 分开显示，未执行的成员不得标为通过。
 
 ${detail.join('\n')}
 ${ext}`
