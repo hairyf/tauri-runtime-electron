@@ -58,21 +58,23 @@ tauri::Builder::<ElectronRuntime>::new().run(context)?;
 Enable `features = ["tauri"]` to access the authenticated client of the current Electron process:
 
 ```rust
-use tauri_runtime_electron::{main_bridge, CommandOutput, ElectronRuntime};
+use std::process::Output;
+use tauri_runtime_electron::{main_bridge, ElectronRuntime};
 
 async fn run_task(
     webview: &tauri::Webview<ElectronRuntime>,
-) -> Result<CommandOutput, Box<dyn std::error::Error>> {
+) -> Result<Output, Box<dyn std::error::Error>> {
     let bridge = main_bridge(webview).await?;
     let output = bridge
-        .node_in_main("console.log(args[0]); return { answer: 42 };", &["hello"])
+        .node_in_main("console.log(args[0]);", &["hello"])
         .await?;
-    assert_eq!(output.result["answer"], 42);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"hello\n");
     Ok(output)
 }
 ```
 
-`main_bridge` returns an `Arc` client for the existing process; `ElectronWebviewDispatcher::main_bridge()` is the direct runtime form. `node_in_main` uses a short-lived Worker, while `electron_in_main` runs on Electron's main thread. Both accept async JavaScript function bodies, preserve raw `stdout`/`stderr` separately from JSON `result`, and support `.on_output(...)`, `.timeout(...)`, and `.max_output_bytes(...)`. Defaults are 30 seconds and 16 MiB. Main-thread cancellation cannot interrupt synchronous JavaScript, and no generic renderer execution endpoint is registered.
+`main_bridge` returns an `Arc` client for the existing process; `ElectronWebviewDispatcher::main_bridge()` is the direct runtime form. `node_in_main` uses a short-lived Worker, while `electron_in_main` runs on Electron's main thread. Both accept async JavaScript function bodies and return `std::process::Output` with `status` and raw `stdout`/`stderr`; JavaScript return values are ignored. They support `.on_output(...)`, an optional `.timeout(...)`, and `.max_output_bytes(...)`. Execution has no time limit by default; the default output cap is 16 MiB. Main-thread cancellation cannot interrupt synchronous JavaScript, and no generic renderer execution endpoint is registered.
 
 For lower-level acquisition, RPC, events, and command APIs, see [electron-rs](https://github.com/hairyf/electron-rs).
 

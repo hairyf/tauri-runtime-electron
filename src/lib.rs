@@ -41,7 +41,7 @@ mod window_handle;
 #[cfg(feature = "tauri")]
 pub use command_bridge::main_bridge;
 pub use command_bridge::ElectronBridge;
-pub use electron_rs::{Command, CommandChunk, CommandOutput, OutputStream};
+pub use electron_rs::{Command, CommandChunk, OutputStream};
 pub use environment::DebugEnvironment;
 #[cfg(feature = "tauri")]
 pub use new_window::on_new_window;

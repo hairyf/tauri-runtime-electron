@@ -145,21 +145,24 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         let webview: &tauri::Webview<ElectronRuntime> = main.as_ref();
         let bridge = tauri_runtime_electron::main_bridge(webview)
           .await.expect("resolve existing Electron client through the Tauri UI route");
-        let electron = bridge.electron_in_main(
-          "const {isMainThread,threadId}=require('node:worker_threads');return {pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId};", &[],
+        let electron: std::process::Output = bridge.electron_in_main(
+          "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId}));return 1n;", &[],
         ).timeout(WAIT).await.expect("execute on actual Electron main");
-        let node = bridge.node_in_main(
-          "const {isMainThread,threadId}=require('node:worker_threads');return {pid:process.pid,isMainThread,threadId};", &[],
+        let node: std::process::Output = bridge.node_in_main(
+          "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId}));const ignored={};ignored.self=ignored;return ignored;", &[],
         ).timeout(WAIT).await.expect("execute on actual Node worker");
-        assert_eq!(electron.code, 0);
-        assert_eq!(node.code, 0);
-        assert!(electron.result["pid"].as_u64().unwrap() > 0);
-        assert_eq!(electron.result["ready"], true);
-        assert_eq!(electron.result["isMainThread"], true);
-        assert_eq!(electron.result["threadId"], 0);
-        assert_eq!(node.result["pid"], electron.result["pid"]);
-        assert_eq!(node.result["isMainThread"], false);
-        assert!(node.result["threadId"].as_u64().unwrap() > 0);
+        assert!(electron.status.success(), "{electron:?}");
+        assert!(node.status.success(), "{node:?}");
+        assert!(electron.stderr.is_empty() && node.stderr.is_empty());
+        let electron: Value = serde_json::from_slice(&electron.stdout).unwrap();
+        let node: Value = serde_json::from_slice(&node.stdout).unwrap();
+        assert!(electron["pid"].as_u64().unwrap() > 0);
+        assert_eq!(electron["ready"], true);
+        assert_eq!(electron["isMainThread"], true);
+        assert_eq!(electron["threadId"], 0);
+        assert_eq!(node["pid"], electron["pid"]);
+        assert_eq!(node["isMainThread"], false);
+        assert!(node["threadId"].as_u64().unwrap() > 0);
         use std::{future::IntoFuture as _, sync::atomic::{AtomicBool, Ordering}};
         for electron_mode in [false, true] {
           let script = "process.stdout.write(Buffer.from([0,255,195]));await new Promise(resolve=>setTimeout(resolve,1000));process.stderr.write(Buffer.from([128,10]));return {done:true};";
@@ -182,10 +185,9 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
             } => {}
           }
           let output = pending.await.expect("collect real streamed command");
-          assert_eq!(output.code, 0);
+          assert!(output.status.success(), "{output:?}");
           assert_eq!(output.stdout, [0, 255, 195]);
           assert_eq!(output.stderr, [128, 10]);
-          assert_eq!(output.result, json!({"done":true}));
           let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
           for (sequence, chunk) in received.try_iter().enumerate() {
             assert_eq!(chunk.sequence, sequence as u64);
