@@ -84,6 +84,11 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
 
   /// Run a task on the main thread.
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
+    #[cfg(feature = "tauri")]
+    let f = {
+      let client = self.context.ipc.client();
+      move || crate::command_bridge::with_client(client, f)
+    };
     self.context.send_message(Message::Task(Box::new(f)))
   }
 

@@ -27,6 +27,7 @@ fn main() -> ExitCode {
   let origin = server();
   let (tx, rx) = mpsc::sync_channel(1);
   let app = tauri::Builder::<ElectronRuntime>::new()
+    .plugin(tauri_runtime_electron::init())
     .setup(move |app| {
       let window = WebviewWindowBuilder::new(
         app,
@@ -137,22 +138,20 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
   expect(main, "document.title", json!("/opener"));
   security(main);
   tokio::runtime::Builder::new_current_thread()
-    .enable_time()
+    .enable_all()
     .build()
     .expect("async consumer bridge runtime")
     .block_on(async {
       tokio::time::timeout(WAIT, async {
-        let webview: &tauri::Webview<ElectronRuntime> = main.as_ref();
-        let bridge = tauri_runtime_electron::main_bridge(webview)
-          .await.expect("resolve existing Electron client through the Tauri UI route");
+        let bridge = app.state::<tauri_runtime_electron::ElectronClient>().inner().clone();
         let electron: std::process::Output = bridge.run(
           "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId}));return 1n;",
         ).timeout(WAIT).await.expect("execute on actual Electron main");
-        let node_bridge = Arc::clone(&bridge);
-        let node: std::process::Output = tokio::task::spawn_blocking(move || node_bridge.node(&[
+        let node: std::process::Output = bridge.node(&[
           "-e", "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,args:process.argv.slice(1)}));",
           "--", "hello",
-        ])).await.expect("join native Node process").expect("execute in a separate Node process");
+        ]).expect("spawn a separate Node process").wait_with_output()
+          .await.expect("collect separate Node process output");
         assert!(electron.status.success(), "{electron:?}");
         assert!(node.status.success(), "{node:?}");
         assert!(electron.stderr.is_empty() && node.stderr.is_empty());
@@ -167,12 +166,19 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         assert_eq!(node["isMainThread"], true);
         assert_eq!(node["threadId"], 0);
         assert_eq!(node["args"], json!(["hello"]));
-        let node_bridge = Arc::clone(&bridge);
-        let bytes = tokio::task::spawn_blocking(move || node_bridge.node(&[
-          "-e", "process.stdout.write(Buffer.from([0,255,195]));process.stderr.write(Buffer.from([128,10]));",
-        ])).await.expect("join Node binary output").expect("collect Node binary output");
+        use tokio::io::AsyncReadExt as _;
+        let mut child = bridge.node(&[
+          "-e", "process.stdout.write(Buffer.from([0,255,195]));setTimeout(()=>process.stderr.write(Buffer.from([128,10])),1000);",
+        ]).expect("spawn streamed Node process");
+        let mut stdout = child.stdout.take().expect("piped Node stdout");
+        let mut first = [0; 3];
+        stdout.read_exact(&mut first).await.expect("read live Node bytes");
+        assert_eq!(first, [0, 255, 195]);
+        assert!(child.try_wait().expect("query live Node child").is_none());
+        child.stdout = Some(stdout);
+        let bytes = child.wait_with_output().await.expect("collect Node binary output");
         assert!(bytes.status.success(), "{bytes:?}");
-        assert_eq!(bytes.stdout, [0, 255, 195]);
+        assert!(bytes.stdout.is_empty(), "stdout prefix was already consumed");
         assert_eq!(bytes.stderr, [128, 10]);
         use std::{future::IntoFuture as _, sync::atomic::{AtomicBool, Ordering}};
         {

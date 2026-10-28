@@ -67,11 +67,6 @@ pub fn with_opener<R>(opener: NewWindowOpener, build: impl FnOnce() -> R) -> R {
   build()
 }
 
-#[cfg(feature = "tauri")]
-pub(crate) fn current_main_bridge() -> Option<crate::ElectronBridge> {
-  WEBVIEW.with(|slot| slot.borrow().as_ref().map(ElectronWebviewDispatcher::main_bridge))
-}
-
 pub(crate) fn take_opener() -> Option<NewWindowOpener> {
   OPENER.with(|slot| slot.borrow_mut().take())
 }

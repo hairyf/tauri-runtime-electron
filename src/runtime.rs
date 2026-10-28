@@ -940,9 +940,11 @@ impl Electron {
     self
   }
 
-  /// Run the resolved binary in a separate Node process, waiting for its output.
-  /// Nonzero exits remain `Ok(Output)`; this does not start an RPC bridge.
-  pub fn node(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+  /// Resolve the binary and spawn a separate Node process on the current Tokio runtime.
+  ///
+  /// Returns a native child with piped stdout/stderr, null stdin and kill-on-drop.
+  /// Use its native async I/O, wait and kill methods; this does not start an RPC bridge.
+  pub fn node(&self, args: &[&str]) -> std::io::Result<tokio::process::Child> {
     electron_rs::node(self.resolve_binary().map_err(std::io::Error::other)?, args)
   }
 
