@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-  platform::monitor_from_value,
+  platform::monitor_from_display,
   runtime::{
-    create_webview_impl, create_window_err, create_window_impl, rect_position, rect_size,
+    create_webview_impl, create_window_err, create_window_impl,
     size_constraints_payload, ElectronRuntime, Message, RuntimeContext,
   },
   window_builder::ElectronWindowBuilder,
 };
 use crate::{rpc, rpc_runtime::Ipc as ElectronProcess};
 use electron_rs::RpcRequest;
-use serde_json::{json, Value};
 use std::{cell::RefCell, sync::Weak};
 
 pub use tauri_utils::{
@@ -54,14 +53,14 @@ impl EffectsTarget {
     }
   }
 
-  fn apply(&self, material: &str) -> std::io::Result<()> {
+  fn apply(&self, material: rpc::window::BackgroundMaterial) -> std::io::Result<()> {
     self
       .ipc
       .upgrade()
       .ok_or_else(|| std::io::Error::other("Electron runtime has exited"))?
       .call(rpc::BackgroundMaterial {
         window_id: self.serial,
-        material: material.to_owned(),
+        material,
       })
       .map(|_| ())
       .map_err(|error| std::io::Error::other(error.to_string()))
@@ -85,17 +84,17 @@ fn with_effects_target<R>(target: EffectsTarget, task: impl FnOnce() -> R) -> R 
   task()
 }
 
-fn background_material(effects: Option<&WindowEffectsConfig>) -> std::io::Result<&'static str> {
+fn background_material(effects: Option<&WindowEffectsConfig>) -> std::io::Result<rpc::window::BackgroundMaterial> {
   match effects.and_then(|config| {
     config
       .effects
       .iter()
       .find(|effect| matches!(effect, Effect::Acrylic | Effect::Mica | Effect::Tabbed))
   }) {
-    Some(Effect::Acrylic) => Ok("acrylic"),
-    Some(Effect::Mica) => Ok("mica"),
-    Some(Effect::Tabbed) => Ok("tabbed"),
-    _ if effects.is_none_or(|config| config.effects.is_empty()) => Ok("none"),
+    Some(Effect::Acrylic) => Ok(rpc::window::BackgroundMaterial::Acrylic),
+    Some(Effect::Mica) => Ok(rpc::window::BackgroundMaterial::Mica),
+    Some(Effect::Tabbed) => Ok(rpc::window::BackgroundMaterial::Tabbed),
+    _ if effects.is_none_or(|config| config.effects.is_empty()) => Ok(rpc::window::BackgroundMaterial::None),
     _ => Err(std::io::Error::new(
       std::io::ErrorKind::Unsupported,
       "Unsupported window effect: Electron supports Acrylic, Mica and Tabbed only",
@@ -105,13 +104,13 @@ fn background_material(effects: Option<&WindowEffectsConfig>) -> std::io::Result
 
 #[test]
 fn selects_supported_background_material_or_rejects() {
-  assert_eq!(background_material(None).unwrap(), "none");
+  assert_eq!(background_material(None).unwrap(), rpc::window::BackgroundMaterial::None);
   let mut config = WindowEffectsConfig::default();
-  assert_eq!(background_material(Some(&config)).unwrap(), "none");
+  assert_eq!(background_material(Some(&config)).unwrap(), rpc::window::BackgroundMaterial::None);
   for (effect, material) in [
-    (Effect::Acrylic, "acrylic"),
-    (Effect::Mica, "mica"),
-    (Effect::Tabbed, "tabbed"),
+    (Effect::Acrylic, rpc::window::BackgroundMaterial::Acrylic),
+    (Effect::Mica, rpc::window::BackgroundMaterial::Mica),
+    (Effect::Tabbed, rpc::window::BackgroundMaterial::Tabbed),
   ] {
     config.effects = vec![Effect::Blur, effect];
     assert_eq!(background_material(Some(&config)).unwrap(), material);
@@ -157,7 +156,7 @@ impl ElectronWindowDispatcher {
   }
 
   /// Queries the live Electron window geometry and state.
-  fn geometry(&self) -> Result<Value> {
+  fn geometry(&self) -> Result<rpc::window::WindowGeometry> {
     self.window_call(rpc::Geometry { window_id: 0 })
   }
 }
@@ -181,42 +180,46 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn scale_factor(&self) -> Result<f64> {
-    Ok(self.geometry()?["scaleFactor"].as_f64().unwrap_or(1.0))
+    Ok(self.geometry()?.scale_factor)
   }
 
   fn inner_position(&self) -> Result<PhysicalPosition<i32>> {
-    Ok(rect_position(&self.geometry()?["contentBounds"]))
+    let bounds = self.geometry()?.content_bounds;
+    Ok(PhysicalPosition::new(bounds.x, bounds.y))
   }
 
   fn outer_position(&self) -> Result<PhysicalPosition<i32>> {
-    Ok(rect_position(&self.geometry()?["bounds"]))
+    let bounds = self.geometry()?.bounds;
+    Ok(PhysicalPosition::new(bounds.x, bounds.y))
   }
 
   fn inner_size(&self) -> Result<PhysicalSize<u32>> {
-    Ok(rect_size(&self.geometry()?["contentBounds"]))
+    let bounds = self.geometry()?.content_bounds;
+    Ok(PhysicalSize::new(bounds.width, bounds.height))
   }
 
   fn outer_size(&self) -> Result<PhysicalSize<u32>> {
-    Ok(rect_size(&self.geometry()?["bounds"]))
+    let bounds = self.geometry()?.bounds;
+    Ok(PhysicalSize::new(bounds.width, bounds.height))
   }
 
   fn is_fullscreen(&self) -> Result<bool> {
-    Ok(self.geometry()?["fullscreen"].as_bool().unwrap_or(false))
+    Ok(self.geometry()?.fullscreen)
   }
 
   fn is_minimized(&self) -> Result<bool> {
-    Ok(self.geometry()?["minimized"].as_bool().unwrap_or(false))
+    Ok(self.geometry()?.minimized)
   }
 
   fn is_maximized(&self) -> Result<bool> {
     #[cfg(windows)]
     return imp::is_maximized(self.context.native_handle(self.id)?);
     #[cfg(not(windows))]
-    Ok(self.geometry()?["maximized"].as_bool().unwrap_or(false))
+    Ok(self.geometry()?.maximized)
   }
 
   fn is_focused(&self) -> Result<bool> {
-    Ok(self.geometry()?["focused"].as_bool().unwrap_or(false))
+    Ok(self.geometry()?.focused)
   }
 
   fn is_decorated(&self) -> Result<bool> {
@@ -224,19 +227,19 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     return crate::platform::linux_window::is_decorated(self.context.x11_window(self.id)?)
       .map_err(create_window_err);
     #[cfg(not(target_os = "linux"))]
-    Ok(self.geometry()?["decorated"].as_bool().unwrap_or(true))
+    Ok(self.geometry()?.decorated)
   }
 
   fn is_resizable(&self) -> Result<bool> {
-    Ok(self.geometry()?["resizable"].as_bool().unwrap_or(true))
+    Ok(self.geometry()?.resizable)
   }
 
   fn is_maximizable(&self) -> Result<bool> {
-    Ok(self.geometry()?["maximizable"].as_bool().unwrap_or(true))
+    Ok(self.geometry()?.maximizable)
   }
 
   fn is_minimizable(&self) -> Result<bool> {
-    Ok(self.geometry()?["minimizable"].as_bool().unwrap_or(true))
+    Ok(self.geometry()?.minimizable)
   }
 
   fn is_closable(&self) -> Result<bool> {
@@ -244,39 +247,30 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     return crate::platform::linux_window::is_closable(self.context.x11_window(self.id)?)
       .map_err(create_window_err);
     #[cfg(not(target_os = "linux"))]
-    Ok(self.geometry()?["closable"].as_bool().unwrap_or(true))
+    Ok(self.geometry()?.closable)
   }
 
   fn is_visible(&self) -> Result<bool> {
-    Ok(self.geometry()?["visible"].as_bool().unwrap_or(true))
+    Ok(self.geometry()?.visible)
   }
 
   fn title(&self) -> Result<String> {
-    Ok(
-      self
-        .geometry()?
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string(),
-    )
+    Ok(self.geometry()?.title)
   }
 
   fn current_monitor(&self) -> Result<Option<Monitor>> {
-    Ok(monitor_from_value(
+    Ok(Some(monitor_from_display(
       &self.window_call(rpc::WindowCurrentDisplay { window_id: 0 })?,
-    ))
+    )))
   }
 
   fn primary_monitor(&self) -> Result<Option<Monitor>> {
     let displays = self.rpc_call(rpc::Displays {})?;
-    Ok(displays.primary.as_ref().and_then(monitor_from_value))
+    Ok(Some(monitor_from_display(&displays.primary)))
   }
 
   fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
-    Ok(monitor_from_value(
-      &self.rpc_call(rpc::DisplayForPoint { x, y })?,
-    ))
+    Ok(self.rpc_call(rpc::DisplayForPoint { x, y })?.as_ref().map(monitor_from_display))
   }
 
   fn available_monitors(&self) -> Result<Vec<Monitor>> {
@@ -285,16 +279,16 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       displays
         .displays
         .iter()
-        .filter_map(monitor_from_value)
+        .map(monitor_from_display)
         .collect(),
     )
   }
 
   fn theme(&self) -> Result<Theme> {
     let query = self.window_call(rpc::WindowTheme { window_id: 0 })?;
-    Ok(match query["theme"].as_str() {
-      Some("dark") => Theme::Dark,
-      _ => Theme::Light,
+    Ok(match query.theme {
+      electron_rs::rpc::ColorScheme::Dark => Theme::Dark,
+      electron_rs::rpc::ColorScheme::Light => Theme::Light,
     })
   }
 
@@ -380,7 +374,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     let flash = request_type.is_some();
     self.window_call(rpc::WindowAttention {
       window_id: 0,
-      flash: flash,
+      flash,
     })
   }
 
@@ -402,21 +396,21 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_resizable(&self, resizable: bool) -> Result<()> {
     self.window_call(rpc::WindowResizable {
       window_id: 0,
-      resizable: resizable,
+      resizable,
     })
   }
 
   fn set_maximizable(&self, maximizable: bool) -> Result<()> {
     self.window_call(rpc::WindowMaximizable {
       window_id: 0,
-      maximizable: maximizable,
+      maximizable,
     })
   }
 
   fn set_minimizable(&self, minimizable: bool) -> Result<()> {
     self.window_call(rpc::WindowMinimizable {
       window_id: 0,
-      minimizable: minimizable,
+      minimizable,
     })
   }
 
@@ -426,7 +420,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       .map_err(create_window_err)?;
     self.window_call(rpc::WindowClosable {
       window_id: 0,
-      closable: closable,
+      closable,
     })
   }
 
@@ -547,7 +541,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     // a later widget update can undo the cross-process SetWindowPos call.
     self.window_call(rpc::WindowAlwaysOnTop {
       window_id: 0,
-      always_on_top: always_on_top,
+      always_on_top,
     })?;
     #[cfg(windows)]
     imp::set_always_on_top(self.context.native_handle(self.id)?, always_on_top)?;
@@ -564,7 +558,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_content_protected(&self, protected: bool) -> Result<()> {
     self.window_call(rpc::WindowContentProtected {
       window_id: 0,
-      protected: protected,
+      protected,
     })
   }
 
@@ -575,15 +569,15 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       imp::set_client_size(self.context.native_handle(self.id)?, size)
     }
     #[cfg(not(windows))]
-    self.window_call(rpc::WindowSize::from_size(size))
+    self.window_call(rpc::window_size(size))
   }
 
   fn set_min_size(&self, size: Option<Size>) -> Result<()> {
-    self.window_call(rpc::WindowMinSize::from_size(size))
+    self.window_call(rpc::window_min_size(size))
   }
 
   fn set_max_size(&self, size: Option<Size>) -> Result<()> {
-    self.window_call(rpc::WindowMaxSize::from_size(size))
+    self.window_call(rpc::window_max_size(size))
   }
 
   fn set_position(&self, position: Position) -> Result<()> {
@@ -599,13 +593,13 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
       )
     }
     #[cfg(not(windows))]
-    self.window_call(rpc::WindowPosition::from_position(position))
+    self.window_call(rpc::window_position(position))
   }
 
   fn set_fullscreen(&self, fullscreen: bool) -> Result<()> {
     self.window_call(rpc::WindowFullscreen {
       window_id: 0,
-      fullscreen: fullscreen,
+      fullscreen,
       x: None,
       y: None,
     })
@@ -635,7 +629,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_focusable(&self, focusable: bool) -> Result<()> {
     self.window_call(rpc::WindowFocusable {
       window_id: 0,
-      focusable: focusable,
+      focusable,
     })
   }
 
@@ -649,7 +643,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_skip_taskbar(&self, skip: bool) -> Result<()> {
     self.window_call(rpc::WindowSkipTaskbar {
       window_id: 0,
-      skip: skip,
+      skip,
     })
   }
 
@@ -670,7 +664,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_cursor_visible(&self, visible: bool) -> Result<()> {
     self.window_call(rpc::WindowCursorVisible {
       window_id: 0,
-      visible: visible,
+      visible,
     })
   }
 
@@ -713,7 +707,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   fn set_ignore_cursor_events(&self, ignore: bool) -> Result<()> {
     self.window_call(rpc::WindowIgnoreCursor {
       window_id: 0,
-      ignore: ignore,
+      ignore,
     })
   }
 
@@ -751,39 +745,38 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   fn set_progress_bar(&self, progress_state: ProgressBarState) -> Result<()> {
     let state = match progress_state.status {
-      None | Some(ProgressBarStatus::None) => "none",
-      Some(ProgressBarStatus::Normal) => "normal",
-      Some(ProgressBarStatus::Indeterminate) => "indeterminate",
-      Some(ProgressBarStatus::Paused) => "paused",
-      Some(ProgressBarStatus::Error) => "error",
+      None | Some(ProgressBarStatus::None) => rpc::window::ProgressState::None,
+      Some(ProgressBarStatus::Normal | ProgressBarStatus::Indeterminate) => rpc::window::ProgressState::Normal,
+      Some(ProgressBarStatus::Paused) => rpc::window::ProgressState::Paused,
+      Some(ProgressBarStatus::Error) => rpc::window::ProgressState::Error,
     };
     self.window_call(rpc::WindowProgressBar {
       window_id: 0,
-      state: state,
-      progress: progress_state
-        .progress
-        .map(|progress| progress as f64 / 100.0),
-      desktop_filename: progress_state.desktop_filename,
+      state,
+      // Electron's documented >1 convention is indeterminate on Windows;
+      // other platforms clamp it to 100% (docs/tutorial/progress-bar.md).
+      progress: if matches!(progress_state.status, Some(ProgressBarStatus::Indeterminate)) { 2.0 }
+        else { progress_state.progress.unwrap_or(0) as f64 / 100.0 },
     })
   }
 
   fn set_badge_count(&self, count: Option<i64>, _desktop_filename: Option<String>) -> Result<()> {
-    self.window_call(rpc::WindowBadgeCount {
-      window_id: 0,
-      count: count.unwrap_or(0),
-    })
+    let count = u32::try_from(count.unwrap_or(0).max(0))
+      .map_err(|_| create_window_err("badge count must fit an unsigned 32-bit integer".into()))?;
+    self.rpc_call(rpc::WindowBadgeCount { count })
   }
 
   // macOS badge labels need a string API Electron does not expose; the dock
   // badge goes through `set_badge_count`.
   fn set_badge_label(&self, label: Option<String>) -> Result<()> {
-    self.rpc_call(rpc::AppBadgeLabel { label })
+    self.rpc_call(rpc::AppBadgeLabel { label: label.unwrap_or_default() })
   }
 
   fn set_overlay_icon(&self, icon: Option<Icon<'_>>) -> Result<()> {
     self.window_call(rpc::WindowOverlayIcon {
       window_id: 0,
       icon: icon.map(icon_payload),
+      description: String::new(),
     })
   }
 
@@ -791,7 +784,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     #[cfg(target_os = "macos")]
     return self.window_call(rpc::WindowTitleBarStyle {
       window_id: 0,
-      style: style,
+      style: rpc::title_bar_style(style)?,
     });
     #[cfg(not(target_os = "macos"))]
     {
@@ -801,7 +794,7 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_traffic_light_position(&self, position: Position) -> Result<()> {
-    self.window_call(rpc::WindowTrafficLight::from_position(position))
+    self.window_call(rpc::window_traffic_light(position))
   }
 
   fn set_size_constraints(&self, constraints: WindowSizeConstraints) -> Result<()> {
@@ -813,20 +806,20 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
 
   fn set_theme(&self, theme: Option<Theme>) -> Result<()> {
     let theme = match theme {
-      Some(Theme::Dark) => "dark",
-      Some(_) => "light",
-      None => "system",
+      Some(Theme::Dark) => electron_rs::Theme::Dark,
+      Some(_) => electron_rs::Theme::Light,
+      None => electron_rs::Theme::System,
     };
     self.window_call(rpc::WindowSetTheme {
       window_id: 0,
-      theme: theme,
+      theme,
     })
   }
 
   fn set_enabled(&self, enabled: bool) -> Result<()> {
     self.window_call(rpc::WindowEnabled {
       window_id: 0,
-      enabled: enabled,
+      enabled,
     })
   }
 
@@ -838,33 +831,19 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
     #[cfg(windows)]
     return Ok(imp::is_always_on_top(self.context.native_handle(self.id)?));
     #[cfg(not(windows))]
-    Ok(self.geometry()?["alwaysOnTop"].as_bool().unwrap_or(false))
+    Ok(self.geometry()?.always_on_top)
   }
 
   fn set_background_color(&self, color: Option<tauri_utils::config::Color>) -> Result<()> {
     self.window_call(rpc::WindowBackgroundColor {
       window_id: 0,
-      color: color.map(color_css),
+      color: color.map(|color| electron_rs::rpc::Color::Rgba([color.0, color.1, color.2, color.3])),
     })
   }
 }
 
-fn icon_payload(icon: Icon<'_>) -> Value {
-  json!({
-    "width": icon.width,
-    "height": icon.height,
-    "rgba": icon.rgba.as_ref(),
-  })
-}
-
-fn color_css(color: tauri_utils::config::Color) -> String {
-  format!(
-    "rgba({}, {}, {}, {:.3})",
-    color.0,
-    color.1,
-    color.2,
-    color.3 as f64 / 255.0
-  )
+fn icon_payload(icon: Icon<'_>) -> rpc::window::Icon {
+  rpc::window::Icon { width: icon.width, height: icon.height, rgba: icon.rgba.into_owned() }
 }
 
 /// Win32 tweaks that Electron has no API for but the window still supports.
@@ -1315,9 +1294,9 @@ pub(crate) mod imp {
 
   pub(super) fn constrained_client_size(
     size: tauri_runtime::dpi::Size,
-    geometry: &serde_json::Value,
+    geometry: &crate::rpc::window::WindowGeometry,
   ) -> tauri_runtime::Result<tauri_runtime::dpi::PhysicalSize<u32>> {
-    let scale = geometry["scaleFactor"].as_f64().unwrap_or_default();
+    let scale = geometry.scale_factor;
     if !scale.is_finite() || scale <= 0.0 {
       return Err(super::create_window_err(
         "invalid window scale factor".into(),
@@ -1333,9 +1312,8 @@ pub(crate) mod imp {
         "invalid or overflowing window size".into(),
       ));
     }
-    let limit = |key: &str| -> tauri_runtime::Result<u32> {
-      let value = geometry["contentConstraints"][key]
-        .as_f64()
+    let limit = |key: crate::rpc::window::ConstraintAxis| -> tauri_runtime::Result<u32> {
+      let value = geometry.content_constraints.get(&key)
         .map(|value| (value * scale).round())
         .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(i32::MAX))
         .ok_or_else(|| {
@@ -1343,7 +1321,7 @@ pub(crate) mod imp {
         })?;
       Ok(value as u32)
     };
-    let clamp = |value: u32, minimum: &str, maximum: &str| -> tauri_runtime::Result<u32> {
+    let clamp = |value: u32, minimum: crate::rpc::window::ConstraintAxis, maximum: crate::rpc::window::ConstraintAxis| -> tauri_runtime::Result<u32> {
       let minimum = limit(minimum)?;
       let maximum = limit(maximum)?;
       Ok(
@@ -1356,8 +1334,8 @@ pub(crate) mod imp {
       )
     };
     Ok(tauri_runtime::dpi::PhysicalSize::new(
-      clamp(size.width, "minWidth", "maxWidth")?,
-      clamp(size.height, "minHeight", "maxHeight")?,
+      clamp(size.width, crate::rpc::window::ConstraintAxis::MinWidth, crate::rpc::window::ConstraintAxis::MaxWidth)?,
+      clamp(size.height, crate::rpc::window::ConstraintAxis::MinHeight, crate::rpc::window::ConstraintAxis::MaxHeight)?,
     ))
   }
 
@@ -1415,11 +1393,18 @@ pub(crate) mod imp {
 
   #[test]
   fn native_client_size_honors_current_content_constraints() {
-    use serde_json::json;
+    use crate::rpc::window::{ConstraintAxis, WindowGeometry};
     use tauri_runtime::dpi::{LogicalSize, PhysicalSize, Size};
-    let mut geometry = json!({ "scaleFactor": 1.25, "contentConstraints": {
-      "minWidth": 300, "minHeight": 320, "maxWidth": 800, "maxHeight": 640,
-    }});
+    let mut geometry: WindowGeometry = serde_json::from_value(serde_json::json!({
+      "scaleFactor": 1.25, "contentConstraints": {
+        "minWidth": 300, "minHeight": 320, "maxWidth": 800, "maxHeight": 640,
+      },
+      "bounds": {"x": 0, "y": 0, "width": 100, "height": 100},
+      "contentBounds": {"x": 0, "y": 0, "width": 100, "height": 100},
+      "maximized": false, "minimized": false, "focused": false, "visible": true,
+      "fullscreen": false, "resizable": true, "alwaysOnTop": false, "decorated": true,
+      "title": "constraints", "maximizable": true, "minimizable": true, "closable": true,
+    })).unwrap();
     let physical = Size::Physical(PhysicalSize::new(1200, 100));
     assert_eq!(
       constrained_client_size(physical, &geometry).unwrap(),
@@ -1429,15 +1414,14 @@ pub(crate) mod imp {
       constrained_client_size(Size::Logical(LogicalSize::new(400.0, 400.0)), &geometry).unwrap(),
       PhysicalSize::new(500, 500)
     );
-    geometry["contentConstraints"] =
-      json!({ "minWidth": 0, "minHeight": 0, "maxWidth": 0, "maxHeight": 0 });
+    geometry.content_constraints.values_mut().for_each(|limit| *limit = 0.0);
     assert_eq!(
       constrained_client_size(physical, &geometry).unwrap(),
       PhysicalSize::new(1200, 100)
     );
-    geometry["contentConstraints"]["minHeight"] = json!(-1);
+    geometry.content_constraints.insert(ConstraintAxis::MinHeight, -1.0);
     assert!(constrained_client_size(physical, &geometry).is_err());
-    geometry["scaleFactor"] = json!(0);
+    geometry.scale_factor = 0.0;
     assert!(constrained_client_size(physical, &geometry).is_err());
   }
 

@@ -65,16 +65,28 @@ async fn run_task(
     webview: &tauri::Webview<ElectronRuntime>,
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let bridge = main_bridge(webview).await?;
-    let output = bridge
-        .node_in_main("console.log(args[0]);", &["hello"])
-        .await?;
+    let output = tokio::task::spawn_blocking(move || {
+        bridge.node(&["-e", "console.log(process.argv[1]);", "--", "hello"])
+    }).await??;
     assert!(output.status.success());
     assert_eq!(output.stdout, b"hello\n");
     Ok(output)
 }
 ```
 
-`main_bridge` returns an `Arc` client for the existing process; `ElectronWebviewDispatcher::main_bridge()` is the direct runtime form. `node_in_main` uses a short-lived Worker, while `electron_in_main` runs on Electron's main thread. Both accept async JavaScript function bodies and return `std::process::Output` with `status` and raw `stdout`/`stderr`; JavaScript return values are ignored. They support `.on_output(...)`, an optional `.timeout(...)`, and `.max_output_bytes(...)`. Execution has no time limit by default; the default output cap is 16 MiB. Main-thread cancellation cannot interrupt synchronous JavaScript, and no generic renderer execution endpoint is registered.
+`main_bridge` returns an `Arc` client for the existing Electron process; `ElectronWebviewDispatcher::main_bridge()` is the direct runtime form. The client has two distinct execution paths:
+
+- `bridge.node(args)` synchronously starts a **separate Node process** using the client's Electron binary with `ELECTRON_RUN_AS_NODE=1`. It directly forwards CLI arguments and returns `std::io::Result<std::process::Output>`; there is no RPC, Worker, streaming builder, or same-PID guarantee. Use `spawn_blocking` from async code as above. For eval use `&["-e", script, "--", ...]` with `process.argv.slice(1)`; file entries use `process.argv.slice(2)`. Eval source is ordinary JavaScript: wrap async work in `(async()=>{...})()` and do not use top-level `return`.
+- `bridge.run(script)` executes an **async JavaScript function body on the existing Electron main thread**, in the same PID. It accepts only the script, not CLI arguments or a separate argument list. Top-level `await` and `return` are supported; return values are ignored. The body receives `signal`, `require`, `process`, and `console`, but no injected `args`.
+
+```rust
+let output = bridge
+    .run("await Promise.resolve(); console.log(require('electron').app.isReady());")
+    .await?;
+assert!(output.status.success());
+```
+
+`run` returns an awaitable `Command` supporting `.on_output(...)`, optional `.timeout(...)`, and `.max_output_bytes(...)`. Output preserves status and raw stdout/stderr bytes. Execution has no time limit by default; the default output cap is 16 MiB. Main-thread cancellation cannot interrupt synchronous JavaScript. There is no connected-client `electron(args)` method or generic renderer execution endpoint.
 
 For lower-level acquisition, RPC, events, and command APIs, see [electron-rs](https://github.com/hairyf/electron-rs).
 

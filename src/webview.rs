@@ -7,7 +7,6 @@ use crate::runtime::{
   create_webview_err, position_payload, size_payload, ElectronRuntime, Message, RuntimeContext,
 };
 use electron_rs::RpcRequest;
-use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri_runtime::{
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
@@ -33,7 +32,10 @@ impl ElectronWebviewDispatcher {
     let bounds = self.webview_call(rpc::WebviewBounds {
       webview_id: self.id,
     })?;
-    Ok(rect_from_value(&bounds["bounds"]))
+    Ok(tauri_runtime::dpi::Rect {
+      position: Position::Physical(PhysicalPosition::new(bounds.bounds.x, bounds.bounds.y)),
+      size: Size::Physical(PhysicalSize::new(bounds.bounds.width, bounds.bounds.height)),
+    })
   }
 }
 
@@ -125,7 +127,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewSetZoom {
         webview_id: self.id,
-        scale_factor: scale_factor,
+        scale_factor,
       })
       .map(|_| ())
   }
@@ -236,8 +238,11 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewSetBounds {
         webview_id: self.id,
-        position: Some(position_payload(bounds.position)),
-        size: Some(size_payload(bounds.size)),
+        bounds: rpc::webview::BoundsInput {
+          position: Some(position_payload(bounds.position)),
+          size: Some(size_payload(bounds.size)),
+          physical: None,
+        },
       })
       .map(|_| ())
   }
@@ -246,8 +251,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewSetBounds {
         webview_id: self.id,
-        position: None,
-        size: Some(size_payload(size)),
+        bounds: rpc::webview::BoundsInput {
+          position: None, size: Some(size_payload(size)), physical: None,
+        },
       })
       .map(|_| ())
   }
@@ -256,8 +262,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewSetBounds {
         webview_id: self.id,
-        position: Some(position_payload(position)),
-        size: None,
+        bounds: rpc::webview::BoundsInput {
+          position: Some(position_payload(position)), size: None, physical: None,
+        },
       })
       .map(|_| ())
   }
@@ -295,14 +302,17 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewSetCookie {
         webview_id: self.id,
-        url: url,
-        name: cookie.name().to_owned(),
-        value: cookie.value().to_owned(),
-        domain: cookie.domain().map(str::to_owned),
-        path: cookie.path().map(str::to_owned),
-        secure: cookie.secure().unwrap_or(false),
-        http_only: cookie.http_only(),
-        same_site: same_site_name(cookie.same_site()),
+        cookie: rpc::webview::CookieInit {
+          url,
+          name: cookie.name().to_owned(),
+          value: cookie.value().to_owned(),
+          domain: cookie.domain().map(str::to_owned),
+          path: cookie.path().map(str::to_owned),
+          secure: Some(cookie.secure().unwrap_or(false)),
+          http_only: cookie.http_only(),
+          same_site: same_site(cookie.same_site()),
+          expiration_date: cookie.expires_datetime().map(|date| date.unix_timestamp_nanos() as f64 / 1_000_000_000.0),
+        },
       })
       .map(|_| ())
   }
@@ -312,7 +322,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewDeleteCookie {
         webview_id: self.id,
-        url: url,
+        url,
         name: cookie.name().to_owned(),
       })
       .map(|_| ())
@@ -324,7 +334,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
     self
       .webview_call(rpc::WebviewSetAutoResize {
         webview_id: self.id,
-        auto_resize: auto_resize,
+        auto_resize,
       })
       .map(|_| ())
   }
@@ -404,54 +414,38 @@ impl ElectronWebviewDispatcher {
   }
 }
 
-/// Converts the physical-pixel rect reported by `electron-rs/assets/main.cjs`.
-fn rect_from_value(value: &Value) -> tauri_runtime::dpi::Rect {
-  let position = Position::Physical(PhysicalPosition::new(
-    value["x"].as_i64().unwrap_or_default() as i32,
-    value["y"].as_i64().unwrap_or_default() as i32,
-  ));
-  let size = Size::Physical(PhysicalSize::new(
-    value["width"].as_u64().unwrap_or_default() as u32,
-    value["height"].as_u64().unwrap_or_default() as u32,
-  ));
-  tauri_runtime::dpi::Rect { position, size }
+fn parse_cookies(cookies: &[rpc::webview::Cookie]) -> Vec<tauri_runtime::Cookie<'static>> {
+  cookies.iter().map(|cookie| {
+    let mut builder = tauri_runtime::Cookie::build((cookie.name.clone(), cookie.value.clone()))
+      .path(cookie.path.clone().unwrap_or_else(|| "/".into()));
+    // Host-only cookies must remain host-only when set again.
+    if !cookie.host_only.unwrap_or(false) {
+      if let Some(domain) = &cookie.domain { builder = builder.domain(domain.clone()); }
+    }
+    builder = builder.secure(cookie.secure.unwrap_or(false))
+      .http_only(cookie.http_only.unwrap_or(false));
+    if let Some(same_site) = match cookie.same_site {
+      rpc::webview::SameSite::Strict => Some(cookie::SameSite::Strict),
+      rpc::webview::SameSite::Lax => Some(cookie::SameSite::Lax),
+      rpc::webview::SameSite::NoRestriction => Some(cookie::SameSite::None),
+      rpc::webview::SameSite::Unspecified => None,
+    } { builder = builder.same_site(same_site); }
+    if !cookie.session {
+      if let Some(date) = cookie.expiration_date.filter(|date| date.is_finite())
+        .and_then(|date| cookie::time::OffsetDateTime::from_unix_timestamp_nanos((date * 1_000_000_000.0) as i128).ok()) {
+        builder = builder.expires(date);
+      }
+    }
+    builder.build()
+  }).collect()
 }
 
-fn parse_cookies(value: &[Value]) -> Vec<tauri_runtime::Cookie<'static>> {
-  value.iter().filter_map(cookie_from_value).collect()
-}
-
-fn cookie_from_value(value: &Value) -> Option<tauri_runtime::Cookie<'static>> {
-  let name = value["name"].as_str()?.to_string();
-  let cookie_value = value["value"].as_str().unwrap_or_default().to_string();
-  let mut builder = tauri_runtime::Cookie::build((name, cookie_value))
-    .path(value["path"].as_str().unwrap_or("/").to_string());
-  if let Some(domain) = value["domain"].as_str() {
-    builder = builder.domain(domain.to_string());
-  }
-  builder = builder
-    .secure(value["secure"].as_bool().unwrap_or(false))
-    .http_only(value["httpOnly"].as_bool().unwrap_or(false));
-  if let Some(same_site) = value["sameSite"].as_str() {
-    builder = builder.same_site(same_site_name_to_same_site(same_site));
-  }
-  Some(builder.build())
-}
-
-fn same_site_name(value: Option<cookie::SameSite>) -> Option<&'static str> {
+fn same_site(value: Option<cookie::SameSite>) -> Option<rpc::webview::SameSite> {
   value.map(|value| match value {
-    cookie::SameSite::Strict => "strict",
-    cookie::SameSite::Lax => "lax",
-    cookie::SameSite::None => "no_restriction",
+    cookie::SameSite::Strict => rpc::webview::SameSite::Strict,
+    cookie::SameSite::Lax => rpc::webview::SameSite::Lax,
+    cookie::SameSite::None => rpc::webview::SameSite::NoRestriction,
   })
-}
-
-fn same_site_name_to_same_site(value: &str) -> cookie::SameSite {
-  match value {
-    "strict" => cookie::SameSite::Strict,
-    "no_restriction" => cookie::SameSite::None,
-    _ => cookie::SameSite::Lax,
-  }
 }
 
 fn css_color(color: tauri_utils::config::Color) -> String {
@@ -462,4 +456,30 @@ fn css_color(color: tauri_utils::config::Color) -> String {
     color.2,
     color.3 as f64 / 255.0
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn cookies_preserve_session_expiry_host_scope_and_same_site() {
+    let snapshots: Vec<rpc::webview::Cookie> = serde_json::from_value(serde_json::json!([
+      {"name": "host", "value": "a", "domain": "example.test", "hostOnly": true,
+       "path": "/", "secure": true, "httpOnly": true, "session": true, "sameSite": "unspecified"},
+      {"name": "persistent", "value": "b", "domain": ".example.test", "hostOnly": false,
+       "path": "/app", "session": false, "expirationDate": 1800000000.5, "sameSite": "no_restriction"},
+    ])).unwrap();
+    let cookies = parse_cookies(&snapshots);
+    assert_eq!(cookies[0].domain(), None);
+    assert_eq!(cookies[0].expires(), None);
+    assert_eq!(cookies[0].same_site(), None);
+    assert_eq!(cookies[0].secure(), Some(true));
+    assert_eq!(cookies[0].http_only(), Some(true));
+    // cookie::Cookie normalizes the legacy leading dot on domain cookies.
+    assert_eq!(cookies[1].domain(), Some("example.test"));
+    assert_eq!(cookies[1].path(), Some("/app"));
+    assert_eq!(cookies[1].expires_datetime().unwrap().unix_timestamp_nanos(), 1_800_000_000_500_000_000);
+    assert_eq!(same_site(cookies[1].same_site()), Some(rpc::webview::SameSite::NoRestriction));
+  }
 }

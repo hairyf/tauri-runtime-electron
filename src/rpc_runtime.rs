@@ -9,6 +9,20 @@ use tokio::runtime::Runtime;
 
 type Task = Box<dyn FnOnce(&Runtime) + Send>;
 
+// Scheduling belongs to the adapter; the built-in method and payload stay upstream-owned.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct Notification<R>(R);
+
+impl<R: RpcRequest> RpcRequest for Notification<R> {
+  type Response = ();
+  const METHOD: &'static str = R::METHOD;
+  fn method(&self) -> &'static str { self.0.method() }
+  fn deferred(&self) -> bool { self.0.deferred() }
+  fn timeout(&self) -> Duration { self.0.timeout() }
+  fn notification(&self) -> bool { true }
+}
+
 /// The synchronous Tauri traits enter the async client only through this bridge.
 #[derive(Debug)]
 pub(crate) struct Ipc {
@@ -75,7 +89,7 @@ impl Ipc {
   }
 
   pub(crate) fn notify<R: RpcRequest>(&self, request: R) -> Result<(), electron_rs::Error> {
-    self.dispatch(request, |result| {
+    self.dispatch(Notification(request), |result| {
       if let Err(error) = result {
         eprintln!("[electron] RPC notification failed: {error}");
       }
@@ -106,5 +120,21 @@ impl Ipc {
         mpsc::TrySendError::Disconnected(_) => electron_rs::Error::ChannelDisconnected,
         mpsc::TrySendError::Full(_) => "Electron adapter task queue is full".into(),
       })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn notifications_preserve_upstream_payload_and_deferred_scheduling() {
+    let notification = Notification(electron_rs::rpc::webview::Eval {
+      webview_id: 8, script: "1 + 1".into(),
+    });
+    assert!(notification.notification() && notification.deferred());
+    assert_eq!(notification.method(), "webview.eval");
+    assert_eq!(serde_json::to_value(notification).unwrap(),
+      serde_json::json!({"webviewId": 8, "script": "1 + 1"}));
   }
 }

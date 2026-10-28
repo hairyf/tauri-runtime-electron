@@ -120,38 +120,33 @@ pub(crate) fn unsupported(method: &'static str, reason: &str) {
 }
 
 /// Tauri sizes are physical or logical; the Electron side converts to DIPs.
-pub(crate) fn size_payload(size: Size) -> Value {
-  match size {
-    Size::Physical(size) => {
-      json!({ "width": size.width, "height": size.height, "physical": true })
-    }
-    Size::Logical(size) => {
-      json!({ "width": size.width, "height": size.height, "physical": false })
-    }
+pub(crate) fn size_payload(size: Size) -> rpc::webview::Extent {
+  let size = rpc::window_size(size);
+  rpc::webview::Extent {
+    width: size.width, height: size.height, physical: Some(size.physical),
   }
 }
 
 /// Keep each constraint's unit until the target display is known in Electron.
-pub(crate) fn size_constraints_payload(constraints: WindowSizeConstraints) -> Value {
+pub(crate) fn size_constraints_payload(constraints: WindowSizeConstraints) -> rpc::window::SizeConstraints {
+  use rpc::window::{ConstraintAxis, SizeConstraint};
   let axis = |unit: Option<PixelUnit>| {
     unit.map(|unit| match unit {
-      PixelUnit::Physical(unit) => json!({ "value": unit.0, "physical": true }),
-      PixelUnit::Logical(unit) => json!({ "value": unit.0, "physical": false }),
+      PixelUnit::Physical(unit) => SizeConstraint::Scaled { value: f64::from(unit.0), physical: true },
+      PixelUnit::Logical(unit) => SizeConstraint::Scaled { value: unit.0, physical: false },
     })
   };
-  json!({
-    "minWidth": axis(constraints.min_width),
-    "minHeight": axis(constraints.min_height),
-    "maxWidth": axis(constraints.max_width),
-    "maxHeight": axis(constraints.max_height),
-  })
+  std::collections::BTreeMap::from([
+    (ConstraintAxis::MinWidth, axis(constraints.min_width)),
+    (ConstraintAxis::MinHeight, axis(constraints.min_height)),
+    (ConstraintAxis::MaxWidth, axis(constraints.max_width)),
+    (ConstraintAxis::MaxHeight, axis(constraints.max_height)),
+  ])
 }
 
-pub(crate) fn position_payload(position: Position) -> Value {
-  match position {
-    Position::Physical(position) => json!({ "x": position.x, "y": position.y, "physical": true }),
-    Position::Logical(position) => json!({ "x": position.x, "y": position.y, "physical": false }),
-  }
+pub(crate) fn position_payload(position: Position) -> rpc::webview::Position {
+  let position = rpc::window_position(position);
+  rpc::webview::Position { x: position.x, y: position.y, physical: Some(position.physical) }
 }
 
 pub(crate) fn rect_position(rect: &Value) -> PhysicalPosition<i32> {
@@ -486,10 +481,10 @@ impl RuntimeContext {
         .ok()
         .filter(|value| *value != 0)
         .ok_or_else(|| create_window_err("Electron returned no X11 handle".into()))?;
-      let process = value
-        .process_id
-        .filter(|value| *value != 0)
-        .ok_or_else(|| create_window_err("Electron returned no X11 processId".into()))?;
+      let process = value.process_id;
+      if process == 0 {
+        return Err(create_window_err("Electron returned no X11 processId".into()));
+      }
       Ok((handle, process))
     })?
   }
@@ -534,12 +529,14 @@ impl RuntimeContext {
       })
       .collect();
     for (id, serial, menu) in changed {
-      match self.ipc.call(rpc::WindowSetMenu {
-        window_id: serial,
-        menu: menu.as_array().map(|items| rpc::Menu {
-          items: items.clone(),
-        }),
-      }) {
+      let items = match serde_json::from_value(menu.clone()) {
+        Ok(items) => items,
+        Err(error) => {
+          eprintln!("[electron] menu conversion failed: {error}");
+          continue;
+        }
+      };
+      match self.ipc.call(rpc::WindowSetMenu { window_id: serial, menu: items }) {
         Ok(_) => {
           if let Some(owner) = self
             .windows
@@ -669,7 +666,7 @@ impl RuntimeContext {
     }
   }
 
-  pub(crate) fn new_window<T: UserEvent>(&self, params: &Value) -> Result<Value> {
+  pub(crate) fn new_window<T: UserEvent>(&self, params: &Value) -> Result<rpc::webview::NewWindowDecision> {
     use crate::{
       new_window::{with_opener, NewWindowFeatures, NewWindowOpener, NewWindowResponse},
       ElectronWindowBuilder,
@@ -761,9 +758,9 @@ impl RuntimeContext {
     };
     // Rejected staged shells are destroyed by Electron's decision cleanup.
     // Keep their identities until window.closed delivers Destroyed to Tauri.
-    Ok(match selected {
-      Some(window_id) => json!({ "action": "allow", "windowId": window_id }),
-      None => json!({ "action": "deny" }),
+    Ok(rpc::webview::NewWindowDecision {
+      action: if selected.is_some() { rpc::webview::NewWindowAction::Allow } else { rpc::webview::NewWindowAction::Deny },
+      window_id: selected,
     })
   }
 }
@@ -986,7 +983,7 @@ impl Electron {
 
   fn resolve_binary(&self) -> std::result::Result<PathBuf, electron_rs::Error> {
     if let Some(path) = &self.binary {
-      return electron_rs::find_binary(path);
+      return electron_rs::electron_binary(path);
     }
     let executable = std::env::current_exe()?;
     let mut lookup_error = None;
@@ -996,7 +993,7 @@ impl Electron {
       let app_dir = std::env::var_os("APPDIR").map(PathBuf::from);
       for root in bundled_roots(dir, product_name, app_dir.as_deref()) {
         if root.is_dir() {
-          match electron_rs::find_binary(&root) {
+          match electron_rs::electron_binary(&root) {
             Ok(binary) => return Ok(binary),
             Err(error) => {
               lookup_error.get_or_insert(error);
@@ -1009,7 +1006,7 @@ impl Electron {
     #[cfg(debug_assertions)]
     if let Some(path) = option_env!("ELECTRON_RS_STAGED_BINARY") {
       if Path::new(path).is_file() {
-        return electron_rs::find_binary(path);
+        return electron_rs::electron_binary(path);
       }
     }
     Err(lookup_error.unwrap_or_else(|| "Electron runtime was not bundled; include target/electron as runtime. Runtime downloads are disabled.".into()))
@@ -1117,15 +1114,12 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
 
   fn primary_monitor(&self) -> Option<Monitor> {
     let displays = self.context.ipc.call(rpc::Displays {}).ok()?;
-    displays
-      .primary
-      .as_ref()
-      .and_then(platform::monitor_from_value)
+    Some(platform::monitor_from_display(&displays.primary))
   }
 
   fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
     let display = self.context.ipc.call(rpc::DisplayForPoint { x, y }).ok()?;
-    platform::monitor_from_value(&display)
+    display.as_ref().map(platform::monitor_from_display)
   }
 
   fn available_monitors(&self) -> Vec<Monitor> {
@@ -1138,7 +1132,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
         displays
           .displays
           .iter()
-          .filter_map(platform::monitor_from_value)
+          .map(platform::monitor_from_display)
           .collect()
       })
       .unwrap_or_default()
@@ -1146,9 +1140,9 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
 
   fn set_theme(&self, theme: Option<Theme>) {
     let theme = match theme {
-      Some(Theme::Dark) => "dark",
-      Some(_) => "light",
-      None => "system",
+      Some(Theme::Dark) => electron_rs::Theme::Dark,
+      Some(_) => electron_rs::Theme::Light,
+      None => electron_rs::Theme::System,
     };
     if let Err(error) = self.context.ipc.call(rpc::AppTheme { theme }) {
       eprintln!("[electron] set theme failed: {error}");
@@ -1161,10 +1155,10 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn set_activation_policy(&mut self, activation_policy: tauri_runtime::ActivationPolicy) {
     let policy = match activation_policy {
-      tauri_runtime::ActivationPolicy::Regular => "regular",
-      tauri_runtime::ActivationPolicy::Accessory => "accessory",
-      tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
-      _ => "regular",
+      tauri_runtime::ActivationPolicy::Regular => rpc::app::ActivationPolicy::Regular,
+      tauri_runtime::ActivationPolicy::Accessory => rpc::app::ActivationPolicy::Accessory,
+      tauri_runtime::ActivationPolicy::Prohibited => rpc::app::ActivationPolicy::Prohibited,
+      _ => rpc::app::ActivationPolicy::Regular,
     };
     if let Err(error) = self.context.ipc.call(rpc::AppActivationPolicy { policy }) {
       eprintln!("[electron] set activation policy failed: {error}");
@@ -1238,7 +1232,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
       .ipc
       .call(rpc::CursorPosition {})
       .map_err(|error| create_window_err(error.to_string()))?;
-    Ok(PhysicalPosition::new(point.x, point.y))
+    Ok(PhysicalPosition::new(f64::from(point.x), f64::from(point.y)))
   }
 }
 
@@ -1478,7 +1472,7 @@ impl ElectronRuntime {
                 .new_window::<T>(params)
                 .unwrap_or_else(|error| {
                   eprintln!("[electron] native popup denied: {error}");
-                  json!({ "action": "deny" })
+                  rpc::webview::NewWindowDecision { action: rpc::webview::NewWindowAction::Deny, window_id: None }
                 });
               if let Err(error) = self
                 .context
@@ -1539,7 +1533,7 @@ impl ElectronRuntime {
             if let Err(error) = self.context.ipc.call(rpc::DownloadResponse {
               id,
               allow,
-              destination: destination.to_string_lossy().into_owned(),
+              destination: Some(destination.to_string_lossy().into_owned()),
             }) {
               eprintln!("[electron] failed to answer a download request: {error}");
             }
@@ -1582,7 +1576,7 @@ impl ElectronRuntime {
                 (Some(kind), Some(handler)) => permission_response_name(handler(kind)),
                 // Tauri's `Default` means the runtime default; Electron's own
                 // default for an unhandled permission is to deny it.
-                _ => "default",
+                _ => rpc::webview::PermissionDecision::Default,
               }
             };
             if let Err(error) = self
@@ -1680,23 +1674,23 @@ impl ElectronRuntime {
             let responder: Box<UriSchemeProtocolResponder> =
               Box::new(move |response: Response<std::borrow::Cow<'static, [u8]>>| {
                 use base64::Engine;
-                let headers: serde_json::Map<String, Value> = response
+                let headers: std::collections::BTreeMap<String, String> = response
                   .headers()
                   .iter()
                   .filter_map(|(name, value)| {
                     value
                       .to_str()
                       .ok()
-                      .map(|value| (name.to_string(), Value::String(value.to_string())))
+                      .map(|value| (name.to_string(), value.to_string()))
                   })
                   .collect();
                 let body =
                   base64::engine::general_purpose::STANDARD.encode(response.body().as_ref());
                 if let Err(error) = ipc.call(rpc::ProtocolRespond {
                   id,
-                  status: response.status().as_u16(),
-                  headers,
-                  body,
+                  status: Some(response.status().as_u16()),
+                  headers: Some(headers),
+                  body: Some(body),
                 }) {
                   eprintln!("[electron] failed to answer protocol request {request_uri}: {error}");
                 }
@@ -1998,14 +1992,14 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
   }
 
   // Build all fallible payload data before installing handlers or protocols.
-  let mut payload = window_create_payload(&window_builder, serial, &label)?;
+  let mut payload = window_create_payload(&window_builder, serial)?;
   #[cfg(target_os = "linux")]
   let defer_show = !window_builder.config.closable
     && window_builder.config.visible
     && new_window_request.is_none();
   #[cfg(target_os = "linux")]
   if defer_show {
-    payload.defer_show = true;
+    payload.defer_show = Some(true);
   }
   if let Some(request) = new_window_request {
     payload.new_window_request = Some(request);
@@ -2038,7 +2032,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
     (Some(pending_webview), Some(webview_serial)) => {
       register_policy_handlers(context, webview_serial, pending_webview)
     }
-    _ => json!(null),
+    _ => rpc::webview::Policy::default(),
   };
   if let (Some(webview), Some(webview_id)) = (&webview, webview_id) {
     payload.webview = Some(webview_create_payload(
@@ -2216,8 +2210,10 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
   }
 
   let policy = register_policy_handlers(context, webview_id, &mut pending);
-  let mut payload = webview_create_payload(&pending, webview_id, &url, policy);
-  payload.window_id = Some(serial);
+  let payload = rpc::webview::Create {
+    window_id: serial,
+    config: webview_create_payload(&pending, webview_id, &url, policy),
+  };
   if let Err(error) = context.ipc.call(payload) {
     context.forget_webview_handlers(webview_id, &pending.label);
     return Err(create_webview_err(error.to_string()));
@@ -2249,7 +2245,6 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
 fn window_create_payload(
   builder: &crate::window_builder::ElectronWindowBuilder,
   serial: u32,
-  label: &str,
 ) -> Result<rpc::WindowCreate> {
   let window_icon = builder.icon.as_ref().map(|icon| {
     use base64::Engine as _;
@@ -2263,14 +2258,20 @@ fn window_create_payload(
       bgra: base64::engine::general_purpose::STANDARD.encode(bgra),
     }
   });
+  // Tauri serializes title bar styles in PascalCase; the upstream contract is lowercase.
+  let mut config = serde_json::to_value(&builder.config)
+    .map_err(|error| create_window_err(error.to_string()))?;
+  config["titleBarStyle"] = serde_json::to_value(rpc::title_bar_style(builder.config.title_bar_style)?)
+    .map_err(|error| create_window_err(error.to_string()))?;
   Ok(rpc::WindowCreate {
     window_id: serial,
-    label: label.to_owned(),
-    window: builder.config.clone(),
+    // Keep unmodeled Tauri settings in the upstream config's extension map.
+    window: serde_json::from_value(config)
+      .map_err(|error| create_window_err(error.to_string()))?,
     size_constraints: builder.size_constraints.map(size_constraints_payload),
     window_icon,
     icon: None,
-    defer_show: false,
+    defer_show: Some(false),
     new_window_request: None,
     webview: None,
   })
@@ -2281,24 +2282,42 @@ fn webview_create_payload<T: UserEvent>(
   pending: &PendingWebview<T, ElectronRuntime>,
   serial: u32,
   url: &str,
-  policy: Value,
-) -> rpc::WebviewCreate {
+  policy: rpc::webview::Policy,
+) -> rpc::webview::Config {
   let attributes = &pending.webview_attributes;
   let scroll_bar_style = match attributes.scroll_bar_style {
     #[cfg(windows)]
     tauri_runtime::webview::ScrollBarStyle::FluentOverlay => "fluentOverlay",
     _ => "default",
   };
-  rpc::WebviewCreate {
-    webview_id: serial, window_id: None, url: url.to_owned(),
-    bounds: attributes.bounds.as_ref().map(|bounds| json!({ "position": position_payload(bounds.position), "size": size_payload(bounds.size) })),
-    auto_resize: attributes.auto_resize, init_scripts: initialization_scripts(pending),
-    data_directory: attributes.data_directory.clone(), incognito: attributes.incognito,
-    user_agent: attributes.user_agent.clone(), accept_first_mouse: attributes.accept_first_mouse,
-    javascript_disabled: attributes.javascript_disabled, devtools: attributes.devtools,
-    background_throttling: attributes.background_throttling.clone(), drag_drop_enabled: attributes.drag_drop_handler_enabled,
-    zoom_hotkeys_enabled: attributes.zoom_hotkeys_enabled, scroll_bar_style,
-    transparent: attributes.transparent, focus: attributes.focus, background_color: attributes.background_color, policy,
+  rpc::webview::Config {
+    webview_id: serial,
+    url: url.to_owned(),
+    bounds: attributes.bounds.as_ref().map(|bounds| rpc::webview::BoundsInput {
+      position: Some(position_payload(bounds.position)), size: Some(size_payload(bounds.size)), physical: None,
+    }),
+    auto_resize: Some(attributes.auto_resize),
+    init_scripts: Some(initialization_scripts(pending)),
+    data_directory: attributes.data_directory.as_ref().map(|path| path.to_string_lossy().into_owned()),
+    incognito: Some(attributes.incognito),
+    user_agent: attributes.user_agent.clone(),
+    accept_first_mouse: Some(attributes.accept_first_mouse),
+    javascript_disabled: Some(attributes.javascript_disabled),
+    devtools: attributes.devtools,
+    background_throttling: attributes.background_throttling.as_ref().map(|policy| match policy {
+      tauri_utils::config::BackgroundThrottlingPolicy::Disabled => "disabled",
+      tauri_utils::config::BackgroundThrottlingPolicy::Throttle => "throttle",
+      tauri_utils::config::BackgroundThrottlingPolicy::Suspend => "suspend",
+    }.to_owned()),
+    transparent: Some(attributes.transparent),
+    background_color: attributes.background_color.map(|color| electron_rs::rpc::Color::Rgba([color.0, color.1, color.2, color.3])),
+    policy: Some(policy),
+    additional: std::collections::BTreeMap::from([
+      ("dragDropEnabled".into(), json!(attributes.drag_drop_handler_enabled)),
+      ("zoomHotkeysEnabled".into(), json!(attributes.zoom_hotkeys_enabled)),
+      ("scrollBarStyle".into(), json!(scroll_bar_style)),
+      ("focus".into(), json!(attributes.focus)),
+    ]),
   }
 }
 
@@ -2338,18 +2357,12 @@ fn register_ipc_handler<T: UserEvent>(
 /// Preserve frame scope through Electron's sandboxed preload.
 fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
   pending: &PendingWebview<T, R>,
-) -> Vec<Value> {
-  pending
-    .webview_attributes
-    .initialization_scripts
-    .iter()
-    .map(|script| {
-      json!({
-        "script": script.script,
-        "mainFrameOnly": script.for_main_frame_only,
-      })
-    })
-    .collect()
+) -> Vec<rpc::webview::InitScript> {
+  pending.webview_attributes.initialization_scripts.iter().map(|script| {
+    rpc::webview::InitScript::Detailed {
+      script: script.script.clone(), main_frame_only: script.for_main_frame_only,
+    }
+  }).collect()
 }
 
 fn validate_webview<T: UserEvent, R: Runtime<T>>(pending: &PendingWebview<T, R>) -> Result<()> {
@@ -2421,11 +2434,11 @@ fn permission_kind(name: &str) -> Option<PermissionKind> {
   })
 }
 
-fn permission_response_name(response: PermissionResponse) -> &'static str {
+fn permission_response_name(response: PermissionResponse) -> rpc::webview::PermissionDecision {
   match response {
-    PermissionResponse::Allow => "allow",
-    PermissionResponse::Deny => "deny",
-    _ => "default",
+    PermissionResponse::Allow => rpc::webview::PermissionDecision::Allow,
+    PermissionResponse::Deny => rpc::webview::PermissionDecision::Deny,
+    _ => rpc::webview::PermissionDecision::Default,
   }
 }
 
@@ -2461,17 +2474,17 @@ fn register_policy_handlers<T: UserEvent>(
   context: &RuntimeContext,
   webview_id: u32,
   pending: &mut PendingWebview<T, ElectronRuntime>,
-) -> Value {
+) -> rpc::webview::Policy {
   let handlers = PolicyHandlers {
     download: pending.download_handler.take(),
     permission: pending.permission_request_handler.take(),
     navigation: pending.navigation_handler.take().map(Rc::from),
   };
-  let wired = json!({
-    "download": handlers.download.is_some(),
-    "permission": handlers.permission.is_some(),
-    "navigation": handlers.navigation.is_some(),
-  });
+  let wired = rpc::webview::Policy {
+    download: Some(handlers.download.is_some()),
+    permission: Some(handlers.permission.is_some()),
+    navigation: Some(handlers.navigation.is_some()),
+  };
   if !handlers.is_empty() {
     context
       .policy_handlers
@@ -2517,6 +2530,8 @@ mod tests {
     let config = tauri_utils::config::WindowConfig {
       focus: false,
       hidden_title: true,
+      title_bar_style: tauri_utils::TitleBarStyle::Overlay,
+      traffic_light_position: Some(tauri_utils::config::LogicalPosition { x: 12.5, y: 8.25 }),
       user_agent: Some("root-parity".into()),
       prevent_overflow: Some(tauri_utils::config::PreventOverflowConfig::Enable(true)),
       ..Default::default()
@@ -2535,16 +2550,20 @@ mod tests {
       })
       .unwrap();
     let payload =
-      serde_json::to_value(window_create_payload(&builder, 42, "host").unwrap()).unwrap();
-    assert_eq!(payload["window"], serde_json::to_value(config).unwrap());
+      serde_json::to_value(window_create_payload(&builder, 42).unwrap()).unwrap();
+    // Both typed configs must decode the same Tauri configuration, despite enum casing/omitted nulls.
+    let restored: tauri_utils::config::WindowConfig = serde_json::from_value(payload["window"].clone()).unwrap();
+    assert_eq!(restored, config);
+    assert_eq!(payload["window"]["titleBarStyle"], "overlay");
+    assert_eq!(payload["window"]["trafficLightPosition"], json!({"x": 12.5, "y": 8.25}));
     assert_eq!(payload["windowId"], 42);
     assert_eq!(
       payload["sizeConstraints"],
       json!({
-        "minWidth": { "value": 250, "physical": true },
+        "minWidth": { "value": 250.0, "physical": true },
         "minHeight": { "value": 120.5, "physical": false },
         "maxWidth": null,
-        "maxHeight": { "value": 900, "physical": true },
+        "maxHeight": { "value": 900.0, "physical": true },
       })
     );
     assert_eq!(
@@ -2571,7 +2590,7 @@ mod tests {
       &pending,
       8,
       "tauri://localhost",
-      json!({ "navigation": true }),
+      rpc::webview::Policy { navigation: Some(true), ..Default::default() },
     ))
     .unwrap();
     assert_eq!(payload["userAgent"], "child-agent");
@@ -2692,11 +2711,11 @@ mod tests {
       Some(PermissionKind::ClipboardRead)
     );
     assert_eq!(permission_kind("openExternal"), None);
-    assert_eq!(permission_response_name(PermissionResponse::Allow), "allow");
-    assert_eq!(permission_response_name(PermissionResponse::Deny), "deny");
+    assert_eq!(permission_response_name(PermissionResponse::Allow), rpc::webview::PermissionDecision::Allow);
+    assert_eq!(permission_response_name(PermissionResponse::Deny), rpc::webview::PermissionDecision::Deny);
     assert_eq!(
       permission_response_name(PermissionResponse::Default),
-      "default"
+      rpc::webview::PermissionDecision::Default
     );
   }
 }

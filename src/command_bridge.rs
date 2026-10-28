@@ -13,8 +13,9 @@ impl crate::ElectronWebviewDispatcher {
 /// Resolve an ordinary Tauri webview to its existing Electron client.
 ///
 /// Call from async application code; no renderer JavaScript or global runtime
-/// lookup is involved. The returned client supports `node_in_main` and
-/// `electron_in_main`, including streamed output callbacks.
+/// lookup is involved. The client's synchronous `node(args)` launches a separate
+/// process (use `spawn_blocking` in async code). Its awaitable `run(script)` executes
+/// an async JavaScript body on the existing main thread and supports streamed output.
 #[cfg(feature = "tauri")]
 pub async fn main_bridge(
   webview: &tauri::Webview<crate::ElectronRuntime>,

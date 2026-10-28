@@ -145,12 +145,14 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         let webview: &tauri::Webview<ElectronRuntime> = main.as_ref();
         let bridge = tauri_runtime_electron::main_bridge(webview)
           .await.expect("resolve existing Electron client through the Tauri UI route");
-        let electron: std::process::Output = bridge.electron_in_main(
-          "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId}));return 1n;", &[],
+        let electron: std::process::Output = bridge.run(
+          "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId}));return 1n;",
         ).timeout(WAIT).await.expect("execute on actual Electron main");
-        let node: std::process::Output = bridge.node_in_main(
-          "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId}));const ignored={};ignored.self=ignored;return ignored;", &[],
-        ).timeout(WAIT).await.expect("execute on actual Node worker");
+        let node_bridge = Arc::clone(&bridge);
+        let node: std::process::Output = tokio::task::spawn_blocking(move || node_bridge.node(&[
+          "-e", "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,args:process.argv.slice(1)}));",
+          "--", "hello",
+        ])).await.expect("join native Node process").expect("execute in a separate Node process");
         assert!(electron.status.success(), "{electron:?}");
         assert!(node.status.success(), "{node:?}");
         assert!(electron.stderr.is_empty() && node.stderr.is_empty());
@@ -160,14 +162,22 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         assert_eq!(electron["ready"], true);
         assert_eq!(electron["isMainThread"], true);
         assert_eq!(electron["threadId"], 0);
-        assert_eq!(node["pid"], electron["pid"]);
-        assert_eq!(node["isMainThread"], false);
-        assert!(node["threadId"].as_u64().unwrap() > 0);
+        assert!(node["pid"].as_u64().unwrap() > 0);
+        assert_ne!(node["pid"], electron["pid"]);
+        assert_eq!(node["isMainThread"], true);
+        assert_eq!(node["threadId"], 0);
+        assert_eq!(node["args"], json!(["hello"]));
+        let node_bridge = Arc::clone(&bridge);
+        let bytes = tokio::task::spawn_blocking(move || node_bridge.node(&[
+          "-e", "process.stdout.write(Buffer.from([0,255,195]));process.stderr.write(Buffer.from([128,10]));",
+        ])).await.expect("join Node binary output").expect("collect Node binary output");
+        assert!(bytes.status.success(), "{bytes:?}");
+        assert_eq!(bytes.stdout, [0, 255, 195]);
+        assert_eq!(bytes.stderr, [128, 10]);
         use std::{future::IntoFuture as _, sync::atomic::{AtomicBool, Ordering}};
-        for electron_mode in [false, true] {
+        {
           let script = "process.stdout.write(Buffer.from([0,255,195]));await new Promise(resolve=>setTimeout(resolve,1000));process.stderr.write(Buffer.from([128,10]));return {done:true};";
-          let command = if electron_mode { bridge.electron_in_main(script, &[]) }
-            else { bridge.node_in_main(script, &[]) };
+          let command = bridge.run(script);
           let first = Arc::new(AtomicBool::new(false));
           let observed = Arc::clone(&first);
           let (chunks, received) = mpsc::channel();
