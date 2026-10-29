@@ -4,6 +4,44 @@ use std::{collections::BTreeMap, env, path::{Path, PathBuf}, process::Command};
 use serde_json::Value;
 use tauri_utils::{config::parse, platform::Target};
 
+/// One preparation at a time: Cargo runs the build script twice for one target (as a
+/// build-dependency and as a dependency), and both brand the same output directory.
+pub struct PreparationLock {
+  path: PathBuf,
+}
+
+impl Drop for PreparationLock {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_file(&self.path);
+  }
+}
+
+pub fn lock_preparation(root: &Path) -> Result<PreparationLock, String> {
+  std::fs::create_dir_all(root).map_err(|error| format!("create Electron output {}: {error}", root.display()))?;
+  let path = root.join(".preparation.lock");
+  let stale = std::time::Duration::from_secs(600);
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+  loop {
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+      Ok(_) => return Ok(PreparationLock { path }),
+      Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        let aged = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok()
+          .and_then(|modified| modified.elapsed().ok())
+          .is_some_and(|age| age > stale);
+        if aged {
+          let _ = std::fs::remove_file(&path);
+          continue;
+        }
+        if std::time::Instant::now() >= deadline {
+          return Err(format!("timed out waiting for {}", path.display()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+      }
+      Err(error) => return Err(format!("create {}: {error}", path.display())),
+    }
+  }
+}
+
 pub struct AppConfig {
   pub name: String,
   pub identifier: Option<String>,

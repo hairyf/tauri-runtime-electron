@@ -19,6 +19,8 @@ fn prepare() -> Result<(), String> {
   let mut builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION);
   let directory = builder.directory().map_err(|error| error.to_string())?;
   let target_root = directory.parent().and_then(|path| path.parent()).ok_or("Electron output has no Cargo target root")?;
+  let output_root = directory.parent().ok_or("Electron output has no parent")?;
+  let _preparation = build_support::lock_preparation(output_root)?;
   let triple = env::var("TARGET").map_err(|error| error.to_string())?;
   let target = Target::from_triple(&triple);
   let app = build_support::discover(target_root, target)?;
