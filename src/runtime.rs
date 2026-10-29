@@ -166,6 +166,20 @@ pub(crate) fn rect_size(rect: &Value) -> PhysicalSize<u32> {
 type ShortcutMap = HashMap<String, Box<dyn Fn() + Send + 'static>>;
 type ProtocolHandlerMap = HashMap<(String, Option<u32>), (String, Rc<UriSchemeProtocolHandler>)>;
 
+/// Identity of a guest the page adopted through `<webview>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestIpc {
+  /// Tauri label the guest was registered under, e.g. `main-webview-1`.
+  pub label: String,
+  pub webview_id: u32,
+}
+
+/// Receives `window.ipc.postMessage` traffic from `<webview>` guests.
+///
+/// Tauri resolves commands against its own managed webviews, and a guest is not
+/// one of them, so this handler is where a caller gets the raw request instead.
+pub type GuestIpcHandler = dyn Fn(GuestIpc, Request<String>) + Send + Sync;
+
 pub(crate) enum Message {
   Task(Box<dyn FnOnce() + Send>),
   CloseWindow(WindowId),
@@ -189,6 +203,10 @@ struct Window {
   /// Numeric id handed to the Electron process (Tauri's `WindowId` is opaque).
   serial: u32,
   webviews: Vec<Webview>,
+  /// Guests the page adopted through `<webview>`, by serial.
+  guests: Vec<u32>,
+  /// Monotonic guest label suffix; a closed guest's label is never reused.
+  guest_seq: u32,
   /// Handlers registered by Tauri to observe this window's events.
   handlers: Vec<(WindowEventId, Rc<WindowEventHandler>)>,
   #[cfg(windows)]
@@ -236,6 +254,8 @@ pub struct RuntimeContext {
   native_handles: Arc<RefCell<HashMap<u32, isize>>>,
   pub(crate) new_window_handlers:
     Arc<RefCell<HashMap<u32, Rc<crate::new_window::NewWindowHandler>>>>,
+  /// Receives `window.ipc.postMessage` traffic from `<webview>` guests.
+  guest_ipc_handler: Arc<RefCell<Option<Arc<GuestIpcHandler>>>>,
 }
 
 // SAFETY: we ensure this type is only used on the main thread.
@@ -306,6 +326,9 @@ impl RuntimeContext {
     for webview in &window.webviews {
       self.forget_webview_handlers(webview.serial, &webview.label);
     }
+    for serial in &window.guests {
+      self.ipc_handlers.borrow_mut().remove(serial);
+    }
     self.native_handles.borrow_mut().remove(&window.serial);
     // MenuOwner deliberately retains its HWND: muda can still reference it.
     true
@@ -324,8 +347,15 @@ impl RuntimeContext {
             .position(|webview| webview.serial == serial)?;
           Some(window.webviews.remove(index))
         });
-      if let Some(webview) = removed {
-        context.forget_webview_handlers(webview.serial, &webview.label);
+      match removed {
+        Some(webview) => context.forget_webview_handlers(webview.serial, &webview.label),
+        // A `<webview>` guest is tracked only by its IPC handler.
+        None => {
+          context.ipc_handlers.borrow_mut().remove(&serial);
+          for window in context.windows.borrow_mut().values_mut() {
+            window.guests.retain(|guest| *guest != serial);
+          }
+        }
       }
     })
   }
@@ -379,6 +409,45 @@ impl RuntimeContext {
         .push(webview);
       Ok(())
     })?
+  }
+
+  /// Registers a guest Electron created for a `<webview>` tag. The guest already
+  /// belongs to Chromium, so only Tauri-side identity and IPC are added.
+  pub(crate) fn attach_guest(&self, serial: u32, window_serial: u32) {
+    let guest_handler = self.guest_ipc_handler.borrow().clone();
+  let label = adopt_guest(
+      &mut self.windows.borrow_mut(),
+      &mut self.ipc_handlers.borrow_mut(),
+      guest_handler,
+      serial,
+      window_serial,
+    );
+    if label.is_none() {
+      eprintln!("[electron] guest {serial} attached to unknown window {window_serial}");
+      return;
+    }
+    // Navigation/download/permission callbacks belong to the host page, which is
+    // the only Tauri webview this guest can borrow a policy from.
+    let host = self
+      .windows
+      .borrow()
+      .values()
+      .find(|window| window.serial == window_serial)
+      .and_then(|window| window.webviews.first().map(|webview| webview.serial));
+    if let Some(handlers) = host.and_then(|host| self.policy_handlers.borrow().get(&host).cloned()) {
+      self.policy_handlers.borrow_mut().insert(serial, handlers);
+    }
+  }
+
+  /// Receives `window.ipc.postMessage` traffic from `<webview>` guests.
+  pub fn on_guest_ipc(
+    &self,
+    handler: impl Fn(GuestIpc, Request<String>) + Send + Sync + 'static,
+  ) {
+    self
+      .guest_ipc_handler
+      .borrow_mut()
+      .replace(Arc::new(handler));
   }
 
   fn forget_webview_handlers(&self, serial: u32, label: &str) {
@@ -830,6 +899,7 @@ impl ElectronRuntime {
       policy_handlers: Default::default(),
       native_handles: Default::default(),
       new_window_handlers: Default::default(),
+      guest_ipc_handler: Default::default(),
     };
     Self {
       is_running,
@@ -1329,6 +1399,18 @@ impl ElectronRuntime {
                 event: WindowEvent::ThemeChanged(theme),
               });
             }
+          }
+          Some("webview.attached") => {
+            let params = &event["params"];
+            let (Some(serial), Some(window_serial)) = (
+              params["webviewId"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok()),
+              params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()),
+            ) else {
+              continue;
+            };
+            self.context.attach_guest(serial, window_serial);
           }
           Some("webview.closed") => {
             if let Some(serial) = event["params"]["webviewId"]
@@ -1918,6 +2000,37 @@ fn remove_webview_protocols(protocols: &mut ProtocolHandlerMap, serial: u32, lab
   });
 }
 
+/// Gives a `<webview>` guest a Tauri label and its IPC route. A guest has no
+/// Tauri-managed webview, so it inherits its host page's IPC identity: messages
+/// reach the same `WebviewIpcHandler`, and Tauri resolves the ACL for the host
+/// label. Anything beyond that needs Tauri to manage the webview itself.
+fn adopt_guest(
+  windows: &mut HashMap<WindowId, Window>,
+  handlers: &mut HashMap<u32, Rc<IpcHandler>>,
+  guest_handler: Option<Arc<GuestIpcHandler>>,
+  serial: u32,
+  window_serial: u32,
+) -> Option<String> {
+  let window = windows
+    .values_mut()
+    .find(|window| window.serial == window_serial)?;
+  window.guests.push(serial);
+  window.guest_seq += 1;
+  let label = format!("{}-webview-{}", window.label, window.guest_seq);
+  let host = window.webviews.first().map(|webview| webview.serial);
+  let route = match guest_handler {
+    Some(handler) => {
+      let guest = GuestIpc { label: label.clone(), webview_id: serial };
+      Some(Rc::new(move |request| handler(guest.clone(), request)) as Rc<IpcHandler>)
+    }
+    None => host.and_then(|host| handlers.get(&host).cloned()),
+  };
+  if let Some(route) = route {
+    handlers.insert(serial, route);
+  }
+  Some(label)
+}
+
 pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'static>(
   context: &RuntimeContext,
   pending: PendingWindow<T, ElectronRuntime>,
@@ -2073,6 +2186,8 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
         })
         .into_iter()
         .collect(),
+      guests: Vec::new(),
+      guest_seq: 0,
       handlers: Vec::new(),
       #[cfg(windows)]
       menu_owner: None,
@@ -2409,10 +2524,10 @@ pub(crate) struct WebviewHandlers {
 
 /// The callbacks Electron asks about out of band: a download question and
 /// permission requests. Both are answered over IPC instead of blocking.
-#[derive(Default)]
+#[derive(Clone)]
 pub(crate) struct PolicyHandlers {
   download: Option<Arc<DownloadHandler>>,
-  permission: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
+  permission: Option<Arc<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
   navigation: Option<Rc<NavigationHandler>>,
 }
 
@@ -2482,7 +2597,7 @@ fn register_policy_handlers<T: UserEvent>(
 ) -> rpc::webview::Policy {
   let handlers = PolicyHandlers {
     download: pending.download_handler.take(),
-    permission: pending.permission_request_handler.take(),
+    permission: pending.permission_request_handler.take().map(Arc::from),
     navigation: pending.navigation_handler.take().map(Rc::from),
   };
   let wired = rpc::webview::Policy {
@@ -2723,4 +2838,70 @@ mod tests {
       rpc::webview::PermissionDecision::Default
     );
   }
+
+  fn guest_window(label: &str, serial: u32, host: Option<u32>) -> Window {
+    Window {
+      label: label.into(),
+      new_window_request: None,
+      serial,
+      webviews: host
+        .map(|serial| Webview { serial, label: label.into(), handlers: Vec::new() })
+        .into_iter()
+        .collect(),
+      guests: Vec::new(),
+      guest_seq: 0,
+      handlers: Vec::new(),
+      #[cfg(windows)]
+      menu_owner: None,
+    }
+  }
+
+  #[test]
+  fn webview_guests_get_labels_and_route_ipc_to_the_host_handler() {
+    let mut windows = HashMap::from([(WindowId::from(0), guest_window("main", 7, Some(3)))]);
+    let mut handlers: HashMap<u32, Rc<IpcHandler>> = HashMap::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let host_seen = seen.clone();
+    handlers.insert(3, Rc::new(move |request: Request<String>| {
+      host_seen.lock().unwrap().push(format!("host:{}", request.body()));
+    }));
+    let guest_seen = seen.clone();
+    let guest_handler: Arc<GuestIpcHandler> = Arc::new(move |guest, request| {
+      guest_seen
+        .lock()
+        .unwrap()
+        .push(format!("{}:{}:{}", guest.label, guest.webview_id, request.body()));
+    });
+
+    let first = adopt_guest(&mut windows, &mut handlers, Some(guest_handler.clone()), 1 << 20, 7);
+    let second = adopt_guest(&mut windows, &mut handlers, Some(guest_handler), (1 << 20) | 1, 7);
+    assert_eq!(first.as_deref(), Some("main-webview-1"));
+    assert_eq!(second.as_deref(), Some("main-webview-2"));
+    assert_eq!(windows[&WindowId::from(0)].guests, vec![1 << 20, (1 << 20) | 1]);
+    assert!(adopt_guest(&mut windows, &mut handlers, None, 5, 999).is_none());
+
+    for serial in [1 << 20, (1 << 20) | 1] {
+      let handler = handlers[&serial].clone();
+      handler(Request::builder().uri("tauri://localhost/").body("ping".into()).unwrap());
+    }
+    assert_eq!(
+      *seen.lock().unwrap(),
+      ["main-webview-1:1048576:ping", "main-webview-2:1048577:ping"]
+    );
+
+    // Without a dedicated guest handler the guest keeps the host page's route.
+    handlers.clear();
+    let host_seen = seen.clone();
+    handlers.insert(3, Rc::new(move |request: Request<String>| {
+      host_seen.lock().unwrap().push(format!("host:{}", request.body()));
+    }));
+    assert_eq!(
+      adopt_guest(&mut windows, &mut handlers, None, 42, 7).as_deref(),
+      Some("main-webview-3")
+    );
+    handlers[&42]
+      .clone()(Request::builder().uri("tauri://localhost/").body("ping".into()).unwrap());
+    assert!(seen.lock().unwrap().last().unwrap().starts_with("host:ping"));
+  }
+
 }
