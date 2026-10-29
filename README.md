@@ -16,6 +16,7 @@ tauri = { version = "2", default-features = false }
 tauri-runtime-electron = { git = "https://github.com/hairyf/tauri-runtime-electron.git" }
 
 [build-dependencies]
+tauri-runtime-electron = { git = "https://github.com/hairyf/tauri-runtime-electron.git" }
 tauri-build = "2"
 ```
 
