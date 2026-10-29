@@ -349,9 +349,14 @@ impl RuntimeContext {
         });
       match removed {
         Some(webview) => context.forget_webview_handlers(webview.serial, &webview.label),
-        // A `<webview>` guest is tracked only by its IPC handler.
+        // A `<webview>` guest is tracked only by its borrowed host entries.
         None => {
           context.ipc_handlers.borrow_mut().remove(&serial);
+          context.policy_handlers.borrow_mut().remove(&serial);
+          context
+            .protocol_handlers
+            .borrow_mut()
+            .retain(|(_, owner), _| *owner != Some(serial));
           for window in context.windows.borrow_mut().values_mut() {
             window.guests.retain(|guest| *guest != serial);
           }
@@ -415,7 +420,7 @@ impl RuntimeContext {
   /// belongs to Chromium, so only Tauri-side identity and IPC are added.
   pub(crate) fn attach_guest(&self, serial: u32, window_serial: u32) {
     let guest_handler = self.guest_ipc_handler.borrow().clone();
-  let label = adopt_guest(
+    let label = adopt_guest(
       &mut self.windows.borrow_mut(),
       &mut self.ipc_handlers.borrow_mut(),
       guest_handler,
@@ -437,6 +442,9 @@ impl RuntimeContext {
     if let Some(handlers) = host.and_then(|host| self.policy_handlers.borrow().get(&host).cloned()) {
       self.policy_handlers.borrow_mut().insert(serial, handlers);
     }
+    // `ipc://` resolves by owner, so a guest needs its own entry pointing at the
+    // host's handler; otherwise `window.ipc.fetch` inside the guest is denied.
+    share_ipc_protocol(&mut self.protocol_handlers.borrow_mut(), host, serial);
   }
 
   /// Receives `window.ipc.postMessage` traffic from `<webview>` guests.
@@ -2031,6 +2039,18 @@ fn adopt_guest(
   Some(label)
 }
 
+fn share_ipc_protocol(
+  protocols: &mut ProtocolHandlerMap,
+  host: Option<u32>,
+  serial: u32,
+) {
+  let shared = host
+    .and_then(|host| protocols.get(&("ipc".to_string(), Some(host))).cloned());
+  if let Some((label, handler)) = shared {
+    protocols.insert(("ipc".to_string(), Some(serial)), (label, handler));
+  }
+}
+
 pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'static>(
   context: &RuntimeContext,
   pending: PendingWindow<T, ElectronRuntime>,
@@ -2902,6 +2922,17 @@ mod tests {
     handlers[&42]
       .clone()(Request::builder().uri("tauri://localhost/").body("ping".into()).unwrap());
     assert!(seen.lock().unwrap().last().unwrap().starts_with("host:ping"));
-  }
 
+    let mut protocols = ProtocolHandlerMap::from([(
+      ("ipc".to_string(), Some(3)),
+      ("main".to_string(), Rc::new(|_: &str, _: Request<Vec<u8>>, _: Box<UriSchemeProtocolResponder>| {}) as Rc<UriSchemeProtocolHandler>),
+    )]);
+    share_ipc_protocol(&mut protocols, Some(3), 42);
+    let mut owners: Vec<_> = protocols.keys().map(|(_, owner)| *owner).collect();
+    owners.sort();
+    assert_eq!(owners, [Some(3), Some(42)]);
+    assert_eq!(protocols[&("ipc".to_string(), Some(42))].0, "main");
+    share_ipc_protocol(&mut protocols, Some(9), 43);
+    assert!(!protocols.contains_key(&("ipc".to_string(), Some(43))));
+  }
 }
