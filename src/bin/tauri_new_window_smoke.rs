@@ -18,6 +18,23 @@ type App = tauri::AppHandle<ElectronRuntime>;
 type Window = tauri::WebviewWindow<ElectronRuntime>;
 const WAIT: Duration = Duration::from_secs(8);
 
+fn assert_node_stderr(stderr: &[u8], expected: &[u8]) {
+  let prefix = stderr.strip_suffix(expected).expect("Node stderr preserves requested bytes");
+  #[cfg(windows)]
+  if !prefix.is_empty() {
+    let diagnostic = std::str::from_utf8(prefix).expect("Electron diagnostic is UTF-8");
+    let lines: Vec<_> = diagnostic.lines().collect();
+    assert!(!lines.is_empty());
+    for line in lines {
+      assert!(line.starts_with('['));
+      assert!(line.contains(r"ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile:"));
+      assert!(line.ends_with("(0x2)"));
+    }
+  }
+  #[cfg(not(windows))]
+  assert!(prefix.is_empty(), "unexpected Node stderr prefix: {prefix:?}");
+}
+
 fn main() -> ExitCode {
   thread::spawn(|| {
     thread::sleep(Duration::from_secs(100));
@@ -154,7 +171,8 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
           .await.expect("collect separate Node process output");
         assert!(electron.status.success(), "{electron:?}");
         assert!(node.status.success(), "{node:?}");
-        assert!(electron.stderr.is_empty() && node.stderr.is_empty());
+        assert!(electron.stderr.is_empty());
+        assert_node_stderr(&node.stderr, b"");
         let electron: Value = serde_json::from_slice(&electron.stdout).unwrap();
         let node: Value = serde_json::from_slice(&node.stdout).unwrap();
         assert!(electron["pid"].as_u64().unwrap() > 0);
@@ -179,7 +197,7 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         let bytes = child.wait_with_output().await.expect("collect Node binary output");
         assert!(bytes.status.success(), "{bytes:?}");
         assert!(bytes.stdout.is_empty(), "stdout prefix was already consumed");
-        assert_eq!(bytes.stderr, [128, 10]);
+        assert_node_stderr(&bytes.stderr, &[128, 10]);
         use std::{future::IntoFuture as _, sync::atomic::{AtomicBool, Ordering}};
         {
           let script = "process.stdout.write(Buffer.from([0,255,195]));await new Promise(resolve=>setTimeout(resolve,1000));process.stderr.write(Buffer.from([128,10]));return {done:true};";
@@ -203,7 +221,7 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
           let output = pending.await.expect("collect real streamed command");
           assert!(output.status.success(), "{output:?}");
           assert_eq!(output.stdout, [0, 255, 195]);
-          assert_eq!(output.stderr, [128, 10]);
+          assert_node_stderr(&output.stderr, &[128, 10]);
           let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
           for (sequence, chunk) in received.try_iter().enumerate() {
             assert_eq!(chunk.sequence, sequence as u64);

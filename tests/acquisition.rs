@@ -4,6 +4,23 @@ use std::time::Duration;
 use tauri_runtime_electron::Electron;
 use tokio::io::AsyncReadExt as _;
 
+fn assert_node_stderr(stderr: &[u8], expected: &[u8]) {
+  let prefix = stderr.strip_suffix(expected).expect("Node stderr preserves the requested raw bytes");
+  #[cfg(windows)]
+  if !prefix.is_empty() {
+    let diagnostic = std::str::from_utf8(prefix).expect("Electron diagnostic is UTF-8");
+    let lines: Vec<_> = diagnostic.lines().collect();
+    assert!(!lines.is_empty());
+    for line in lines {
+      assert!(line.starts_with('['));
+      assert!(line.contains(r"ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile:"));
+      assert!(line.ends_with("(0x2)"));
+    }
+  }
+  #[cfg(not(windows))]
+  assert!(prefix.is_empty(), "unexpected Node stderr prefix: {prefix:?}");
+}
+
 #[test]
 fn staged_electron_reports_its_version() {
   let binary = env!("ELECTRON_RS_STAGED_BINARY");
@@ -53,7 +70,7 @@ fn node_preserves_raw_output_and_nonzero_exit() {
         .expect("collect Node output");
       assert_eq!(output.status.code(), Some(7));
       assert_eq!(output.stdout, [0, 255, 195]);
-      assert_eq!(output.stderr, [128, 10]);
+      assert_node_stderr(&output.stderr, &[128, 10]);
     });
 }
 
