@@ -44,6 +44,8 @@ fn prepare() -> Result<(), String> {
   if let Some(warning) = prepared.cleanup_warning {
     println!("cargo:warning={warning}");
   }
+  let output_root = prepared.directory.parent().ok_or("Electron output has no parent")?;
+  build_support::prune_foreign_distributions(output_root, &prepared.directory)?;
   println!("cargo:rustc-env=ELECTRON_RS_STAGED_BINARY={}", prepared.binary.display());
   Ok(())
 }

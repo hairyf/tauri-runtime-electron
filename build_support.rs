@@ -11,6 +11,29 @@ pub struct AppConfig {
   pub inputs: Vec<PathBuf>,
 }
 
+/// Keep only the Electron distribution prepared for the current `TARGET`.
+///
+/// The host-side build-dependency copy and the target-side dependency share one
+/// output root. Bundling maps the whole `target/electron` directory, so a host
+/// build left behind next to the target distribution ships both: a macOS x64 app
+/// then carries `darwin-x64` and `darwin-arm64` and doubles to 945 MB.
+pub fn prune_foreign_distributions(root: &Path, keep: &Path) -> Result<Vec<PathBuf>, String> {
+  let entries = match std::fs::read_dir(root) {
+    Ok(entries) => entries,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    Err(error) => return Err(format!("read Electron output {}: {error}", root.display())),
+  };
+  let mut removed = Vec::new();
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path == keep || !path.is_dir() || !path.join("electron-rs.json").is_file() { continue; }
+    std::fs::remove_dir_all(&path)
+      .map_err(|error| format!("remove stale Electron distribution {}: {error}", path.display()))?;
+    removed.push(path);
+  }
+  Ok(removed)
+}
+
 pub fn discover(target_dir: &Path, target: Target) -> Result<Option<AppConfig>, String> {
   let mut manifests = Vec::new();
   for seed in [env::var_os("INIT_CWD").map(PathBuf::from), env::var_os("PWD").map(PathBuf::from), target_dir.parent().map(Path::to_path_buf)].into_iter().flatten() {
@@ -97,6 +120,37 @@ fn identity(root: &Path, package_name: &str, config: &Value, target: Target, inp
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn foreign_distributions_are_removed_and_plain_files_survive() {
+    let root = std::env::temp_dir().join(format!("runtime-electron-prune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let keep = root.join("darwin-x64");
+    let foreign = root.join("darwin-arm64");
+    for directory in [&keep, &foreign] {
+      std::fs::create_dir_all(directory).unwrap();
+      std::fs::write(directory.join("electron-rs.json"), "{}").unwrap();
+    }
+    let plain = root.join("notes");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(root.join("README"), "keep").unwrap();
+
+    let removed = prune_foreign_distributions(&root, &keep).unwrap();
+
+    assert_eq!(removed, vec![foreign.clone()], "only the foreign distribution is reported");
+    assert!(keep.join("electron-rs.json").is_file(), "the target distribution must survive");
+    assert!(!foreign.exists(), "the host distribution must be removed");
+    assert!(plain.is_dir(), "directories without a marker are not Electron distributions");
+    assert!(root.join("README").is_file(), "plain files are untouched");
+    std::fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
+  fn missing_output_root_is_not_an_error() {
+    let root = std::env::temp_dir().join(format!("runtime-electron-absent-{}", std::process::id()));
+    let keep = root.join("darwin-arm64");
+    assert_eq!(prune_foreign_distributions(&root, &keep).unwrap(), Vec::<PathBuf>::new());
+  }
 
   #[test]
   fn merged_tauri_identity_uses_platform_icon_and_package_name_fallback() {
