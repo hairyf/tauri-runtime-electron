@@ -1069,6 +1069,12 @@ impl Electron {
     if let Some(path) = &self.binary {
       return electron_rs::electron_binary(path);
     }
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if let Some(path) = option_env!("ELECTRON_RS_STAGED_BINARY") {
+      if Path::new(path).is_file() {
+        return electron_rs::electron_binary(path);
+      }
+    }
     let executable = std::env::current_exe()?;
     let mut lookup_error = None;
     if let Some(dir) = executable.parent() {
@@ -1323,6 +1329,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
 impl ElectronRuntime {
   fn pump<T: UserEvent, F: FnMut(RunEvent<T>)>(&self, mut callback: F, once: bool) -> i32 {
     self.is_running.store(true, Ordering::Relaxed);
+    init_native_ui();
     if !once {
       callback(RunEvent::Ready);
     }
@@ -2656,7 +2663,22 @@ fn pump_thread_messages() {
   }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "macos")))]
+fn init_native_ui() {
+  let _ = gtk::init();
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn init_native_ui() {}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pump_thread_messages() {
+  while gtk::events_pending() {
+    gtk::main_iteration_do(false);
+  }
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
 fn pump_thread_messages() {}
 
 #[cfg(test)]
