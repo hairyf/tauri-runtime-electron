@@ -53,3 +53,6 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalizati
 # so the types must be nameable even though Electron draws the window.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = "0.18"
+
+[patch."https://github.com/hairyf/electron-rs.git"]
+electron-rs = { path = "../electron-rs" }

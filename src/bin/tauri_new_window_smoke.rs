@@ -164,10 +164,12 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         let electron: std::process::Output = bridge.run(
           "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,ready:require('electron').app.isReady(),isMainThread,threadId}));return 1n;",
         ).timeout(WAIT).await.expect("execute on actual Electron main");
-        let node: std::process::Output = bridge.node(&[
-          "-e", "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,args:process.argv.slice(1)}));",
-          "--", "hello",
-        ]).expect("spawn a separate Node process").wait_with_output()
+        let node: std::process::Output = bridge.node()
+          .args([
+            "-e", "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,args:process.argv.slice(1)}));",
+            "--", "hello",
+          ])
+          .spawn().expect("spawn a separate Node process").wait_with_output()
           .await.expect("collect separate Node process output");
         assert!(electron.status.success(), "{electron:?}");
         assert!(node.status.success(), "{node:?}");
@@ -185,9 +187,11 @@ fn exercise(app: &App, main: &Window, origin: &str, ui_thread: thread::ThreadId)
         assert_eq!(node["threadId"], 0);
         assert_eq!(node["args"], json!(["hello"]));
         use tokio::io::AsyncReadExt as _;
-        let mut child = bridge.node(&[
-          "-e", "process.stdout.write(Buffer.from([0,255,195]));setTimeout(()=>process.stderr.write(Buffer.from([128,10])),1000);",
-        ]).expect("spawn streamed Node process");
+        let mut child = bridge.node()
+          .args([
+            "-e", "process.stdout.write(Buffer.from([0,255,195]));setTimeout(()=>process.stderr.write(Buffer.from([128,10])),1000);",
+          ])
+          .spawn().expect("spawn streamed Node process");
         let mut stdout = child.stdout.take().expect("piped Node stdout");
         let mut first = [0; 3];
         stdout.read_exact(&mut first).await.expect("read live Node bytes");

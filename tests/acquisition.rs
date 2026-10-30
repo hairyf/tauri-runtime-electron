@@ -32,7 +32,10 @@ fn staged_electron_reports_its_version() {
     .block_on(async {
       let child: tokio::process::Child = Electron::new()
         .binary(binary)
-        .node(&["--version"])
+        .node()
+        .expect("build staged Electron command")
+        .args(["--version"])
+        .spawn()
         .expect("spawn staged Electron");
       tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
         .await
@@ -59,10 +62,13 @@ fn node_preserves_raw_output_and_nonzero_exit() {
     .block_on(async {
       let child = Electron::new()
         .binary(env!("ELECTRON_RS_STAGED_BINARY"))
-        .node(&[
+        .node()
+        .expect("build native Node command")
+        .args([
           "-e",
           "process.stdout.write(Buffer.from([0,255,195]));process.stderr.write(Buffer.from([128,10]));process.exitCode=7;",
         ])
+        .spawn()
         .expect("spawn native Node child");
       let output = tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
         .await
@@ -83,10 +89,13 @@ fn node_streams_before_exit_and_supports_native_kill() {
     .block_on(async {
       let mut child = Electron::new()
         .binary(env!("ELECTRON_RS_STAGED_BINARY"))
-        .node(&[
+        .node()
+        .expect("build live Node command")
+        .args([
           "-e",
           "process.stdout.write(Buffer.from([0,255,195]));setInterval(()=>{},1000);",
         ])
+        .spawn()
         .expect("spawn live Node child");
       let mut stdout = child.stdout.take().expect("piped Node stdout");
       let mut first = [0; 3];

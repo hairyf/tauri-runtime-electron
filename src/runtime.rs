@@ -1021,18 +1021,19 @@ impl Electron {
     self
   }
 
-  /// Resolve the binary and spawn a separate Node process on the current Tokio runtime.
+  /// Resolve the binary and build a command that runs it in Node mode.
   ///
-  /// Returns a native child with piped stdout/stderr, null stdin and kill-on-drop.
-  /// Use its native async I/O, wait and kill methods; this does not start an RPC bridge.
-  pub fn node(&self, args: &[&str]) -> std::io::Result<tokio::process::Child> {
-    electron_rs::node(self.resolve_binary().map_err(std::io::Error::other)?, args)
+  /// Carries `ELECTRON_RUN_AS_NODE=1`, piped stdout/stderr, null stdin and
+  /// kill-on-drop. Chain the arguments, working directory and environment, then
+  /// spawn; this does not start an RPC bridge.
+  pub fn node(&self) -> std::io::Result<tokio::process::Command> {
+    Ok(electron_rs::node(self.resolve_binary().map_err(std::io::Error::other)?))
   }
 
-  /// Run the resolved binary normally in a separate Electron process.
-  /// Clears `ELECTRON_RUN_AS_NODE`; nonzero exits remain `Ok(Output)`.
-  pub fn electron(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-    electron_rs::electron(self.resolve_binary().map_err(std::io::Error::other)?, args)
+  /// Resolve the binary and build a command that runs it normally.
+  /// Clears `ELECTRON_RUN_AS_NODE`; the caller chains arguments and environment.
+  pub fn electron(&self) -> std::io::Result<tokio::process::Command> {
+    Ok(electron_rs::electron(self.resolve_binary().map_err(std::io::Error::other)?))
   }
 
   /// Appended to the Electron command line (after the main script).
