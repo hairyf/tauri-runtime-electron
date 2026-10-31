@@ -25,6 +25,7 @@ mod app_icon;
 mod command_bridge;
 mod devtools;
 mod environment;
+mod guest;
 mod locale;
 pub mod new_window;
 mod platform;
@@ -43,6 +44,7 @@ pub use command_bridge::init;
 pub use command_bridge::ElectronClient;
 pub use electron_rs::{Command, CommandChunk, OutputStream};
 pub use environment::DebugEnvironment;
+pub use guest::with_guest;
 #[cfg(feature = "tauri")]
 pub use new_window::on_new_window;
 pub use new_window::{with_opener, NewWindowFeatures, NewWindowOpener, NewWindowResponse};

@@ -65,7 +65,23 @@ A tag guest is created by Chromium, not by this runtime, so it is adopted rather
 - `did-attach-webview` registers the guest in the webview registry and applies the window's navigation, download, permission, and `window.open` policies. Its IPC reaches Rust as `ipc.message` with the guest's own webview id.
 - Chromium owns the guest's view: sizing comes from CSS. `set_bounds`, `reparent`, `set_visible`, and `set_background_color` do not apply to it, and closing the page closes the guest like any other webview.
 
-ACL boundary: a guest has no Tauri-managed webview, so its IPC is routed through the host window's webview handler and Tauri resolves the ACL for the **host** label. To give a guest its own identity, install `RuntimeContext::on_guest_ipc` on the runtime instance you own.
+For official `@tauri-apps/api` invoke/listen, register the guest from Rust before assigning the tag's `src`:
+
+```rust
+let guest = tauri_runtime_electron::with_guest(host.label(), &guest_label, || {
+  window.add_child(
+    tauri::WebviewBuilder::new(&guest_label, tauri::WebviewUrl::External(url.clone())),
+    tauri::LogicalPosition::new(0.0, 0.0),
+    tauri::LogicalSize::new(1.0, 1.0),
+  )
+})?;
+```
+
+The ordinary Tauri builder registers the guest label, initialization scripts, IPC handler and event target. Electron reserves its native id instead of creating a second view. A tag in the named host consumes that reservation only when its complete `src` URL matches; the host must still be on its configured origin. No `name` attribute is needed. Registration crosses Tauri's UI-thread dispatch and is consumed once. The guest keeps its real URL, dispatcher and callbacks; it does not inherit host initialization scripts or permissions. Set guest-specific initialization and navigation/download/permission callbacks on its builder.
+
+Each IPC message/fetch is checked against the registered guest origin, and navigation outside that origin is blocked. Closing the managed guest cancels an unused reservation or closes the attached contents; closing its host clears reservations. An unregistered tag has only the plain runtime preload and cannot borrow the host's Tauri handler or IPC protocol. `RuntimeContext::on_guest_ipc` remains available for an explicit raw IPC handler.
+
+Tauri ACL still applies to the guest label and real URL. An HTTP guest at a different origin is remote to Tauri even when it uses loopback; `local: true` alone cannot authorize it. The application must grant the exact trusted URL and guest label using official capabilities before loading it. The runtime grants no capability and never rewrites an external URL to a local origin.
 
 ## Electron client
 
