@@ -13,8 +13,12 @@ pub(crate) fn init() {
   INITIALIZED.call_once(|| {
     autoreleasepool(|_| {
       let app = NSApplication::sharedApplication(mtm);
+      // A bundled host that declares `LSUIElement` is already an accessory app.
+      // AppKit (notably on macOS 26) reports `false` for a redundant policy change,
+      // so assert on the resulting policy rather than on the return value.
+      let changed = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
       assert!(
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory),
+        changed || app.activationPolicy() == NSApplicationActivationPolicy::Accessory,
         "macOS host must remain an accessory application"
       );
       app.finishLaunching();

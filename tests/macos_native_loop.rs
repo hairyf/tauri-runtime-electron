@@ -65,6 +65,13 @@ fn main() {
   autoreleasepool(|_| {
     let app: Retained<NSApplication> =
       unsafe { msg_send![ProbeApplication::class(), sharedApplication] };
+    // Mirrors a bundled host that declares `LSUIElement`: AppKit already reports the
+    // accessory policy, so initialization must tolerate a refused redundant change.
+    assert!(
+      app.setActivationPolicy(NSApplicationActivationPolicy::Accessory)
+        || app.activationPolicy() == NSApplicationActivationPolicy::Accessory,
+      "probe app could not enter the accessory policy"
+    );
     macos_loop::init();
     macos_loop::init();
     std::thread::spawn(|| {
