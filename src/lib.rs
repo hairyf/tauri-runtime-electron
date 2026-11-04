@@ -63,7 +63,8 @@ pub use new_window::on_new_window;
 pub use shell_open::{open_external, open_path};
 pub use new_window::{with_opener, NewWindowFeatures, NewWindowOpener, NewWindowResponse};
 pub use runtime::{
-  register_custom_protocol_scheme, Electron, ElectronRuntime, EventProxy, RuntimeContext,
+  register_custom_protocol_scheme, set_app_details, Electron, ElectronRuntime, EventProxy,
+  RuntimeContext,
 };
 pub use webview::ElectronWebviewDispatcher;
 #[cfg(feature = "tauri")]
