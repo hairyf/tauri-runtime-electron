@@ -695,7 +695,7 @@ dependencies = [
 [[package]]
 name = "electron-rs"
 version = "0.1.0"
-source = "git+https://github.com/hairyf/electron-rs.git?rev=6f643cde6b9fd44a0813bac755dd4c848c9642ef#6f643cde6b9fd44a0813bac755dd4c848c9642ef"
+source = "git+https://github.com/hairyf/electron-rs.git?rev=bb5cb05e7b5292d8cd8539b0dbb8dfe9b1526ca5#bb5cb05e7b5292d8cd8539b0dbb8dfe9b1526ca5"
 dependencies = [
  "base64 0.22.1",
  "serde",

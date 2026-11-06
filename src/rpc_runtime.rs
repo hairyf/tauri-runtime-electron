@@ -71,9 +71,14 @@ impl Ipc {
     self.dispatch(request, move |result| {
       let _ = sender.send(result);
     })?;
-    receiver
-      .recv()
-      .map_err(|_| electron_rs::Error::ChannelDisconnected)?
+    let receive = || receiver.recv().map_err(|_| electron_rs::Error::ChannelDisconnected)?;
+    if tokio::runtime::Handle::try_current()
+      .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+      tokio::task::block_in_place(receive)
+    } else {
+      receive()
+    }
   }
 
   pub(crate) fn client(&self) -> Arc<Electron> {
@@ -89,7 +94,11 @@ impl Ipc {
   }
 
   pub(crate) fn notify<R: RpcRequest>(&self, request: R) -> Result<(), electron_rs::Error> {
-    self.dispatch(Notification(request), |_| {})
+    self.dispatch(Notification(request), |result| {
+      if let Err(error) = result {
+        eprintln!("[electron] RPC notification failed: {error}");
+      }
+    })
   }
 
   pub(crate) fn dispatch<R: RpcRequest>(
@@ -98,17 +107,11 @@ impl Ipc {
     callback: impl FnOnce(Result<R::Response, electron_rs::Error>) + Send + 'static,
   ) -> Result<(), electron_rs::Error> {
     let electron = Arc::clone(&self.electron);
-    let method = request.method();
-    let operation = if request.notification() { "notify" } else { "call" };
     self
       .tasks
       .try_send(Box::new(move |runtime| {
         let mut task = Box::pin(async move {
-          let result = electron.call(request).await;
-          if let Err(error) = &result {
-            eprintln!("[DEBUG-pr1427] runtime operation={operation} method={method} error={error}");
-          }
-          callback(result);
+          callback(electron.call(request).await);
         });
         // Reserve the client's writer order before accepting the next request.
         let complete = runtime.block_on(std::future::poll_fn(|cx| {
@@ -124,6 +127,10 @@ impl Ipc {
       })
   }
 }
+
+#[cfg(test)]
+#[path = "rpc_runtime_tests.rs"]
+mod writer_tests;
 
 #[cfg(test)]
 mod tests {
