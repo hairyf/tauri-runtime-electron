@@ -8,8 +8,8 @@ import { ciMetadata, collectEvidence, PLATFORMS } from './runtime-evidence.mjs'
 
 export const SUITES = [
   { id: 'runtime-tests', command: 'cargo', args: ['test', '--locked', '--all-features', '--', '--nocapture', '--test-threads=1'] },
-  ...['new_window_smoke', 'tauri_new_window_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke', 'macos_behavior_smoke', 'windows_behavior_smoke', 'linux_behavior_smoke', 'rendering_behavior_smoke'].map(id => ({
-    id, command: 'cargo', args: ['run', '--locked', ...(id === 'tauri_new_window_smoke' ? ['--features', 'tauri'] : []), '--bin', id],
+  ...['new_window_smoke', 'tauri_new_window_smoke', 'tauri_event_smoke', 'runtime_behavior_smoke', 'webview_behavior_smoke', 'desktop_behavior_smoke', 'system_behavior_smoke', 'macos_behavior_smoke', 'windows_behavior_smoke', 'linux_behavior_smoke', 'rendering_behavior_smoke'].map(id => ({
+    id, command: 'cargo', args: ['run', '--locked', ...(['tauri_new_window_smoke', 'tauri_event_smoke'].includes(id) ? ['--features', 'tauri'] : []), '--bin', id],
     ...(id === 'macos_behavior_smoke' ? { platforms: ['macos'] } : {}),
     ...(id === 'windows_behavior_smoke' ? { platforms: ['windows'] } : {}),
     ...(id === 'linux_behavior_smoke' ? { platforms: ['linux'] } : {}),
@@ -21,12 +21,12 @@ export function suitesFor(platform, suites = SUITES) {
   return suites.filter(suite => !suite.platforms || suite.platforms.includes(platform))
 }
 
-export function requireSuites(artifacts) {
+export function requireSuites(artifacts, suites = SUITES) {
   for (const artifact of artifacts) {
     assert.ok(SUITES.some(suite => suite.id === artifact.testRun.id), `unrecognized CI suite: ${artifact.testRun.id}`)
-    assert.ok(suitesFor(artifact.platform).some(suite => suite.id === artifact.testRun.id), `suite not applicable: ${artifact.platform}/${artifact.testRun.id}`)
+    assert.ok(suitesFor(artifact.platform, suites).some(suite => suite.id === artifact.testRun.id), `suite not applicable: ${artifact.platform}/${artifact.testRun.id}`)
   }
-  for (const platform of PLATFORMS) for (const suite of suitesFor(platform)) {
+  for (const platform of PLATFORMS) for (const suite of suitesFor(platform, suites)) {
     const matches = artifacts.filter(artifact => artifact.platform === platform && artifact.testRun.id === suite.id)
     assert.equal(matches.length, 1, `missing or duplicate suite: ${platform}/${suite.id}`)
     assert.equal(matches[0].testRun.status, 'pass', `suite did not pass: ${platform}/${suite.id}`)

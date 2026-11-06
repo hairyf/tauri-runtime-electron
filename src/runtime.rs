@@ -2663,8 +2663,17 @@ fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
   pending: &PendingWebview<T, R>,
 ) -> Vec<rpc::webview::InitScript> {
   pending.webview_attributes.initialization_scripts.iter().map(|script| {
+    let mut source = script.script.clone();
+    if source.contains("Object.defineProperty(window, '__TAURI_EVENT_PLUGIN_INTERNALS__', {") {
+      // Tauri 2.12.5 注销后残留监听条目，使在途事件调用已删除的回调。
+      source = source.replacen(
+        "if (listener) {\n            window.__TAURI_INTERNALS__.unregisterCallback(listener.handlerId)\n          }",
+        "if (listener) {\n            window.__TAURI_INTERNALS__.unregisterCallback(listener.handlerId)\n            delete listeners[eventId]\n          }",
+        1,
+      );
+    }
     rpc::webview::InitScript::Detailed {
-      script: script.script.clone(), main_frame_only: script.for_main_frame_only,
+      script: source, main_frame_only: script.for_main_frame_only,
     }
   }).collect()
 }

@@ -7,7 +7,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PLATFORMS, aggregateEvidence, cfgApplies, readArtifacts, traitMembers } from './runtime-evidence.mjs'
-import { requireSuites } from './runtime-suites.mjs'
+import { SUITES, requireSuites } from './runtime-suites.mjs'
 
 const repo = (path) => fileURLToPath(new URL(`../../${path}`, import.meta.url))
 const TAURI = 'source/tauri/crates'
@@ -380,12 +380,12 @@ export function main(args = process.argv.slice(2)) {
   const artifacts = options['--evidence'] ? readArtifacts(options['--evidence']) : JSON.parse(read(SNAPSHOT))
   assert.ok(Array.isArray(artifacts) && artifacts.length, 'evidence has no result artifacts')
   // The checked-in snapshot is historical; explicit CI input never inherits it.
-  if (!options['--evidence']) requireSuites(artifacts)
+  if (!options['--evidence']) requireSuites(artifacts, SUITES.filter(suite => suite.id !== 'tauri_event_smoke'))
   const evidence = aggregateEvidence(inventory, artifacts, {
     commit: options['--commit'] ?? (!options['--evidence'] ? artifacts[0].commit : undefined),
     runId: options['--run'] ?? (!options['--evidence'] ? artifacts[0].run.id : undefined),
   })
-  if (options['--require-suites']) requireSuites(artifacts)
+  if (options['--require-suites'] && options['--evidence']) requireSuites(artifacts)
   if (options['--require-platforms']) {
     assert.deepEqual([...evidence.platforms].sort(), [...PLATFORMS].sort(), 'missing Windows/macOS/Linux runtime artifacts')
   }
