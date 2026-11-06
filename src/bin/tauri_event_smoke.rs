@@ -96,7 +96,21 @@ fn exercise(window: &Window) {
     window,
     r#"window.cyclesDone = false; window.cycleError = null; (async () => { for (let cycle = 0; cycle < 100; cycle++) { window.cycleProgress = 'listen:' + cycle; const off = await __TAURI__.event.listen('callback-warning-probe', event => cyclePayloads.push(event.payload)); await __TAURI__.event.emitTo('event-probe', 'callback-warning-probe', {source:'cycle',cycle}); window.cycleProgress = 'off:' + cycle; await off(); } cyclesDone = true; })().catch(error => cycleError = String(error)); true"#,
   );
-  expect(window, "cyclesDone || cycleError", json!(true));
+  let mut progress = Value::Null;
+  let mut advanced = Instant::now();
+  loop {
+    let state = eval(window, "[cyclesDone, cycleError, cycleProgress]");
+    assert_eq!(state[1], Value::Null, "event cycle failed: {state}");
+    if state[0] == true {
+      break;
+    }
+    if state[2] != progress {
+      progress = state[2].clone();
+      advanced = Instant::now();
+    }
+    assert!(advanced.elapsed() < WAIT, "event cycle stalled: {state}");
+    thread::sleep(Duration::from_millis(10));
+  }
   stop.store(true, Ordering::Relaxed);
   let emitted = worker.join().unwrap();
   window.emit("event-probe-drained", ()).unwrap();
