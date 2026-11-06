@@ -2878,6 +2878,17 @@ mod tests {
     pending.set_webview(view);
     let window = create_window_impl(&runtime.context, pending, None::<fn(RawWindow<'_>)>).unwrap();
     let host = window.webview.unwrap().webview.dispatcher;
+    let wait_loaded = |url: &str| {
+      let deadline = std::time::Instant::now() + Duration::from_secs(5);
+      loop {
+        let event = runtime.event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+          .unwrap_or_else(|error| panic!("document {url} did not finish loading: {error}"));
+        if event["params"]["webviewId"] != host.id { continue; }
+        assert!(!matches!(event["event"].as_str(), Some("webview.loadFailed" | "webview.processGone")), "document load failed: {event}");
+        if event["event"] == "webview.loadFinished" && event["params"]["url"] == url { break; }
+      }
+    };
+    wait_loaded("data:text/html,old");
     assert_eq!(host.webview_call(rpc::EvalScript { webview_id: host.id, script: "1".into(), document_generation: None }).unwrap(), json!(1));
     let handler = runtime.context.ipc_handlers.borrow().get(&host.id).unwrap().clone();
     crate::webview::with_ipc_document(host.id, Some(1), || handler(Request::new(String::new())));
@@ -2885,6 +2896,7 @@ mod tests {
     assert_eq!(old.document_generation, Some(1));
     let retained = std::thread::spawn(move || old.clone()).join().unwrap();
     host.webview_call(rpc::WebviewNavigate { webview_id: host.id, url: "data:text/html,new".into() }).unwrap();
+    wait_loaded("data:text/html,new");
     let next = host.webview_call(rpc::EvalScript { webview_id: host.id, script: "2".into(), document_generation: None }).unwrap();
     assert_eq!(next, json!(2));
     let channel = tauri::ipc::Channel::<u8>::new(move |_| {
