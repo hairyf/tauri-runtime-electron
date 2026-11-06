@@ -14,6 +14,10 @@ Build a trusted native child webview inside `with_browser_host(label, || builder
 
 `on_webview_load_state(&webview, handler)` reports `WebviewLoadState::{Started, Finished, Failed, ProcessGone}` across platforms and replays the latest observed state when registered. A later registration replaces the callback; webview destruction removes the callback and cached state. Main-frame aborted navigations do not report `Failed`.
 
+## Authenticated web hosts
+
+Register `init()` to access managed `ElectronClient`. Hold `WebviewSetup::new(label).authenticated_web_host_session().browser_host()` across creation of the native host webview; it may initially load a local bootstrap page. Once the owned backend reports its launch URL, await `authenticate_web_host(&client, launch_url)`, call synchronous `bind_authenticated_web_host(&webview, &host)`, and navigate to `host.document_url()`. When authentication precedes creation, `.authenticated_web_host(&host)` both reserves the private session and binds before navigation. `set_webview_trusted_origin(&webview, origin)` closes existing browser guests and revokes any authenticated binding before switching to a host-approved HTTP(S) origin. Call `bind_authenticated_web_host` again before returning to the authenticated backend. These APIs register no renderer commands. Browser proxy cookies and streaming bodies remain in the Electron main process. Trusted Rust hosts may explicitly await `host.cookie_header(&client)` to reuse the same exchanged credential with their own backend HTTP clients or event streams; keep it out of renderer commands and logs, and send it only to `host.backend_origin()`. The host must be a native webview to embed browser guests; recursive `<webview>` elements remain unsupported by Electron.
+
 ## Install
 
 ```toml

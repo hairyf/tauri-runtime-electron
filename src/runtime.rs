@@ -1411,7 +1411,7 @@ impl ElectronRuntime {
     } else {
       let body = serde_json::from_str::<Value>(params["body"].as_str().unwrap_or_default()).unwrap_or_default();
       let (Some(error), Some(webview_id)) = (body["error"].as_u64(), params["webviewId"].as_u64().and_then(|id| u32::try_from(id).ok())) else { return; };
-      self.context.ipc.notify(rpc::EvalScript { webview_id, script: format!("window.__TAURI_INTERNALS__.runCallback({error}, \"IPC rejected: {status}\")") })
+      self.context.ipc.notify(rpc::EvalScript { webview_id, document_generation: params["documentGeneration"].as_u64(), script: format!("window.__TAURI_INTERNALS__.runCallback({error}, \"IPC rejected: {status}\")") })
     };
     if let Err(error) = result { eprintln!("[electron] failed to reject IPC: {error}"); }
   }
@@ -1834,7 +1834,7 @@ impl ElectronRuntime {
             // Keep the real sender URL for Tauri's ACL; an invalid or opaque
             // URL must never become the trusted tauri://localhost origin.
             match Request::builder().uri(url).body(body) {
-              Ok(request) => handler(request),
+              Ok(request) => crate::webview::with_ipc_document(serial as u32, params["documentGeneration"].as_u64(), || handler(request)),
               Err(error) => eprintln!("[electron] invalid ipc request url: {error}"),
             }
           }
@@ -1923,7 +1923,11 @@ impl ElectronRuntime {
                   eprintln!("[electron] failed to answer protocol request {request_uri}: {error}");
                 }
               });
-            handler(&label, request, responder);
+            crate::webview::with_ipc_document(
+              params["webviewId"].as_u64().unwrap_or_default() as u32,
+              params["documentGeneration"].as_u64(),
+              || handler(&label, request, responder),
+            );
           }
           Some("ipc.closed") => {
             break 'event_loop 0;
@@ -2429,6 +2433,7 @@ pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'st
       dispatcher: ElectronWebviewDispatcher {
         id: webview_id,
         context: context.clone(),
+        document_generation: None,
         last_evaluated_script: Default::default(),
       },
     },
@@ -2520,6 +2525,7 @@ pub(crate) fn create_webview_impl<T: UserEvent>(
     dispatcher: ElectronWebviewDispatcher {
       id: webview_id,
       context: context.clone(),
+      document_generation: None,
       last_evaluated_script: Default::default(),
     },
   })
@@ -2608,6 +2614,8 @@ fn webview_create_payload<T: UserEvent>(
     policy: Some(policy),
     additional: std::collections::BTreeMap::from([
       ("browserHost".into(), json!(crate::setup::take_browser_host(&pending.label))),
+      ("authenticatedWebHostSession".into(), json!(crate::setup::take_authenticated_web_host_session(&pending.label))),
+      ("authenticatedWebHost".into(), json!(crate::setup::take_authenticated_web_host(&pending.label))),
       ("dragDropEnabled".into(), json!(attributes.drag_drop_handler_enabled)),
       ("zoomHotkeysEnabled".into(), json!(attributes.zoom_hotkeys_enabled)),
       ("scrollBarStyle".into(), json!(scroll_bar_style)),
@@ -2639,6 +2647,7 @@ fn register_ipc_handler<T: UserEvent>(
     dispatcher: ElectronWebviewDispatcher {
       id: webview_id,
       context: context.clone(),
+      document_generation: None,
       last_evaluated_script: Default::default(),
     },
   };
@@ -2654,8 +2663,17 @@ fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
   pending: &PendingWebview<T, R>,
 ) -> Vec<rpc::webview::InitScript> {
   pending.webview_attributes.initialization_scripts.iter().map(|script| {
+    let mut source = script.script.clone();
+    if source.contains("Object.defineProperty(window, '__TAURI_EVENT_PLUGIN_INTERNALS__', {") {
+      // Tauri 2.12.5 注销后残留监听条目，使在途事件调用已删除的回调。
+      source = source.replacen(
+        "if (listener) {\n            window.__TAURI_INTERNALS__.unregisterCallback(listener.handlerId)\n          }",
+        "if (listener) {\n            window.__TAURI_INTERNALS__.unregisterCallback(listener.handlerId)\n            delete listeners[eventId]\n          }",
+        1,
+      );
+    }
     rpc::webview::InitScript::Detailed {
-      script: script.script.clone(), main_frame_only: script.for_main_frame_only,
+      script: source, main_frame_only: script.for_main_frame_only,
     }
   }).collect()
 }
@@ -2842,6 +2860,56 @@ fn pump_thread_messages() {}
 mod tests {
   use super::*;
 
+  #[cfg(feature = "tauri")]
+  #[test]
+  fn ipc_document_handles_survive_async_cloning_but_not_navigation() {
+    use tauri_runtime::window::{PendingWindow, WindowBuilder};
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("document-generation-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let runtime = ElectronRuntime::start(Electron::new().arg(format!("--user-data-dir={}", scratch.display())), DEFAULT_SCHEMES).unwrap();
+    struct Shutdown(Arc<ElectronProcess>);
+    impl Drop for Shutdown { fn drop(&mut self) { self.0.shutdown(); } }
+    let _shutdown = Shutdown(runtime.context.ipc.clone());
+    let mut pending = PendingWindow::<(), ElectronRuntime>::new(crate::ElectronWindowBuilder::new().visible(false), "document-generation").unwrap();
+    let mut view = PendingWebview::new(tauri_runtime::webview::WebviewAttributes::new(tauri_utils::config::WebviewUrl::External("data:text/html,old".parse().unwrap())), "document-generation").unwrap();
+    view.url = "data:text/html,old".into();
+    let (tx, rx) = channel();
+    view.ipc_handler = Some(Box::new(move |view, _| { tx.send(view.dispatcher).unwrap(); }));
+    pending.set_webview(view);
+    let window = create_window_impl(&runtime.context, pending, None::<fn(RawWindow<'_>)>).unwrap();
+    let host = window.webview.unwrap().webview.dispatcher;
+    let wait_loaded = |url: &str| {
+      let deadline = std::time::Instant::now() + Duration::from_secs(5);
+      loop {
+        let event = runtime.event_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+          .unwrap_or_else(|error| panic!("document {url} did not finish loading: {error}"));
+        if event["params"]["webviewId"] != host.id { continue; }
+        assert!(!matches!(event["event"].as_str(), Some("webview.loadFailed" | "webview.processGone")), "document load failed: {event}");
+        if event["event"] == "webview.loadFinished" && event["params"]["url"] == url { break; }
+      }
+    };
+    wait_loaded("data:text/html,old");
+    assert_eq!(host.webview_call(rpc::EvalScript { webview_id: host.id, script: "1".into(), document_generation: None }).unwrap(), json!(1));
+    let handler = runtime.context.ipc_handlers.borrow().get(&host.id).unwrap().clone();
+    crate::webview::with_ipc_document(host.id, Some(1), || handler(Request::new(String::new())));
+    let old = rx.recv_timeout(IPC_TIMEOUT).unwrap();
+    assert_eq!(old.document_generation, Some(1));
+    let retained = std::thread::spawn(move || old.clone()).join().unwrap();
+    host.webview_call(rpc::WebviewNavigate { webview_id: host.id, url: "data:text/html,new".into() }).unwrap();
+    wait_loaded("data:text/html,new");
+    let next = host.webview_call(rpc::EvalScript { webview_id: host.id, script: "2".into(), document_generation: None }).unwrap();
+    assert_eq!(next, json!(2));
+    let channel = tauri::ipc::Channel::<u8>::new(move |_| {
+      retained.webview_call(rpc::EvalScript { webview_id: retained.id, script: "window.stale = true".into(), document_generation: retained.document_generation }).map_err(|error| tauri::Error::Io(std::io::Error::other(error.to_string())))?;
+      Ok(())
+    });
+    assert!(channel.send(1).is_err());
+    assert!(channel.send(2).is_err());
+    assert_eq!(host.document_generation, None);
+    assert_eq!(host.webview_call(rpc::EvalScript { webview_id: host.id, script: "typeof window.stale".into(), document_generation: None }).unwrap(), json!("undefined"));
+    tauri_runtime::WindowDispatch::<()>::destroy(&window.dispatcher).unwrap();
+  }
+
   #[cfg(windows)]
   #[test]
   fn connect_failure_message_names_the_runtime_directory_and_repair_command() {
@@ -3004,6 +3072,7 @@ mod tests {
   #[test]
   fn setup_options_reach_the_creation_payload_once() {
     let setup = crate::setup::WebviewSetup::new("setup-payload")
+      .authenticated_web_host_session()
       .browser_host()
       .preload_script("globalThis.first = true")
       .preload_script("globalThis.second = true");
@@ -3022,6 +3091,7 @@ mod tests {
       json!(["globalThis.first = true", "globalThis.second = true"])
     );
     assert_eq!(payload["browserHost"], true);
+    assert_eq!(payload["authenticatedWebHostSession"], true);
     let repeated = serde_json::to_value(webview_create_payload(
       &pending,
       10,
@@ -3034,6 +3104,7 @@ mod tests {
       "setup preload sources are consumed once and never leak into a later webview"
     );
     assert_eq!(repeated["browserHost"], false, "the host flag is consumed too");
+    assert_eq!(repeated["authenticatedWebHostSession"], false);
     drop(setup);
   }
 

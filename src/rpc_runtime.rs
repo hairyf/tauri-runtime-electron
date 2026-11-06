@@ -71,9 +71,14 @@ impl Ipc {
     self.dispatch(request, move |result| {
       let _ = sender.send(result);
     })?;
-    receiver
-      .recv()
-      .map_err(|_| electron_rs::Error::ChannelDisconnected)?
+    let receive = || receiver.recv().map_err(|_| electron_rs::Error::ChannelDisconnected)?;
+    if tokio::runtime::Handle::try_current()
+      .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+      tokio::task::block_in_place(receive)
+    } else {
+      receive()
+    }
   }
 
   pub(crate) fn client(&self) -> Arc<Electron> {
@@ -124,13 +129,17 @@ impl Ipc {
 }
 
 #[cfg(test)]
+#[path = "rpc_runtime_tests.rs"]
+mod writer_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
   #[test]
   fn notifications_preserve_upstream_payload_and_deferred_scheduling() {
     let notification = Notification(electron_rs::rpc::webview::Eval {
-      webview_id: 8, script: "1 + 1".into(),
+      webview_id: 8, script: "1 + 1".into(), document_generation: None,
     });
     assert!(notification.notification() && notification.deferred());
     assert_eq!(notification.method(), "webview.eval");

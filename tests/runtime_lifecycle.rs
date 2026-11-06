@@ -28,10 +28,12 @@ fn main() {
       .stderr(Stdio::inherit())
       .spawn()
       .expect("run lifecycle child");
+    eprintln!("[lifecycle] mode={mode} child_pid={} started", child.id());
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
       match child.try_wait().expect("wait for lifecycle child") {
         Some(status) => {
+          eprintln!("[lifecycle] mode={mode} child_pid={} exited={status}", child.id());
           assert_eq!(status.code(), Some(expected), "{mode}: {status}");
           break;
         }
@@ -46,9 +48,69 @@ fn main() {
   }
 }
 
+#[cfg(not(windows))]
+fn startup_snapshot(mode: &str, stage: &str, _failed: bool) {
+  eprintln!("[lifecycle] mode={mode} stage={stage} rust_pid={}", std::process::id());
+}
+
+#[cfg(windows)]
+fn startup_snapshot(mode: &str, stage: &str, failed: bool) {
+  use std::{fs, io::Read, path::PathBuf};
+  let owner = std::env::var_os("TAURI_RUNTIME_ELECTRON_OWNER").or_else(|| {
+    std::env::current_exe().ok().and_then(|exe| exe.file_stem().map(ToOwned::to_owned))
+  });
+  let profile = std::env::var_os("APPDATA").zip(owner).map(|(root, owner)| PathBuf::from(root).join(owner));
+  eprintln!("[lifecycle] mode={mode} stage={stage} rust_pid={} profile={profile:?}", std::process::id());
+  if !failed { return; }
+  if failed {
+    if let Some(profile) = &profile {
+      for directory in [profile.parent().unwrap_or(profile).to_path_buf(), profile.clone(), profile.join("GPUCache"), profile.join("ShaderCache")] {
+        eprintln!("[lifecycle] metadata {directory:?}: {:?}", fs::metadata(&directory).map(|meta| (meta.is_dir(), meta.len(), meta.modified().ok())));
+        if directory == *profile || directory.starts_with(profile) {
+          let entries = fs::read_dir(&directory).into_iter().flatten();
+          for entry in entries.take(20).flatten() {
+            eprintln!("[lifecycle] entry {:?}: {:?}", entry.file_name(), entry.metadata().map(|meta| (meta.is_dir(), meta.len(), meta.modified().ok())));
+          }
+        }
+      }
+    }
+  }
+  let path = std::env::temp_dir().join(format!("runtime-lifecycle-{}-{stage}.txt", std::process::id()));
+  let output = match fs::File::create(&path) { Ok(output) => output, Err(error) => { eprintln!("[lifecycle] process snapshot file: {error}"); return; } };
+  let binary = env!("ELECTRON_RS_STAGED_BINARY").replace("'", "''");
+  let fields = if failed { "ProcessId,ParentProcessId,CommandLine" } else { "ProcessId,ParentProcessId" };
+  let script = format!("$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter \"Name='electron.exe'\" | Where-Object {{ $_.ExecutablePath -eq '{binary}' }} | Select-Object -First 20 {fields} | ConvertTo-Json -Compress");
+  let result = Command::new("powershell.exe").args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+    .stdin(Stdio::null()).stdout(Stdio::from(output)).stderr(Stdio::null()).spawn();
+  match result {
+    Ok(mut child) => {
+      let deadline = Instant::now() + Duration::from_secs(3);
+      loop {
+        match child.try_wait() {
+          Ok(Some(status)) => { eprintln!("[lifecycle] process snapshot status={status}"); break; }
+          Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+          result => { let _ = child.kill(); let _ = child.wait(); eprintln!("[lifecycle] process snapshot bounded stop: {result:?}"); break; }
+        }
+      }
+      let mut text = String::new();
+      if let Ok(file) = fs::File::open(&path) {
+        let _ = file.take(16_384).read_to_string(&mut text);
+      }
+      eprintln!("[lifecycle] Electron processes: {}", text.replace('\0', ""));
+    }
+    Err(error) => eprintln!("[lifecycle] process snapshot unavailable: {error}"),
+  }
+  let _ = fs::remove_file(path);
+}
+
 fn exercise(mode: &str) {
+  startup_snapshot(mode, "before", false);
   let runtime = <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs::default())
-    .expect("start Electron for lifecycle regression");
+    .unwrap_or_else(|error| {
+      startup_snapshot(mode, "failed", true);
+      panic!("start Electron for lifecycle regression: {error:?}");
+    });
+  startup_snapshot(mode, "ready", false);
   let handle = <ElectronRuntime as Runtime<()>>::handle(&runtime);
   // Setup-time exit must queue, not disappear before run starts.
   <ElectronRuntimeHandle as RuntimeHandle<()>>::request_exit(&handle, 17).unwrap();

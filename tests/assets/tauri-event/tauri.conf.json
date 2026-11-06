@@ -1,0 +1,17 @@
+{
+  "productName": "Tauri Event Regression",
+  "identifier": "com.tauri.runtime-electron.event-regression",
+  "app": {
+    "windows": [],
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "../tauri-new-window/icon.png"
+    ]
+  }
+}

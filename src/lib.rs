@@ -22,6 +22,10 @@
 //! the independent `electron-rs` crate.
 
 mod app_icon;
+mod authenticated_host;
+pub use authenticated_host::{authenticate_web_host, AuthenticatedWebHost};
+#[cfg(feature = "tauri")]
+pub use authenticated_host::bind_authenticated_web_host;
 mod browser;
 mod command_bridge;
 mod devtools;
@@ -57,7 +61,7 @@ pub use guest::with_guest;
 pub use setup::WebviewSetup;
 pub use browser::BrowserGuestReservation;
 #[cfg(feature = "tauri")]
-pub use browser::{acquire_browser_guest, release_browser_guest, on_browser_open_requested};
+pub use browser::{acquire_browser_guest, release_browser_guest, on_browser_open_requested, set_webview_trusted_origin};
 #[cfg(feature = "tauri")]
 pub use new_window::on_new_window;
 pub use shell_open::{open_external, open_path};
