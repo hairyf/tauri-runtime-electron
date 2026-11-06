@@ -22,11 +22,34 @@ pub fn capture_webview(webview: &tauri::Webview<ElectronRuntime>) -> tauri::Resu
   })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ElectronWebviewDispatcher {
   pub(crate) id: u32,
+  pub(crate) document_generation: Option<u64>,
   pub(crate) context: RuntimeContext,
   pub(crate) last_evaluated_script: Arc<Mutex<Option<String>>>,
+}
+
+thread_local! {
+  static IPC_DOCUMENT: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn with_ipc_document<R>(id: u32, generation: Option<u64>, task: impl FnOnce() -> R) -> R {
+  struct Restore(Option<(u32, u64)>);
+  impl Drop for Restore { fn drop(&mut self) { IPC_DOCUMENT.set(self.0); } }
+  let _restore = Restore(IPC_DOCUMENT.replace(generation.map(|generation| (id, generation))));
+  task()
+}
+
+impl Clone for ElectronWebviewDispatcher {
+  fn clone(&self) -> Self {
+    Self {
+      id: self.id,
+      document_generation: self.document_generation.or_else(|| IPC_DOCUMENT.get().filter(|(id, _)| *id == self.id).map(|(_, generation)| generation)),
+      context: self.context.clone(),
+      last_evaluated_script: self.last_evaluated_script.clone(),
+    }
+  }
 }
 
 impl ElectronWebviewDispatcher {
@@ -157,6 +180,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
       .ipc
       .notify(rpc::EvalScript {
         webview_id: self.id,
+        document_generation: self.document_generation,
         script,
       })
       .map_err(|error| tauri_runtime::Error::CreateWebview(Box::new(error)))
@@ -181,6 +205,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher {
       .dispatch(
         rpc::EvalScriptCallback {
           webview_id: self.id,
+          document_generation: self.document_generation,
           script,
         },
         move |result| {

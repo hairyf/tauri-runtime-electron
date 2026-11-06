@@ -130,7 +130,7 @@ mod tests {
   #[test]
   fn notifications_preserve_upstream_payload_and_deferred_scheduling() {
     let notification = Notification(electron_rs::rpc::webview::Eval {
-      webview_id: 8, script: "1 + 1".into(),
+      webview_id: 8, script: "1 + 1".into(), document_generation: None,
     });
     assert!(notification.notification() && notification.deferred());
     assert_eq!(notification.method(), "webview.eval");
