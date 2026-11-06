@@ -2608,6 +2608,8 @@ fn webview_create_payload<T: UserEvent>(
     policy: Some(policy),
     additional: std::collections::BTreeMap::from([
       ("browserHost".into(), json!(crate::setup::take_browser_host(&pending.label))),
+      ("authenticatedWebHostSession".into(), json!(crate::setup::take_authenticated_web_host_session(&pending.label))),
+      ("authenticatedWebHost".into(), json!(crate::setup::take_authenticated_web_host(&pending.label))),
       ("dragDropEnabled".into(), json!(attributes.drag_drop_handler_enabled)),
       ("zoomHotkeysEnabled".into(), json!(attributes.zoom_hotkeys_enabled)),
       ("scrollBarStyle".into(), json!(scroll_bar_style)),
@@ -3004,6 +3006,7 @@ mod tests {
   #[test]
   fn setup_options_reach_the_creation_payload_once() {
     let setup = crate::setup::WebviewSetup::new("setup-payload")
+      .authenticated_web_host_session()
       .browser_host()
       .preload_script("globalThis.first = true")
       .preload_script("globalThis.second = true");
@@ -3022,6 +3025,7 @@ mod tests {
       json!(["globalThis.first = true", "globalThis.second = true"])
     );
     assert_eq!(payload["browserHost"], true);
+    assert_eq!(payload["authenticatedWebHostSession"], true);
     let repeated = serde_json::to_value(webview_create_payload(
       &pending,
       10,
@@ -3034,6 +3038,7 @@ mod tests {
       "setup preload sources are consumed once and never leak into a later webview"
     );
     assert_eq!(repeated["browserHost"], false, "the host flag is consumed too");
+    assert_eq!(repeated["authenticatedWebHostSession"], false);
     drop(setup);
   }
 

@@ -22,6 +22,10 @@
 //! the independent `electron-rs` crate.
 
 mod app_icon;
+mod authenticated_host;
+pub use authenticated_host::{authenticate_web_host, AuthenticatedWebHost};
+#[cfg(feature = "tauri")]
+pub use authenticated_host::bind_authenticated_web_host;
 mod browser;
 mod command_bridge;
 mod devtools;

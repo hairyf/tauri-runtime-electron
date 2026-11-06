@@ -11,6 +11,8 @@ use std::{collections::HashMap, sync::{Mutex, OnceLock}};
 struct Options {
   generation: u64,
   browser_host: bool,
+  authenticated_web_host_session: bool,
+  authenticated_web_host: Option<String>,
   preload_scripts: Vec<String>,
 }
 
@@ -60,6 +62,23 @@ impl WebviewSetup {
     self
   }
 
+  pub fn authenticated_web_host(self, host: &crate::AuthenticatedWebHost) -> Self {
+    let mut options = options().lock().unwrap();
+    if let Some(pending) = options.get_mut(&self.label).filter(|pending| pending.generation == self.generation) {
+      pending.authenticated_web_host_session = true;
+      pending.authenticated_web_host = Some(host.id().to_owned());
+    }
+    self
+  }
+
+  pub fn authenticated_web_host_session(self) -> Self {
+    let mut options = options().lock().unwrap();
+    if let Some(pending) = options.get_mut(&self.label).filter(|pending| pending.generation == self.generation) {
+      pending.authenticated_web_host_session = true;
+    }
+    self
+  }
+
   /// Append a source snippet to this webview's own preload.
   ///
   /// The snippet runs in the isolated preload world, where `require('electron')`
@@ -80,6 +99,14 @@ impl Drop for WebviewSetup {
       options.remove(&self.label);
     }
   }
+}
+
+pub(crate) fn take_authenticated_web_host(label: &str) -> Option<String> {
+  options().lock().unwrap().get_mut(label)?.authenticated_web_host.take()
+}
+
+pub(crate) fn take_authenticated_web_host_session(label: &str) -> bool {
+  options().lock().unwrap().get_mut(label).is_some_and(|pending| std::mem::take(&mut pending.authenticated_web_host_session))
 }
 
 pub(crate) fn take_browser_host(label: &str) -> bool {
