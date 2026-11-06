@@ -5,6 +5,10 @@ impl AuthenticatedWebHost {
   pub(crate) fn id(&self) -> &str { &self.0.id }
   pub fn document_url(&self) -> &str { &self.0.document_url }
   pub fn backend_origin(&self) -> &str { &self.0.backend_origin }
+
+  pub async fn cookie_header(&self, client: &crate::ElectronClient) -> Result<String, electron_rs::Error> {
+    client.call(electron_rs::rpc::protocol::HostCookieHeader { host_id: self.0.id.clone() }).await
+  }
 }
 
 pub async fn authenticate_web_host(
