@@ -650,7 +650,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "electron-rs"
 version = "0.1.0"
-source = "git+https://github.com/hairyf/electron-rs.git?rev=16081e80307f2963b89b60227ad79f313fbe86ee#16081e80307f2963b89b60227ad79f313fbe86ee"
+source = "git+https://github.com/hairyf/electron-rs.git?rev=159413118afdebfc32cd145e3999433eccddae52#159413118afdebfc32cd145e3999433eccddae52"
 dependencies = [
  "base64 0.22.1",
  "serde",

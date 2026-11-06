@@ -20,6 +20,14 @@ pub(crate) fn route<R: Send + 'static>(
 }
 
 #[cfg(feature = "tauri")]
+pub fn set_webview_trusted_origin(
+  webview: &tauri::Webview<crate::ElectronRuntime>, origin: &str,
+) -> tauri::Result<()> {
+  let origin = origin.to_owned();
+  route(webview, move |view| view.webview_call(electron_rs::rpc::browser::SetTrustedOrigin { webview_id: view.id, origin }))
+}
+
+#[cfg(feature = "tauri")]
 pub fn acquire_browser_guest(
   webview: &tauri::Webview<crate::ElectronRuntime>, workspace: &str,
 ) -> tauri::Result<BrowserGuestReservation> {

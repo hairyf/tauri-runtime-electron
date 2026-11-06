@@ -61,7 +61,7 @@ pub use guest::with_guest;
 pub use setup::WebviewSetup;
 pub use browser::BrowserGuestReservation;
 #[cfg(feature = "tauri")]
-pub use browser::{acquire_browser_guest, release_browser_guest, on_browser_open_requested};
+pub use browser::{acquire_browser_guest, release_browser_guest, on_browser_open_requested, set_webview_trusted_origin};
 #[cfg(feature = "tauri")]
 pub use new_window::on_new_window;
 pub use shell_open::{open_external, open_path};
