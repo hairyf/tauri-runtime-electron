@@ -89,11 +89,7 @@ impl Ipc {
   }
 
   pub(crate) fn notify<R: RpcRequest>(&self, request: R) -> Result<(), electron_rs::Error> {
-    self.dispatch(Notification(request), |result| {
-      if let Err(error) = result {
-        eprintln!("[electron] RPC notification failed: {error}");
-      }
-    })
+    self.dispatch(Notification(request), |_| {})
   }
 
   pub(crate) fn dispatch<R: RpcRequest>(
@@ -102,11 +98,17 @@ impl Ipc {
     callback: impl FnOnce(Result<R::Response, electron_rs::Error>) + Send + 'static,
   ) -> Result<(), electron_rs::Error> {
     let electron = Arc::clone(&self.electron);
+    let method = request.method();
+    let operation = if request.notification() { "notify" } else { "call" };
     self
       .tasks
       .try_send(Box::new(move |runtime| {
         let mut task = Box::pin(async move {
-          callback(electron.call(request).await);
+          let result = electron.call(request).await;
+          if let Err(error) = &result {
+            eprintln!("[DEBUG-pr1427] runtime operation={operation} method={method} error={error}");
+          }
+          callback(result);
         });
         // Reserve the client's writer order before accepting the next request.
         let complete = runtime.block_on(std::future::poll_fn(|cx| {
