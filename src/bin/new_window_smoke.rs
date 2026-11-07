@@ -96,7 +96,7 @@ const targets=await fetch('http://127.0.0.1:'+process.argv[1]+'/json/list',{sign
 const socket=new WebSocket(targets[0].webSocketDebuggerUrl);
 await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true})});
 socket.addEventListener('message',event=>{const result=JSON.parse(String(event.data));if(result.id===1){console.log(JSON.stringify(result.result?.result?.value??result.error));clearTimeout(timer);socket.close()}});
-socket.send(JSON.stringify({id:1,method:'Runtime.evaluate',params:{expression:`(async()=>{const {webContents}=process.getBuiltinModule('module').createRequire(process.cwd()+'/probe.cjs')('electron');return await Promise.all(webContents.getAllWebContents().map(async contents=>({id:contents.id,url:contents.getURL().split('?')[0],loading:contents.isLoadingMainFrame(),state:await Promise.race([contents.mainFrame.executeJavaScript('({ready:document.readyState,title:document.title})'),new Promise(resolve=>setTimeout(()=>resolve('native evaluation pending'),1000))])})))})()`,awaitPromise:true,returnByValue:true}}));
+socket.send(JSON.stringify({id:1,method:'Runtime.evaluate',params:{expression:`(async()=>{const {webContents}=process.getBuiltinModule('module').createRequire(process.cwd()+'/probe.cjs')('electron');return await Promise.all(webContents.getAllWebContents().slice(0,20).map(async contents=>({id:contents.id,url:contents.getURL().split(/[?#]/)[0],loading:contents.isLoadingMainFrame(),state:await Promise.race([contents.mainFrame.executeJavaScript('({ready:document.readyState,title:document.title})'),new Promise(resolve=>setTimeout(()=>resolve('native evaluation pending'),1000))])})))})()`,awaitPromise:true,returnByValue:true}}));
 "#;
   let file = std::env::temp_dir().join(format!("opener-snapshot-{}-{}.log", std::process::id(), SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
   let output = match fs::File::create(&file) { Ok(output) => output, Err(error) => { eprintln!("[opener-diagnostic] snapshot unavailable: {error}"); return; } };
@@ -124,7 +124,7 @@ fn exercise(handle: &ElectronRuntimeHandle, inspector_port: u16) {
   let other_origin = server(requests.clone());
   let (main_window, main) = create(handle, "popup-opener", &format!("{origin}/opener"), "window.openerInit = true").unwrap();
   if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expect(&main, "document.title", json!("/opener")))) {
-    eprintln!("[opener-diagnostic] fixture requests: {:?}", requests.lock().unwrap().iter().map(|(method, path, _, _)| (method, path)).collect::<Vec<_>>());
+    eprintln!("[opener-diagnostic] fixture requests: {:?}", requests.lock().unwrap().iter().take(20).map(|(method, path, _, _)| (method.as_str(), path.split(['?', '#']).next().unwrap_or(""))).collect::<Vec<_>>());
     opener_snapshot(inspector_port);
     std::panic::resume_unwind(error);
   }
