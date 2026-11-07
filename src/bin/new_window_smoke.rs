@@ -25,6 +25,11 @@ type Requests = Arc<Mutex<Vec<(String, String, HashMap<String, String>, Vec<u8>)
 const WAIT: Duration = Duration::from_secs(8);
 
 fn main() -> ExitCode {
+  let inspector = TcpListener::bind(("127.0.0.1", 0)).expect("reserve native inspector port");
+  let inspector_port = inspector.local_addr().unwrap().port();
+  drop(inspector);
+  let inherited_args = std::env::var("TAURI_RUNTIME_ELECTRON_ARGS").unwrap_or_default();
+  std::env::set_var("TAURI_RUNTIME_ELECTRON_ARGS", format!("{inherited_args} --inspect=127.0.0.1:{inspector_port}"));
   let runtime = <ElectronRuntime as Runtime<()>>::new(RuntimeInitArgs::default()).expect("start Electron");
   let handle = <ElectronRuntime as Runtime<()>>::handle(&runtime);
   thread::spawn(|| {
@@ -33,7 +38,7 @@ fn main() -> ExitCode {
     std::process::abort();
   });
   let worker = thread::spawn(move || {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exercise(&handle)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exercise(&handle, inspector_port)));
     // Closing the last native popup can finish run_return before this worker
     // sends its explicit exit request. The exercise result still controls failure.
     if let Err(error) = <ElectronRuntimeHandle as RuntimeHandle<()>>::request_exit(&handle, i32::from(result.is_err())) {
@@ -83,13 +88,46 @@ fn evidence(member: &str, assertion: &str) {
   }));
 }
 
-fn exercise(handle: &ElectronRuntimeHandle) {
+fn opener_snapshot(port: u16) {
+  use std::{fs, process::{Command, Stdio}, time::SystemTime};
+  let script = r#"
+const timer=setTimeout(()=>process.exit(2),2500);
+const targets=await fetch('http://127.0.0.1:'+process.argv[1]+'/json/list',{signal:AbortSignal.timeout(1000)}).then(response=>response.json());
+const socket=new WebSocket(targets[0].webSocketDebuggerUrl);
+await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true})});
+socket.addEventListener('message',event=>{const result=JSON.parse(String(event.data));if(result.id===1){console.log(JSON.stringify(result.result?.result?.value??result.error));clearTimeout(timer);socket.close()}});
+socket.send(JSON.stringify({id:1,method:'Runtime.evaluate',params:{expression:`(async()=>{const {webContents}=process.getBuiltinModule('module').createRequire(process.cwd()+'/probe.cjs')('electron');return await Promise.all(webContents.getAllWebContents().map(async contents=>({id:contents.id,url:contents.getURL().split('?')[0],loading:contents.isLoadingMainFrame(),state:await Promise.race([contents.mainFrame.executeJavaScript('({ready:document.readyState,title:document.title})'),new Promise(resolve=>setTimeout(()=>resolve('native evaluation pending'),1000))])})))})()`,awaitPromise:true,returnByValue:true}}));
+"#;
+  let file = std::env::temp_dir().join(format!("opener-snapshot-{}-{}.log", std::process::id(), SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
+  let output = match fs::File::create(&file) { Ok(output) => output, Err(error) => { eprintln!("[opener-diagnostic] snapshot unavailable: {error}"); return; } };
+  match Command::new("node").args(["--input-type=module", "-e", script, &port.to_string()]).stdin(Stdio::null()).stdout(Stdio::from(output)).stderr(Stdio::null()).spawn() {
+    Ok(mut child) => {
+      let deadline = Instant::now() + Duration::from_secs(3);
+      loop {
+        match child.try_wait() {
+          Ok(Some(status)) => { eprintln!("[opener-diagnostic] snapshot status={status}"); break; }
+          Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+          result => { let _ = child.kill(); let _ = child.wait(); eprintln!("[opener-diagnostic] snapshot bounded stop: {result:?}"); break; }
+        }
+      }
+      if let Ok(file) = fs::File::open(&file) { let mut text = String::new(); let _ = file.take(16_384).read_to_string(&mut text); eprintln!("[opener-diagnostic] native={text}"); }
+    }
+    Err(error) => eprintln!("[opener-diagnostic] snapshot launch failed: {error}"),
+  }
+  let _ = fs::remove_file(file);
+}
+
+fn exercise(handle: &ElectronRuntimeHandle, inspector_port: u16) {
   use serde_json::json;
   let requests: Requests = Default::default();
   let origin = server(requests.clone());
   let other_origin = server(requests.clone());
   let (main_window, main) = create(handle, "popup-opener", &format!("{origin}/opener"), "window.openerInit = true").unwrap();
-  expect(&main, "document.title", json!("/opener"));
+  if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expect(&main, "document.title", json!("/opener")))) {
+    eprintln!("[opener-diagnostic] fixture requests: {:?}", requests.lock().unwrap().iter().map(|(method, path, _, _)| (method, path)).collect::<Vec<_>>());
+    opener_snapshot(inspector_port);
+    std::panic::resume_unwind(error);
+  }
   // Default behavior is allow, not the former unconditional deny.
   assert_eq!(eval(&main, &format!("window.defaultPopup = window.open('{origin}/default'); !!defaultPopup")), true);
   expect(&main, "defaultPopup.document.title", json!("/default"));
