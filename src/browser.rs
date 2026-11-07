@@ -30,12 +30,15 @@ pub fn set_webview_trusted_origin(
 #[cfg(feature = "tauri")]
 /// Navigates to the exact target and switches trust only when its main frame commits.
 /// Cancellation before commit preserves the previous authenticated binding.
-pub fn navigate_webview_with_trusted_origin(
+/// Await outside the runtime UI thread so custom-protocol responses can be dispatched.
+pub async fn navigate_webview_with_trusted_origin(
   webview: &tauri::Webview<crate::ElectronRuntime>, origin: &str, url: &str,
 ) -> tauri::Result<()> {
   let origin = origin.to_owned();
   let url = url.to_owned();
-  route(webview, move |view| view.webview_call(electron_rs::rpc::browser::SetTrustedOriginAndNavigate { webview_id: view.id, origin, url }))
+  let (client, webview_id) = route(webview, |view| Ok((view.context.ipc.client(), view.id)))?;
+  client.call(electron_rs::rpc::browser::SetTrustedOriginAndNavigate { webview_id, origin, url })
+    .await.map_err(|error| std::io::Error::other(error.to_string()).into())
 }
 
 #[cfg(feature = "tauri")]

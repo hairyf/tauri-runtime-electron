@@ -29,6 +29,11 @@ path = "src/bin/tauri_new_window_smoke.rs"
 required-features = ["tauri"]
 
 [[bin]]
+name = "trusted_navigation_smoke"
+path = "src/bin/trusted_navigation_smoke.rs"
+required-features = ["tauri"]
+
+[[bin]]
 name = "tauri_event_smoke"
 path = "src/bin/tauri_event_smoke.rs"
 required-features = ["tauri"]

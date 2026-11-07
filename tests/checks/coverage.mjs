@@ -380,7 +380,7 @@ export function main(args = process.argv.slice(2)) {
   const artifacts = options['--evidence'] ? readArtifacts(options['--evidence']) : JSON.parse(read(SNAPSHOT))
   assert.ok(Array.isArray(artifacts) && artifacts.length, 'evidence has no result artifacts')
   // The checked-in snapshot is historical; explicit CI input never inherits it.
-  if (!options['--evidence']) requireSuites(artifacts, SUITES.filter(suite => suite.id !== 'tauri_event_smoke'))
+  if (!options['--evidence']) requireSuites(artifacts, SUITES.filter(suite => !['tauri_event_smoke', 'trusted_navigation_smoke'].includes(suite.id)))
   const evidence = aggregateEvidence(inventory, artifacts, {
     commit: options['--commit'] ?? (!options['--evidence'] ? artifacts[0].commit : undefined),
     runId: options['--run'] ?? (!options['--evidence'] ? artifacts[0].run.id : undefined),
