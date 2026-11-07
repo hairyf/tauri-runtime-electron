@@ -80,6 +80,10 @@ jobs:
         run: pnpm --dir example build && pnpm --dir example typecheck
       - name: Check
         run: cargo check --locked --all-targets --all-features
+      - name: Check macOS signer formatting
+        run: cargo fmt --manifest-path tools/macos-sign/Cargo.toml --check
+      - name: Test macOS signing entitlements
+        run: cargo test --manifest-path tools/macos-sign/Cargo.toml --locked
       # Cargo embeds electron-rs's scripts from the pinned Git dependency.
       # Rebranding replaces the distribution; restore sandbox modes before launch.
       - name: Configure the runtime Chromium sandbox runner

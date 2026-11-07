@@ -60,6 +60,10 @@ fn entitlements(existing: Option<plist::Value>, electron: bool) -> io::Result<pl
     };
     if electron {
         values.insert("com.apple.security.cs.allow-jit".into(), true.into());
+        values.insert(
+            "com.apple.security.cs.disable-library-validation".into(),
+            true.into(),
+        );
     }
     Ok(values)
 }
@@ -222,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn electron_jit_is_added_without_losing_node_or_helper_entitlements() {
+    fn electron_jit_and_native_addon_permissions_preserve_node_or_helper_entitlements() {
         let existing = plist::Value::from_reader_xml(br#"<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/><key>com.apple.security.device.audio-input</key><true/></dict></plist>"#.as_slice()).unwrap();
         let preserved = entitlements(Some(existing.clone()), false).unwrap();
         assert_eq!(preserved.len(), 2);
@@ -233,6 +237,12 @@ mod tests {
         let electron = entitlements(Some(existing), true).unwrap();
         assert_eq!(
             electron["com.apple.security.cs.allow-jit"].as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            electron
+                .get("com.apple.security.cs.disable-library-validation")
+                .and_then(plist::Value::as_boolean),
             Some(true)
         );
         assert_eq!(
