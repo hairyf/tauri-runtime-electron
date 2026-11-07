@@ -28,6 +28,17 @@ pub fn set_webview_trusted_origin(
 }
 
 #[cfg(feature = "tauri")]
+/// Navigates to the exact target and switches trust only when its main frame commits.
+/// Cancellation before commit preserves the previous authenticated binding.
+pub fn navigate_webview_with_trusted_origin(
+  webview: &tauri::Webview<crate::ElectronRuntime>, origin: &str, url: &str,
+) -> tauri::Result<()> {
+  let origin = origin.to_owned();
+  let url = url.to_owned();
+  route(webview, move |view| view.webview_call(electron_rs::rpc::browser::SetTrustedOriginAndNavigate { webview_id: view.id, origin, url }))
+}
+
+#[cfg(feature = "tauri")]
 pub fn acquire_browser_guest(
   webview: &tauri::Webview<crate::ElectronRuntime>, workspace: &str,
 ) -> tauri::Result<BrowserGuestReservation> {
