@@ -48,6 +48,7 @@ tauri-runtime = "2.12"
 tauri-utils = { version = "2.10", features = ["resources"] }
 electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "f26b5a3bf2e5ea58a6c5dc2f45baf452e051ad40" }
 http = "1"
+log = "0.4"
 cookie = "0.18"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
