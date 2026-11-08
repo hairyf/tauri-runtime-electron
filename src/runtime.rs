@@ -2017,7 +2017,7 @@ impl ElectronRuntime {
 
     self.pending_ipc.borrow_mut().clear();
     self.is_running.store(false, Ordering::Relaxed);
-    eprintln!("[electron] run loop finished, shutting the runtime down");
+    log::warn!("[electron] run loop finished, shutting the runtime down");
     // Tauri's exit cleanup still calls into the windows (hide/close), so it has
     // to run while Electron is alive; only then can the channel be torn down.
     callback(RunEvent::Exit);
