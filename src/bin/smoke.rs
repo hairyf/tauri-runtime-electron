@@ -217,7 +217,7 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
   #[cfg(not(windows))]
   let after: Option<fn(RawWindow<'_>)> = None;
   let detached = match <ElectronRuntimeHandle as RuntimeHandle<()>>::create_window(
-    &handle, pending, after,
+    handle, pending, after,
   ) {
     Ok(window) => window,
     Err(error) => {
@@ -268,7 +268,7 @@ fn run_checks(handle: &Handle, exit_rx: std::sync::mpsc::Receiver<()>) -> ExitCo
     before, &failures);
   native_access_checks(&window, &mut failures);
   new_window_rejection_checks(&window, handle, &mut failures);
-  window_checks(&window, &handle, &mut failures);
+  window_checks(&window, handle, &mut failures);
   if let Some(webview) = webview.as_ref() {
     session_checks(&window, webview, &session_a, &session_b, &mut failures);
   }

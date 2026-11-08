@@ -156,7 +156,7 @@ fn exercise(handle: &ElectronRuntimeHandle, inspector_port: u16) {
     match url.path() {
       "/deny" => NewWindowResponse::Deny,
       "/allow" => NewWindowResponse::Allow,
-      "/invalid" => NewWindowResponse::Create { window: invalid.clone() },
+      "/invalid" => NewWindowResponse::Create { window: Box::new(invalid.clone()) },
       "/incompatible-session" => {
         let result = with_opener(features.opener(), || create_with_attributes(
           &runtime_handle, "private-target", "about:blank",
@@ -181,8 +181,8 @@ fn exercise(handle: &ElectronRuntimeHandle, inspector_port: u16) {
         let response = match url.path() {
           "/unused-deny" => NewWindowResponse::Deny,
           "/unused-allow" => NewWindowResponse::Allow,
-          "/unused-invalid" => NewWindowResponse::Create { window: invalid.clone() },
-          _ => NewWindowResponse::Create { window: target.0.clone() },
+          "/unused-invalid" => NewWindowResponse::Create { window: Box::new(invalid.clone()) },
+          _ => NewWindowResponse::Create { window: Box::new(target.0.clone()) },
         };
         created.lock().unwrap().insert(url.path().into(), target);
         response
@@ -298,7 +298,7 @@ fn exercise(handle: &ElectronRuntimeHandle, inspector_port: u16) {
       &session_handle, "session-target", "about:blank",
       WebviewAttributes::new(WebviewUrl::External("about:blank".parse().unwrap())).data_directory(directory.join(".")),
     )).expect("compatible data directory must keep its native opener");
-    NewWindowResponse::Create { window: target.0 }
+    NewWindowResponse::Create { window: Box::new(target.0) }
   }).unwrap();
   assert_eq!(eval(&session_opener, &format!("window.sameSession = window.open('{origin}/same-session'); !!sameSession")), true);
   expect(&session_opener, "sameSession.document.title", json!("/same-session"));
