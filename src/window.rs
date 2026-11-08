@@ -75,9 +75,8 @@ impl EffectsTarget {
         x: None,
         y: None,
       };
-      match ipc.call(request) {
-        Ok(Some(choice)) => on_command(choice),
-        _ => {}
+      if let Ok(Some(choice)) = ipc.call(request) {
+        on_command(choice);
       }
     });
     Ok(())

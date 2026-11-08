@@ -501,7 +501,7 @@ fn builder_checks(handle: &ElectronRuntimeHandle, anchor: &Window, displays: &[M
   let builder = builder.theme(Some(Theme::Dark));
   assert_eq!(builder.get_theme(), Some(Theme::Dark));
   assert!(!builder.has_icon());
-  let builder = builder.icon(Icon { rgba: Cow::Owned(vec![220, 30, 10, 255].repeat(4)), width: 2, height: 2 }).unwrap();
+  let builder = builder.icon(Icon { rgba: Cow::Owned([220, 30, 10, 255].repeat(4)), width: 2, height: 2 }).unwrap();
   assert!(builder.has_icon());
   let themed = create(handle, builder, true);
   let themed_page = &themed.webview.as_ref().unwrap().webview.dispatcher;

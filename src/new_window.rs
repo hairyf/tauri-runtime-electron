@@ -44,7 +44,7 @@ pub enum NewWindowResponse {
   Deny,
   /// A window built using this request's [`with_opener`].
   Create {
-    window: ElectronWindowDispatcher,
+    window: Box<ElectronWindowDispatcher>,
   },
 }
 
@@ -138,7 +138,7 @@ impl NewWindowResponse {
         .with(|slot| slot.borrow().clone())
         .ok_or_else(|| create_webview_err("Electron webview route is unavailable".into()))
         .and_then(|webview| webview.context.window_for_webview(webview.id))
-        .map(|window| Self::Create { window });
+        .map(|window| Self::Create { window: Box::new(window) });
       let _ = tx.send(result);
     })?;
     rx.recv_timeout(IPC_TIMEOUT)

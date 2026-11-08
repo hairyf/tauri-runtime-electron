@@ -7,9 +7,13 @@
 pub type ElectronClient = std::sync::Arc<electron_rs::Electron>;
 
 #[cfg(feature = "tauri")]
+type ReadyClients =
+  std::collections::HashMap<usize, (std::sync::Weak<electron_rs::Electron>, std::collections::HashSet<u32>)>;
+
+#[cfg(feature = "tauri")]
 thread_local! {
   static CLIENT: std::cell::RefCell<Option<ElectronClient>> = const { std::cell::RefCell::new(None) };
-  static READY: std::cell::RefCell<std::collections::HashMap<usize, (std::sync::Weak<electron_rs::Electron>, std::collections::HashSet<u32>)>> = Default::default();
+  static READY: std::cell::RefCell<ReadyClients> = Default::default();
 }
 
 #[cfg(feature = "tauri")]
