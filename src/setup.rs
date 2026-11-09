@@ -7,11 +7,17 @@
 
 use std::{collections::HashMap, sync::{Mutex, OnceLock}};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuthenticatedSession {
+  Memory,
+  Persistent(String),
+}
+
 #[derive(Default)]
 struct Options {
   generation: u64,
   browser_host: bool,
-  authenticated_web_host_session: bool,
+  authenticated_web_host_session: Option<AuthenticatedSession>,
   authenticated_web_host: Option<String>,
   preload_scripts: Vec<String>,
 }
@@ -65,7 +71,7 @@ impl WebviewSetup {
   pub fn authenticated_web_host(self, host: &crate::AuthenticatedWebHost) -> Self {
     let mut options = options().lock().unwrap();
     if let Some(pending) = options.get_mut(&self.label).filter(|pending| pending.generation == self.generation) {
-      pending.authenticated_web_host_session = true;
+      pending.authenticated_web_host_session = Some(AuthenticatedSession::Memory);
       pending.authenticated_web_host = Some(host.id().to_owned());
     }
     self
@@ -74,7 +80,15 @@ impl WebviewSetup {
   pub fn authenticated_web_host_session(self) -> Self {
     let mut options = options().lock().unwrap();
     if let Some(pending) = options.get_mut(&self.label).filter(|pending| pending.generation == self.generation) {
-      pending.authenticated_web_host_session = true;
+      pending.authenticated_web_host_session = Some(AuthenticatedSession::Memory);
+    }
+    self
+  }
+
+  pub fn authenticated_web_host_session_key(self, key: impl Into<String>) -> Self {
+    let mut options = options().lock().unwrap();
+    if let Some(pending) = options.get_mut(&self.label).filter(|pending| pending.generation == self.generation) {
+      pending.authenticated_web_host_session = Some(AuthenticatedSession::Persistent(key.into()));
     }
     self
   }
@@ -105,8 +119,8 @@ pub(crate) fn take_authenticated_web_host(label: &str) -> Option<String> {
   options().lock().unwrap().get_mut(label)?.authenticated_web_host.take()
 }
 
-pub(crate) fn take_authenticated_web_host_session(label: &str) -> bool {
-  options().lock().unwrap().get_mut(label).is_some_and(|pending| std::mem::take(&mut pending.authenticated_web_host_session))
+pub(crate) fn take_authenticated_web_host_session(label: &str) -> Option<AuthenticatedSession> {
+  options().lock().unwrap().get_mut(label)?.authenticated_web_host_session.take()
 }
 
 pub(crate) fn take_browser_host(label: &str) -> bool {
@@ -132,6 +146,26 @@ mod tests {
     drop(setup);
     assert_eq!(take_preload_scripts("setup-crosses-threads"), None);
     assert!(!take_browser_host("setup-crosses-threads"));
+  }
+
+  #[test]
+  fn authenticated_session_key_is_consumed_once() {
+    let setup = WebviewSetup::new("setup-session-key").authenticated_web_host_session_key("profile-desktop-main");
+    assert_eq!(
+      take_authenticated_web_host_session("setup-session-key"),
+      Some(AuthenticatedSession::Persistent("profile-desktop-main".into()))
+    );
+    assert_eq!(take_authenticated_web_host_session("setup-session-key"), None);
+    drop(setup);
+    assert_eq!(take_authenticated_web_host_session("setup-session-key"), None);
+  }
+
+  #[test]
+  fn authenticated_session_setup_without_a_key_stays_in_memory() {
+    let setup = WebviewSetup::new("setup-session-memory").authenticated_web_host_session();
+    assert_eq!(take_authenticated_web_host_session("setup-session-memory"), Some(AuthenticatedSession::Memory));
+    assert_eq!(take_authenticated_web_host_session("setup-session-memory"), None);
+    drop(setup);
   }
 
   #[test]
