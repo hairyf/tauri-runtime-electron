@@ -2576,6 +2576,14 @@ fn window_create_payload(
   })
 }
 
+fn authenticated_web_host_session(label: &str) -> serde_json::Value {
+  match crate::setup::take_authenticated_web_host_session(label) {
+    Some(crate::setup::AuthenticatedSession::Memory) => json!(true),
+    Some(crate::setup::AuthenticatedSession::Persistent(key)) => json!(key),
+    None => json!(false),
+  }
+}
+
 /// Main pages and native children use exactly the same webview preferences.
 fn webview_create_payload<T: UserEvent>(
   pending: &PendingWebview<T, ElectronRuntime>,
@@ -2614,7 +2622,7 @@ fn webview_create_payload<T: UserEvent>(
     policy: Some(policy),
     additional: std::collections::BTreeMap::from([
       ("browserHost".into(), json!(crate::setup::take_browser_host(&pending.label))),
-      ("authenticatedWebHostSession".into(), json!(crate::setup::take_authenticated_web_host_session(&pending.label))),
+      ("authenticatedWebHostSession".into(), authenticated_web_host_session(&pending.label)),
       ("authenticatedWebHost".into(), json!(crate::setup::take_authenticated_web_host(&pending.label))),
       ("dragDropEnabled".into(), json!(attributes.drag_drop_handler_enabled)),
       ("zoomHotkeysEnabled".into(), json!(attributes.zoom_hotkeys_enabled)),
@@ -3067,6 +3075,35 @@ mod tests {
       payload.get("preloadScripts").is_none(),
       "a webview without setup options sends no preload sources"
     );
+  }
+
+  #[test]
+  fn authenticated_session_key_reaches_the_creation_payload_once() {
+    let setup = crate::setup::WebviewSetup::new("setup-session-payload")
+      .authenticated_web_host_session_key("profile-desktop-main");
+    let attributes =
+      tauri_runtime::webview::WebviewAttributes::new(tauri_utils::config::WebviewUrl::default());
+    let pending = PendingWebview::<(), ElectronRuntime>::new(attributes, "setup-session-payload").unwrap();
+    let payload = serde_json::to_value(webview_create_payload(
+      &pending,
+      11,
+      "http://127.0.0.1:3080",
+      rpc::webview::Policy::default(),
+    ))
+    .unwrap();
+    assert_eq!(payload["authenticatedWebHostSession"], "profile-desktop-main");
+    let repeated = serde_json::to_value(webview_create_payload(
+      &pending,
+      12,
+      "http://127.0.0.1:3080",
+      rpc::webview::Policy::default(),
+    ))
+    .unwrap();
+    assert_eq!(
+      repeated["authenticatedWebHostSession"], false,
+      "the session key is consumed once and never leaks into a later webview"
+    );
+    drop(setup);
   }
 
   #[test]
