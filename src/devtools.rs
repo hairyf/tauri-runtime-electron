@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// First identifier of the range reserved for the runtime's own requests.
 ///
@@ -14,11 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The bound is the reference's, and it is kept: it holds every caller-visible
 /// identifier inside the positive 32-bit range the DevTools agent accepts, which
 /// is what a caller forwarding one over `--remote-debugging-port` needs, while
-/// the reserved range above it is free to run to the top of `u64`.
-const RESERVED_RANGE_START: u64 = 1_000_000_000;
+/// the reserved range above it is free to run to the top of `i32`.
+const RESERVED_RANGE_START: i32 = 1_000_000_000;
 
-static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_RESERVED_MESSAGE_ID: AtomicU64 = AtomicU64::new(RESERVED_RANGE_START);
+static NEXT_MESSAGE_ID: AtomicI32 = AtomicI32::new(1);
+static NEXT_RESERVED_MESSAGE_ID: AtomicI32 = AtomicI32::new(RESERVED_RANGE_START);
 
 /// The process-local native DevTools request identifier space is exhausted.
 #[derive(Clone, Copy, Debug)]
@@ -49,7 +49,7 @@ impl std::error::Error for DevToolsMessageIdExhausted {}
 ///
 /// IDs are positive and never reused, including after cancellation or browser
 /// teardown. Numeric correlation does not authorize a browser or document.
-pub fn allocate_devtools_message_id() -> Result<u64, DevToolsMessageIdExhausted> {
+pub fn allocate_devtools_message_id() -> Result<i32, DevToolsMessageIdExhausted> {
   allocate_from(&NEXT_MESSAGE_ID, RESERVED_RANGE_START - 1)
 }
 
@@ -64,14 +64,14 @@ pub fn allocate_devtools_message_id() -> Result<u64, DevToolsMessageIdExhausted>
 /// consumer has to share this runtime's attachment rather than open its own. The range stays
 /// reserved so the two halves cannot drift into each other if that lease is ever exposed.
 #[allow(dead_code)]
-pub(crate) fn allocate_runtime_devtools_message_id() -> Result<u64, DevToolsMessageIdExhausted> {
-  allocate_from(&NEXT_RESERVED_MESSAGE_ID, u64::MAX)
+pub(crate) fn allocate_runtime_devtools_message_id() -> Result<i32, DevToolsMessageIdExhausted> {
+  allocate_from(&NEXT_RESERVED_MESSAGE_ID, i32::MAX)
 }
 
 /// Allocates the next identifier of `counter`, which hands out values up to
 /// `last`. Each range fails closed at its own boundary instead of wrapping or
 /// growing into the other one.
-fn allocate_from(counter: &AtomicU64, last: u64) -> Result<u64, DevToolsMessageIdExhausted> {
+fn allocate_from(counter: &AtomicI32, last: i32) -> Result<i32, DevToolsMessageIdExhausted> {
   counter
     .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
       if value > last {
@@ -126,7 +126,7 @@ mod tests {
   #[test]
   fn caller_exhaustion_cannot_reach_the_reserved_range() {
     let last = RESERVED_RANGE_START - 1;
-    let counter = AtomicU64::new(last);
+    let counter = AtomicI32::new(last);
     assert_eq!(allocate_from(&counter, last).unwrap(), last);
     assert!(allocate_from(&counter, last).is_err());
     assert!(allocate_from(&counter, last).is_err());
@@ -135,10 +135,10 @@ mod tests {
 
   #[test]
   fn exhaustion_cannot_reuse_a_late_response_id() {
-    let counter = AtomicU64::new(u64::MAX - 1);
-    assert_eq!(allocate_from(&counter, u64::MAX).unwrap(), u64::MAX - 1);
-    assert!(allocate_from(&counter, u64::MAX).is_err());
-    assert!(allocate_from(&counter, u64::MAX).is_err());
-    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    let counter = AtomicI32::new(i32::MAX - 1);
+    assert_eq!(allocate_from(&counter, i32::MAX).unwrap(), i32::MAX - 1);
+    assert!(allocate_from(&counter, i32::MAX).is_err());
+    assert!(allocate_from(&counter, i32::MAX).is_err());
+    assert_eq!(counter.load(Ordering::Relaxed), i32::MAX);
   }
 }

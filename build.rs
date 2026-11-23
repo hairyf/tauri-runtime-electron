@@ -56,7 +56,10 @@ fn prepare() -> Result<(), String> {
     if let Some(icon) = &app.icon {
       println!("cargo:rerun-if-changed={}", icon.display());
     }
-    println!("cargo:rustc-env=ELECTRON_RS_TAURI_PRODUCT_NAME={}", app.name);
+    println!(
+      "cargo:rustc-env=ELECTRON_RS_TAURI_PRODUCT_NAME={}",
+      app.name
+    );
     if let Some(identifier) = &app.identifier {
       println!("cargo:rustc-env=ELECTRON_RS_TAURI_IDENTIFIER={identifier}");
     }

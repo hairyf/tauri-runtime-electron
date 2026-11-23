@@ -137,7 +137,7 @@ pub(crate) struct TauriElectronBrowserClient<T: UserEvent> {
 impl<T: UserEvent> TauriElectronBrowserClient<T> {
   /// The native browser identity reported in frame events.
   pub(crate) fn browser_id(&self) -> i32 {
-    self.contents_id.unwrap_or_else(|| self.webview_id as i32)
+    self.contents_id.unwrap_or(self.webview_id as i32)
   }
 }
 

@@ -498,6 +498,9 @@ impl Default for BoundsRate {
 /// `TauriCefBrowserClientHandlers`.
 ///
 /// The reference hands these to `TauriCefBrowserClient` when it builds the client.
+/// The IPC handler Tauri registers, after the webview id is bound to it.
+pub(crate) type IpcHandler = dyn Fn(u32, http::Request<String>) + Send + Sync;
+
 /// Here they are parked in the live webview state, and
 /// `electron_impl::client::with_client` borrows them for the duration of one event
 /// — which is exactly the lifetime a CEF callback has. `ipc_handler` is the one
@@ -505,7 +508,7 @@ impl Default for BoundsRate {
 /// cannot build, so `webview.rs` wraps it into a closure over the webview id.
 pub(crate) struct WebviewHandlers<T: UserEvent> {
   pub(crate) frame_event_handler: Option<Arc<crate::FrameEventHandler>>,
-  pub(crate) ipc_handler: Option<Arc<dyn Fn(u32, http::Request<String>) + Send + Sync>>,
+  pub(crate) ipc_handler: Option<Arc<IpcHandler>>,
   pub(crate) on_page_load_handler: Option<Box<OnPageLoadHandler>>,
   pub(crate) document_title_changed_handler: Option<Box<DocumentTitleChangedHandler>>,
   pub(crate) navigation_handler: Option<Box<NavigationHandler>>,
@@ -580,11 +583,7 @@ impl AppWebview {
   /// `BrowserHost`; Electron reports it through `webview.url`, so the committing
   /// navigation records it here and this answers without a round trip.
   pub fn url(&self) -> String {
-    self
-      .url
-      .lock()
-      .map(|url| url.clone())
-      .unwrap_or_default()
+    self.url.lock().map(|url| url.clone()).unwrap_or_default()
   }
 
   /// The application's callbacks, when they are of this application's event type.
@@ -740,11 +739,7 @@ fn put_webview(child: AppWebview) {
 
 /// Runs `f` with the live state of one webview.
 pub(crate) fn with_app_webview<R>(webview_id: u32, f: impl FnOnce(&AppWebview) -> R) -> Option<R> {
-  webviews()
-    .lock()
-    .ok()?
-    .get(&webview_id)
-    .map(f)
+  webviews().lock().ok()?.get(&webview_id).map(f)
 }
 
 /// The ids of every webview hosted by one window.
@@ -829,7 +824,10 @@ fn window_number(window_id: WindowId) -> Result<u32> {
 /// The bridge's own request types are the wire contract, so call sites name them
 /// instead of hand-building JSON; the transport stays the runtime's synchronous
 /// IPC.
-fn call<T: UserEvent, R: RpcRequest>(context: &RuntimeContext<T>, request: R) -> Result<R::Response> {
+fn call<T: UserEvent, R: RpcRequest>(
+  context: &RuntimeContext<T>,
+  request: R,
+) -> Result<R::Response> {
   let params =
     serde_json::to_value(&request).map_err(|error| create_webview_err(error.to_string()))?;
   let value = context
@@ -920,10 +918,10 @@ fn parse_cookies(cookies: &[rpc::webview::Cookie]) -> Vec<Cookie<'static>> {
       let mut builder = Cookie::build((cookie.name.clone(), cookie.value.clone()))
         .path(cookie.path.clone().unwrap_or_else(|| "/".into()));
       // Host-only cookies must remain host-only when set again.
-      if !cookie.host_only.unwrap_or(false) {
-        if let Some(domain) = &cookie.domain {
-          builder = builder.domain(domain.clone());
-        }
+      if !cookie.host_only.unwrap_or(false)
+        && let Some(domain) = &cookie.domain
+      {
+        builder = builder.domain(domain.clone());
       }
       builder = builder
         .secure(cookie.secure.unwrap_or(false))
@@ -931,8 +929,8 @@ fn parse_cookies(cookies: &[rpc::webview::Cookie]) -> Vec<Cookie<'static>> {
       if let Some(same_site) = same_site(cookie.same_site) {
         builder = builder.same_site(same_site);
       }
-      if !cookie.session {
-        if let Some(date) = cookie
+      if !cookie.session
+        && let Some(date) = cookie
           .expiration_date
           .filter(|date| date.is_finite())
           .and_then(|date| {
@@ -941,9 +939,8 @@ fn parse_cookies(cookies: &[rpc::webview::Cookie]) -> Vec<Cookie<'static>> {
             )
             .ok()
           })
-        {
-          builder = builder.expires(date);
-        }
+      {
+        builder = builder.expires(date);
       }
       builder.build()
     })
@@ -1078,7 +1075,9 @@ fn build_and_attach_webview<T: UserEvent>(
   }
 
   let frame_navigation_state = crate::FrameNavigationState::new();
-  let popup_family = Arc::new(crate::popup::PopupFamily::new(frame_navigation_state.clone()));
+  let popup_family = Arc::new(crate::popup::PopupFamily::new(
+    frame_navigation_state.clone(),
+  ));
   let dialogs = crate::dialog::DialogState::new(frame_navigation_state.clone());
   // The URL the document is created with is the first one `url()` reports; later
   // commits replace it.
@@ -1273,12 +1272,7 @@ pub(crate) fn handle_webview_message<T: UserEvent>(
       let Some(child) = take_webview(webview_id) else {
         return;
       };
-      match call(
-        context,
-        rpc::webview::Close {
-          webview_id,
-        },
-      ) {
+      match call(context, rpc::webview::Close { webview_id }) {
         Ok(()) => {
           forget_webview(webview_id);
         }
@@ -1509,70 +1503,35 @@ fn handle_window_independent_webview_message<T: UserEvent>(
     }
     WebviewMessage::Reload => log_call(
       child,
-      call(
-        context,
-        rpc::webview::Reload {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::Reload { webview_id }),
       "reload",
     ),
     WebviewMessage::GoBack => log_call(
       child,
-      call(
-        context,
-        rpc::webview::GoBack {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::GoBack { webview_id }),
       "go back",
     ),
     WebviewMessage::CanGoBack(tx) => {
-      let _ = tx.send(call(
-        context,
-        rpc::webview::CanGoBack {
-          webview_id,
-        },
-      ));
+      let _ = tx.send(call(context, rpc::webview::CanGoBack { webview_id }));
     }
     WebviewMessage::GoForward => log_call(
       child,
-      call(
-        context,
-        rpc::webview::GoForward {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::GoForward { webview_id }),
       "go forward",
     ),
     WebviewMessage::CanGoForward(tx) => {
-      let _ = tx.send(call(
-        context,
-        rpc::webview::CanGoForward {
-          webview_id,
-        },
-      ));
+      let _ = tx.send(call(context, rpc::webview::CanGoForward { webview_id }));
     }
     WebviewMessage::Close => {
       unreachable!("`Close` is handled before the webview is taken out of the registry")
     }
     WebviewMessage::SetFocus => log_call(
       child,
-      call(
-        context,
-        rpc::webview::Focus {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::Focus { webview_id }),
       "focus",
     ),
     WebviewMessage::Url(tx) => {
-      let _ = tx.send(call(
-        context,
-        rpc::webview::Url {
-          webview_id,
-        },
-      ));
+      let _ = tx.send(call(context, rpc::webview::Url { webview_id }));
     }
     WebviewMessage::Bounds(tx) => {
       let _ = tx.send(child.bounds(context));
@@ -1582,12 +1541,7 @@ fn handle_window_independent_webview_message<T: UserEvent>(
     }
     WebviewMessage::Print => log_call(
       child,
-      call(
-        context,
-        rpc::webview::Print {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::Print { webview_id }),
       "print",
     ),
     WebviewMessage::Show => child.set_visible(context, true),
@@ -1620,12 +1574,7 @@ fn handle_window_independent_webview_message<T: UserEvent>(
     ),
     WebviewMessage::ClearAllBrowsingData => log_call(
       child,
-      call(
-        context,
-        rpc::webview::ClearBrowsingData {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::ClearBrowsingData { webview_id }),
       "clear browsing data",
     ),
     WebviewMessage::CookiesForUrl(url, tx) => {
@@ -1713,12 +1662,7 @@ fn handle_window_independent_webview_message<T: UserEvent>(
       if child.devtools_enabled {
         log_call(
           child,
-          call(
-            context,
-            rpc::webview::OpenDevtools {
-              webview_id,
-            },
-          ),
+          call(context, rpc::webview::OpenDevtools { webview_id }),
           "open devtools",
         );
       } else {
@@ -1732,25 +1676,12 @@ fn handle_window_independent_webview_message<T: UserEvent>(
     #[cfg(any(debug_assertions, feature = "devtools"))]
     WebviewMessage::CloseDevTools => log_call(
       child,
-      call(
-        context,
-        rpc::webview::CloseDevtools {
-          webview_id,
-        },
-      ),
+      call(context, rpc::webview::CloseDevtools { webview_id }),
       "close devtools",
     ),
     #[cfg(any(debug_assertions, feature = "devtools"))]
     WebviewMessage::IsDevToolsOpen(tx) => {
-      let _ = tx.send(
-        call(
-          context,
-          rpc::webview::IsDevtoolsOpen {
-            webview_id,
-          },
-        )
-        .unwrap_or(false),
-      );
+      let _ = tx.send(call(context, rpc::webview::IsDevtoolsOpen { webview_id }).unwrap_or(false));
     }
     WebviewMessage::SendDevToolsMessage(_, tx) => {
       // The bridge exposes no CDP session: `webContents.debugger` needs
@@ -1980,7 +1911,9 @@ impl ElectronInitScript {
   }
 }
 
-pub(crate) fn initialization_scripts(attrs: &mut WebviewAttributes) -> Arc<Vec<ElectronInitScript>> {
+pub(crate) fn initialization_scripts(
+  attrs: &mut WebviewAttributes,
+) -> Arc<Vec<ElectronInitScript>> {
   let mut initialization_scripts = Vec::new();
 
   if attrs.drag_drop_handler_enabled {
@@ -2175,10 +2108,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher<T> {
   }
 
   fn go_forward(&self) -> Result<()> {
-    self.context.send_message(Message::Webview(
-      self.webview_id,
-      WebviewMessage::GoForward,
-    ))
+    self
+      .context
+      .send_message(Message::Webview(self.webview_id, WebviewMessage::GoForward))
   }
 
   fn can_go_forward(&self) -> Result<bool> {
@@ -2219,10 +2151,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher<T> {
   }
 
   fn set_focus(&self) -> Result<()> {
-    self.context.send_message(Message::Webview(
-      self.webview_id,
-      WebviewMessage::SetFocus,
-    ))
+    self
+      .context
+      .send_message(Message::Webview(self.webview_id, WebviewMessage::SetFocus))
   }
 
   fn hide(&self) -> Result<()> {
@@ -2448,17 +2379,23 @@ mod tests {
         ChromeCommandGroup::History,
       ]
     );
-    assert!(ElectronWebviewAttributes::default()
-      .allowed_chrome_commands
-      .is_empty());
+    assert!(
+      ElectronWebviewAttributes::default()
+        .allowed_chrome_commands
+        .is_empty()
+    );
   }
 
   #[test]
   fn an_unset_bounds_rate_fills_the_window_and_auto_resize_scales_it() {
     let parent = PhysicalSize::new(800, 600);
     assert_eq!(
-      compute_child_bounds_rate(None, false, parent, 1.0)
-        .map(|rate| (rate.x, rate.y, rate.width, rate.height)),
+      compute_child_bounds_rate(None, false, parent, 1.0).map(|rate| (
+        rate.x,
+        rate.y,
+        rate.width,
+        rate.height
+      )),
       Some((0., 0., 1., 1.))
     );
     let bounds = Rect {

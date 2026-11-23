@@ -556,7 +556,7 @@ fn icon_payload(icon: &Icon<'_>) -> Value {
 fn creation_icon(icon: Option<&Icon<'static>>) -> Option<Value> {
   let icon = icon?;
   let mut bgra = Vec::with_capacity(icon.rgba.len());
-  for pixel in icon.rgba.chunks_exact(4) {
+  for pixel in icon.rgba.as_chunks::<4>().0 {
     bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
   }
   Some(json!({

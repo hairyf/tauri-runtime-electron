@@ -522,10 +522,8 @@ impl Electron {
   #[must_use]
   pub fn on_window_event<F>(mut self, handler: F) -> Self
   where
-    F: Fn(&str, &dyn NativeEventLoop, Arc<NativeWindow>, &NativeWindowEvent)
-      + Send
-      + Sync
-      + 'static,
+    F:
+      Fn(&str, &dyn NativeEventLoop, Arc<NativeWindow>, &NativeWindowEvent) + Send + Sync + 'static,
   {
     self.window_event_handler = Some(Arc::new(handler));
     self
@@ -708,10 +706,7 @@ impl Electron {
 
   /// Adds to `--enable-features`, merged with anything already configured.
   #[must_use]
-  pub fn enable_features<S: Into<String>>(
-    mut self,
-    features: impl IntoIterator<Item = S>,
-  ) -> Self {
+  pub fn enable_features<S: Into<String>>(mut self, features: impl IntoIterator<Item = S>) -> Self {
     self
       .enabled_features
       .extend(features.into_iter().map(Into::into));
@@ -902,16 +897,16 @@ impl Electron {
     // A packaged app keeps the distribution beside its executable, or under
     // `resources/`. The bundler copies it to `resources/electron`, which on macOS
     // is `Contents/Resources/electron` — one level up from `Contents/MacOS`.
-    if let Ok(executable) = std::env::current_exe() {
-      if let Some(dir) = executable.parent() {
-        for candidate in [
-          dir.join("electron"),
-          dir.join("resources").join("electron"),
-          dir.join("..").join("Resources").join("electron"),
-        ] {
-          if let Ok(binary) = electron_rs::electron_binary(&candidate) {
-            return binary;
-          }
+    if let Ok(executable) = std::env::current_exe()
+      && let Some(dir) = executable.parent()
+    {
+      for candidate in [
+        dir.join("electron"),
+        dir.join("resources").join("electron"),
+        dir.join("..").join("Resources").join("electron"),
+      ] {
+        if let Ok(binary) = electron_rs::electron_binary(&candidate) {
+          return binary;
         }
       }
     }
@@ -1045,13 +1040,16 @@ impl<T: UserEvent> RuntimeContext<T> {
 
   pub(crate) fn send_message(&self, message: Message<T>) -> Result<()> {
     // Tasks run inline on the main thread; everything else goes to the loop.
-    if std::thread::current().id() == self.main_thread_id {
-      if let Message::Task(task) = message {
-        task();
-        return Ok(());
-      }
+    if std::thread::current().id() == self.main_thread_id
+      && let Message::Task(task) = message
+    {
+      task();
+      return Ok(());
     }
-    self.run_tx.send(message).map_err(|_| Error::FailedToSendMessage)
+    self
+      .run_tx
+      .send(message)
+      .map_err(|_| Error::FailedToSendMessage)
   }
 
   pub(crate) fn next_window_id(&self) -> WindowId {
@@ -1253,8 +1251,7 @@ impl<T: UserEvent> tauri_runtime::RuntimeInitAttrs<T> for Electron {
     else {
       return Ok(());
     };
-    let links: DesktopDeepLinks =
-      serde_json::from_value(value.clone()).map_err(Error::Json)?;
+    let links: DesktopDeepLinks = serde_json::from_value(value.clone()).map_err(Error::Json)?;
     let protocols = match links {
       DesktopDeepLinks::One(protocol) => vec![protocol],
       DesktopDeepLinks::Many(protocols) => protocols,
@@ -1287,7 +1284,8 @@ impl<T: UserEvent> Clone for ElectronRuntimeHandle<T> {
 
 impl<T: UserEvent> fmt::Debug for ElectronRuntimeHandle<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("ElectronRuntimeHandle").finish_non_exhaustive()
+    f.debug_struct("ElectronRuntimeHandle")
+      .finish_non_exhaustive()
   }
 }
 
@@ -1301,7 +1299,10 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle<T> {
   }
 
   #[cfg(target_os = "macos")]
-  fn set_activation_policy(&self, activation_policy: tauri_runtime::ActivationPolicy) -> Result<()> {
+  fn set_activation_policy(
+    &self,
+    activation_policy: tauri_runtime::ActivationPolicy,
+  ) -> Result<()> {
     let policy = match activation_policy {
       tauri_runtime::ActivationPolicy::Regular => "regular",
       tauri_runtime::ActivationPolicy::Accessory => "accessory",
@@ -1311,7 +1312,11 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle<T> {
     self
       .context
       .ipc
-      .call("app.activationPolicy", serde_json::json!({ "policy": policy }), IPC_TIMEOUT)
+      .call(
+        "app.activationPolicy",
+        serde_json::json!({ "policy": policy }),
+        IPC_TIMEOUT,
+      )
       .map(|_| ())
       .map_err(create_window_err)
   }
@@ -1321,7 +1326,11 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle<T> {
     self
       .context
       .ipc
-      .call("app.dockVisibility", serde_json::json!({ "visible": visible }), IPC_TIMEOUT)
+      .call(
+        "app.dockVisibility",
+        serde_json::json!({ "visible": visible }),
+        IPC_TIMEOUT,
+      )
       .map(|_| ())
       .map_err(create_window_err)
   }
@@ -1350,7 +1359,9 @@ impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle<T> {
     self.context.send_message(Message::Task(Box::new(f)))
   }
 
-  fn display_handle(&self) -> std::result::Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
+  fn display_handle(
+    &self,
+  ) -> std::result::Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
     // Electron owns the display server connection, so the runtime has no handle of
     // its own to lend. `SendRawDisplayHandle` keeps the type honest without
     // pretending a foreign-process connection is ours.
@@ -1487,7 +1498,11 @@ fn apply_app_theme<T: UserEvent>(context: &RuntimeContext<T>, theme: Option<Them
   };
   context
     .ipc
-    .call("app.theme", serde_json::json!({ "theme": name }), IPC_TIMEOUT)
+    .call(
+      "app.theme",
+      serde_json::json!({ "theme": name }),
+      IPC_TIMEOUT,
+    )
     .map(|_| ())
     .map_err(create_window_err)?;
   *context
@@ -1584,9 +1599,7 @@ impl<T: UserEvent> ElectronRuntime<T> {
     }
     if let Some(product) = &attrs.user_agent_product {
       if attrs.user_agent.is_some() {
-        log::warn!(
-          "[electron] user_agent_product is ignored because a whole user_agent was set"
-        );
+        log::warn!("[electron] user_agent_product is ignored because a whole user_agent was set");
       } else {
         push_switch(&mut args, "user-agent-product", Some(product));
       }
@@ -1597,7 +1610,11 @@ impl<T: UserEvent> ElectronRuntime<T> {
     if !attrs.allow_chromium_command_line_args && !is_dev {
       // Release builds refuse Chromium switches from the process command line,
       // unless the application asked for them.
-      push_switch(&mut args, "disable-features", Some("AllowCommandLineSwitchesFromProcess"));
+      push_switch(
+        &mut args,
+        "disable-features",
+        Some("AllowCommandLineSwitchesFromProcess"),
+      );
     }
     match &attrs.remote_debugging {
       RemoteDebugging::Disabled => {}
@@ -1612,7 +1629,11 @@ impl<T: UserEvent> ElectronRuntime<T> {
         } else {
           push_switch(&mut args, "remote-debugging-port", Some(&port.to_string()));
           if !allowed_origins.is_empty() {
-            push_switch(&mut args, "remote-allow-origins", Some(&allowed_origins.join(",")));
+            push_switch(
+              &mut args,
+              "remote-allow-origins",
+              Some(&allowed_origins.join(",")),
+            );
           }
         }
       }
@@ -1621,10 +1642,10 @@ impl<T: UserEvent> ElectronRuntime<T> {
     if let Some(value) = secret_storage_switch(attrs.secret_storage, is_dev) {
       push_switch(&mut args, value.0, Some(value.1));
     }
-    if let Some(decision) = crate::sandbox::resolve_sandbox_decision(attrs.sandbox) {
-      if decision.no_sandbox {
-        push_switch(&mut args, "no-sandbox", None);
-      }
+    if let Some(decision) = crate::sandbox::resolve_sandbox_decision(attrs.sandbox)
+      && decision.no_sandbox
+    {
+      push_switch(&mut args, "no-sandbox", None);
     }
     // Merged feature switches, so a caller's own `--disable-features` is not lost.
     let disabled = attrs.disabled_features.clone();
@@ -1647,14 +1668,17 @@ impl<T: UserEvent> ElectronRuntime<T> {
         .unwrap_or_else(|| "tauri-runtime-electron".to_owned());
       root.join(identifier).join("electron")
     });
-    create_dir_all(&cache_path).map_err(|error| {
-      create_window_err(format!("create {}: {error}", cache_path.display()))
-    })?;
+    create_dir_all(&cache_path)
+      .map_err(|error| create_window_err(format!("create {}: {error}", cache_path.display())))?;
     crate::downgrade::prepare_root_cache_path(&cache_path, attrs.downgrade)
       .map_err(create_window_err)?;
     // The breadcrumb is only meaningful if Electron really uses this directory as
     // its profile, so the path has to reach Chromium as well.
-    push_switch(&mut args, "user-data-dir", Some(&cache_path.display().to_string()));
+    push_switch(
+      &mut args,
+      "user-data-dir",
+      Some(&cache_path.display().to_string()),
+    );
 
     let mut settings = ElectronSettings {
       cache_path: Some(cache_path),
@@ -1697,7 +1721,11 @@ impl<T: UserEvent> ElectronRuntime<T> {
     if let Some(identifier) = &attrs.identifier {
       push_switch(&mut args, "tauri-identifier", Some(identifier.as_str()));
     }
-    push_switch(&mut args, API_VERSION_SWITCH, Some(ELECTRON_API_VERSION_LAST));
+    push_switch(
+      &mut args,
+      API_VERSION_SWITCH,
+      Some(ELECTRON_API_VERSION_LAST),
+    );
 
     let (ipc, events) = Ipc::launch(
       &binary,
@@ -1782,11 +1810,8 @@ impl<T: UserEvent> ElectronRuntime<T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
       let mut batch = Vec::new();
-      loop {
-        match receiver.try_recv() {
-          Ok(event) => batch.push(event),
-          Err(_) => break,
-        }
+      while let Ok(event) = receiver.try_recv() {
+        batch.push(event);
       }
       batch
     };
@@ -1824,7 +1849,9 @@ impl<T: UserEvent> ElectronRuntime<T> {
           self.is_running.store(false, Ordering::Relaxed);
         }
       }
-      Message::Window(id, message) => crate::window::handle_window_message(&self.context, id, message),
+      Message::Window(id, message) => {
+        crate::window::handle_window_message(&self.context, id, message)
+      }
       Message::Webview(id, message) => {
         crate::webview::handle_webview_message(&self.context, id, message)
       }
@@ -1868,7 +1895,10 @@ fn push_switch(args: &mut Vec<String>, key: &str, value: Option<&str>) {
 ///
 /// Windows is untouched: DPAPI is always the key, and Chromium has no switch that
 /// would replace it.
-fn secret_storage_switch(storage: SecretStorage, is_dev: bool) -> Option<(&'static str, &'static str)> {
+fn secret_storage_switch(
+  storage: SecretStorage,
+  is_dev: bool,
+) -> Option<(&'static str, &'static str)> {
   let mock = match storage {
     SecretStorage::Auto => is_dev,
     SecretStorage::Mock => true,

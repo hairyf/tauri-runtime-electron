@@ -4,6 +4,11 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::too_many_arguments)]
+// The module tree mirrors `tauri-runtime-cef` item for item, so it keeps the
+// reference's full surface even where this runtime reaches a mechanism over RPC
+// instead of calling it in-process, and even where a platform's code cannot be
+// compiled here. Removing an item to silence a warning would break the mirror.
+#![allow(dead_code)]
 
 mod devtools;
 mod dialog;
@@ -23,7 +28,9 @@ mod frame_navigation;
 mod locale;
 mod macros;
 mod offscreen;
-pub use offscreen::{CursorHandler, CursorInfo, CursorType, Offscreen, OffscreenView, RenderHandler};
+pub use offscreen::{
+  CursorHandler, CursorInfo, CursorType, Offscreen, OffscreenView, RenderHandler,
+};
 mod platform;
 mod popup;
 mod runtime;
@@ -39,18 +46,18 @@ mod webview;
 pub use devtools::{DevToolsMessageIdExhausted, allocate_devtools_message_id};
 pub use frame::{FrameEvent, FrameEventHandler, FrameEventKind};
 pub use frame_navigation::{FrameNavigationState, NativeDocumentToken};
+/// The Electron main process bridge: process ownership, the event stream and RPC.
+mod electron_impl;
 mod window;
 mod window_builder;
 mod window_handle;
-/// The Electron main process bridge: process ownership, the event stream and RPC.
-mod electron_impl;
 
+/// Marks the application entry point so Electron helper processes are handled.
+pub use macros::electron_entry_point;
 #[cfg(target_os = "macos")]
 pub use platform::macos::setup_application as prepare_macos_application;
 pub use runtime::*;
 pub use tauri_ext::*;
-/// Marks the application entry point so Electron helper processes are handled.
-pub use macros::electron_entry_point;
 pub use webview::*;
 pub use window::{ElectronWindowDispatcher, NativeWindowToken};
 pub use window_builder::WindowBuilderWrapper;

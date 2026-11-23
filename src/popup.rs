@@ -186,24 +186,21 @@ impl PopupFamily {
     if root_closed {
       self.closing.store(true, Ordering::Release);
     }
-    let descendants = {
-      let Ok(mut popups) = self.popups.lock() else {
-        return Vec::new();
-      };
-      popups.retain(|popup| !popup.state.is_same_browser(state));
-      revoke_descendants(
-        state,
-        root_closed,
-        popups
-          .iter()
-          .enumerate()
-          .map(|(index, popup)| (index, &popup.state, &popup.opener, &popup.closing)),
-      )
-      .into_iter()
-      .map(|index| popups[index].browser_id)
-      .collect::<Vec<_>>()
+    let Ok(mut popups) = self.popups.lock() else {
+      return Vec::new();
     };
-    descendants
+    popups.retain(|popup| !popup.state.is_same_browser(state));
+    revoke_descendants(
+      state,
+      root_closed,
+      popups
+        .iter()
+        .enumerate()
+        .map(|(index, popup)| (index, &popup.state, &popup.opener, &popup.closing)),
+    )
+    .into_iter()
+    .map(|index| popups[index].browser_id)
+    .collect()
   }
 
   /// Window close and app shutdown own the whole family, so teardown never

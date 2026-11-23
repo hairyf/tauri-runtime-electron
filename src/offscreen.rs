@@ -68,13 +68,16 @@ pub type CursorHandler = dyn Fn(CursorType, Option<&CursorInfo>) + Send + Sync;
 
 /// One webview's paint target.
 ///
+/// The callback one offscreen paint feeds: the view, its BGRA pixels, and their size.
+type PaintCallback = dyn Fn(&OffscreenView, &[u8], u32, u32) + Send + Sync;
+
 /// The reference hands CEF a `RenderHandler` per webview. Electron's offscreen
 /// mode is a `webPreferences.offscreen` flag on an ordinary `webContents`, whose
 /// frames arrive as `paint` events, so the mirror keeps the per-webview factory
 /// and names the callback those events would feed.
 #[derive(Clone)]
 pub struct RenderHandler {
-  paint: Arc<dyn Fn(&OffscreenView, &[u8], u32, u32) + Send + Sync>,
+  paint: Arc<PaintCallback>,
 }
 
 impl RenderHandler {
