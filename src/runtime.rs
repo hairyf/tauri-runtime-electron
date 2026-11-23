@@ -2,44 +2,1213 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use crate::{
-  electron_impl::ipc::Ipc, environment, environment::DebugEnvironment, locale, platform, switches,
-  webview::ElectronWebviewDispatcher, window::ElectronWindowDispatcher,
-  window_handle::ElectronRuntimeHandle,
-};
-use serde_json::{json, Value};
-use tauri_runtime::{
-  DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
-  RuntimeInitArgs, RuntimeInitAttrs, UserEvent, WindowEventId,
-  dpi::{PhysicalPosition, PhysicalSize, Position, Size},
-  monitor::Monitor,
-  webview::{
-    DetachedWebview, DownloadEvent, DownloadHandler, NewWindowFeatures, NewWindowResponse,
-    PageLoadEvent, PendingWebview, PermissionKind, PermissionResponse, UriSchemeProtocolHandler,
-    WebContentProcessTermination, WebContentProcessTerminationReason, WebviewIpcHandler,
-  },
-  window::{
-    DetachedWindow, DetachedWindowWebview, PendingWindow, RawWindow, WindowEvent, WindowId,
-  },
-};
-use tauri_utils::{Theme, config::WebviewUrl};
-
-use http::{Request, Response};
 use std::{
-  any::Any,
-  cell::RefCell,
   collections::HashMap,
   fmt,
-  path::{Path, PathBuf},
-  rc::Rc,
+  fs::create_dir_all,
+  path::PathBuf,
   sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc::{Receiver, SyncSender, channel, sync_channel},
+    mpsc::{self, Receiver, Sender},
   },
   time::Duration,
 };
 
+use raw_window_handle::DisplayHandle;
+use tauri_runtime::{
+  DeviceEventFilter, Error, EventLoopProxy, Result, RunEvent, Runtime, RuntimeHandle,
+  RuntimeInitArgs, UserEvent,
+  dpi::PhysicalPosition,
+  monitor::Monitor,
+  webview::{DetachedWebview, PendingWebview},
+  window::{DetachedWindow, PendingWindow, RawWindow, WindowEvent, WindowId},
+};
+use tauri_utils::Theme;
+
+use crate::{
+  DebugEnvironment,
+  electron_impl::{
+    client::{self},
+    ipc::Ipc,
+    request_handler,
+  },
+  platform::{NativeEventLoop, NativeWindow, NativeWindowEvent},
+  webview::{
+    self, ElectronWebviewAttributes, ElectronWebviewDispatcher, Webview, WebviewMessage,
+    create_webview_detached,
+  },
+  window::{
+    AppWindow, ElectronWindowDispatcher, WindowMessage, create_window_detached,
+    native_monitor_to_tauri_monitor,
+  },
+  window_handle::SendRawDisplayHandle,
+};
+
+/// Re-exported so applications can name the bridge crate's types, mirroring the
+/// reference runtime's `pub use cef;`.
+pub use electron_rs;
+
+/// The Electron release this runtime was built against, mirroring the reference's
+/// `CEF_API_VERSION_LAST`.
+pub const ELECTRON_API_VERSION_LAST: &str = electron_rs::DEFAULT_VERSION;
+
+/// The switch that tells a helper process which API version the browser process runs.
+const API_VERSION_SWITCH: &str = "tauri-electron-api-version";
+
+/// Handles a non-browser process of this application.
+///
+/// CEF re-executes the application binary for its renderer, GPU and utility
+/// processes, so the reference has to detect that case and hand the process to CEF
+/// before any Tauri code runs. Electron launches its own helpers from its own
+/// distribution and never re-executes the application, so there is nothing to
+/// detect and nothing to hand over.
+///
+/// The function exists because `#[electron_entry_point]` expands to a call to it,
+/// which keeps an application's `main` identical to the CEF runtime's.
+pub fn run_electron_helper_process() {}
+
+/// Observes a native window event before Tauri's own handling.
+///
+/// `Destroyed` is delivered before the window is released, so a handler can still
+/// read the native handle.
+pub type NativeWindowEventHandler =
+  dyn Fn(&str, &dyn NativeEventLoop, Arc<NativeWindow>, &NativeWindowEvent) + Send + Sync;
+
+/// Last-chance mutation of the settings handed to the Electron main process.
+type SettingsCallback = dyn FnOnce(&mut ElectronSettings) + Send + Sync;
+
+/// Which key Chromium's `os_crypt` uses for cookies and saved passwords.
+///
+/// Only those two are encrypted; everything else in the cache directory is
+/// plaintext. `Mock` and `System` on a machine with no keyring both fall back to a
+/// publicly known constant, which protects nothing at rest, and switching between
+/// them invalidates the cookies already stored.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecretStorage {
+  /// Skip the OS secret store in development builds (`tauri::is_dev()`), use it in
+  /// release builds.
+  #[default]
+  Auto,
+  /// Always use Chromium's hard-coded constant: `--use-mock-keychain` on macOS,
+  /// `--password-store=basic` on Linux.
+  Mock,
+  /// Always use the OS secret store; appends no switch.
+  System,
+}
+
+/// What to do with Chromium's process sandbox.
+///
+/// Electron ships its own sandbox broker on every platform, so unlike the CEF
+/// runtime there is no platform where the sandbox is structurally unavailable.
+/// The policy still decides what happens when the OS refuses to start a sandboxed
+/// renderer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SandboxPolicy {
+  /// Keep the sandbox where possible, warn where it cannot start.
+  #[default]
+  Auto,
+  /// Never run unsandboxed: fail startup instead.
+  Required,
+  /// Always run unsandboxed, on every platform.
+  Disabled,
+}
+
+/// Whether the DevTools protocol server runs, and over which transport.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemoteDebugging {
+  /// No server.
+  #[default]
+  Disabled,
+  /// Listen on a TCP port, as `--remote-debugging-port`.
+  ///
+  /// The port must be 1024–65535: anything below is a privileged port on every
+  /// Unix and is refused with a warning.
+  Port {
+    /// The TCP port to listen on.
+    port: u16,
+    /// Origins allowed to connect, as `--remote-allow-origins`.
+    allowed_origins: Vec<String>,
+  },
+  /// Speak the protocol over inherited file descriptors, as
+  /// `--remote-debugging-pipe`.
+  Pipe,
+}
+
+/// Whether the application may open a DevTools window at all.
+///
+/// Combined with the per-webview `WebviewAttributes::devtools`. The protocol
+/// itself stays available whatever this says, because the runtime drives its own
+/// startup over it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevToolsPolicy {
+  /// Allow in a build that could open them anyway (debug, or the `devtools`
+  /// feature), refuse otherwise.
+  #[default]
+  Auto,
+  /// Allow whatever the build profile; per-webview `devtools` still applies.
+  Allowed,
+  /// Refuse whatever the build profile.
+  Disallowed,
+}
+
+/// What to do when a TLS certificate fails to verify.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CertificateErrorPolicy {
+  /// Show Chromium's SSL interstitial, which offers a way through.
+  #[default]
+  ChromeInterstitial,
+  /// Cancel the request; no interstitial, no override.
+  Cancel,
+}
+
+/// How Chromium resolves the proxy for every request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProxyConfig {
+  /// Use the OS proxy configuration.
+  #[default]
+  System,
+  /// Connect directly, ignoring any system proxy.
+  Direct,
+  /// Discover a proxy through WPAD.
+  AutoDetect,
+  /// Fetch a PAC script from `url`.
+  PacScript {
+    /// The PAC script URL.
+    url: String,
+  },
+  /// A fixed proxy.
+  FixedServers {
+    /// `scheme://host:port`; a bare `host:port` means HTTP.
+    server: String,
+    /// Semicolon-delimited bypass list.
+    bypass_list: Option<String>,
+  },
+}
+
+impl ProxyConfig {
+  /// Renders the Chromium `proxy` preference dictionary.
+  ///
+  /// A key the mode does not accept makes Chromium reject the whole dictionary,
+  /// so `bypass_list` is written only when it is set.
+  fn to_preference(&self) -> serde_json::Value {
+    use serde_json::json;
+    match self {
+      Self::System => json!({ "mode": "system" }),
+      Self::Direct => json!({ "mode": "direct" }),
+      Self::AutoDetect => json!({ "mode": "auto_detect" }),
+      Self::PacScript { url } => json!({ "mode": "pac_script", "pac_url": url }),
+      Self::FixedServers {
+        server,
+        bypass_list,
+      } => {
+        let mut value = json!({ "mode": "fixed_servers", "server": server });
+        if let Some(bypass_list) = bypass_list {
+          value["bypass_list"] = json!(bypass_list);
+        }
+        value
+      }
+    }
+  }
+}
+
+/// When a page may start playing media on its own.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AutoplayPolicy {
+  /// Chromium's own default: audible media needs a document gesture.
+  #[default]
+  Default,
+  /// Play without any user interaction.
+  NoUserGestureRequired,
+  /// Require a gesture on the media element.
+  UserGestureRequired,
+  /// Require the user to have interacted with the document.
+  DocumentUserActivationRequired,
+}
+
+impl AutoplayPolicy {
+  /// The `--autoplay-policy` value, `None` to leave the switch off.
+  fn as_switch_value(self) -> Option<&'static str> {
+    match self {
+      Self::Default => None,
+      Self::NoUserGestureRequired => Some("no-user-gesture-required"),
+      Self::UserGestureRequired => Some("user-gesture-required"),
+      Self::DocumentUserActivationRequired => Some("document-user-activation-required"),
+    }
+  }
+}
+
+/// Which local interfaces WebRTC may reveal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebRtcIpHandling {
+  /// Chromium's default.
+  #[default]
+  Default,
+  /// Offer public and private interfaces, which reveals the LAN address.
+  DefaultPublicAndPrivateInterfaces,
+  /// Offer only the public interface.
+  DefaultPublicInterfaceOnly,
+  /// Refuse UDP that does not go through the proxy.
+  DisableNonProxiedUdp,
+}
+
+impl WebRtcIpHandling {
+  /// The `--webrtc-ip-handling-policy` value, `None` to leave the switch off.
+  ///
+  /// The values are underscored, deliberately unlike [`AutoplayPolicy`]'s
+  /// hyphenated ones.
+  fn as_switch_value(self) -> Option<&'static str> {
+    match self {
+      Self::Default => None,
+      Self::DefaultPublicAndPrivateInterfaces => Some("default_public_and_private_interfaces"),
+      Self::DefaultPublicInterfaceOnly => Some("default_public_interface_only"),
+      Self::DisableNonProxiedUdp => Some("disable_non_proxied_udp"),
+    }
+  }
+}
+
+/// What to do with a profile a newer Electron/Chromium milestone last used.
+///
+/// Chromium migrates a profile forward only. The runtime writes the `Last Version`
+/// breadcrumb Chromium does not write, and applies this policy when the breadcrumb
+/// names a higher milestone. A downgrade within a milestone is left alone, and a
+/// profile another running instance holds is never touched.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DowngradePolicy {
+  /// Open the profile as is and log a warning naming both versions.
+  #[default]
+  KeepProfile,
+  /// Move the root cache path aside and start empty, deleting the old one in the
+  /// background.
+  ResetProfile,
+}
+
+/// The severity Chromium writes to its log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LogSeverity {
+  /// The most verbose level.
+  Verbose,
+  /// Informational messages.
+  Info,
+  /// Chromium's own default.
+  #[default]
+  Default,
+  /// Warnings and errors only.
+  Warning,
+  /// Errors only.
+  Error,
+  /// Nothing.
+  Disable,
+}
+
+impl LogSeverity {
+  /// The `--log-severity` value.
+  fn as_switch_value(self) -> &'static str {
+    match self {
+      Self::Verbose => "verbose",
+      Self::Info => "info",
+      Self::Default => "default",
+      Self::Warning => "warning",
+      Self::Error => "error",
+      Self::Disable => "disable",
+    }
+  }
+}
+
+/// Which fields the runtime prepends to each log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LogItems {
+  /// Chromium's own choice of fields.
+  #[default]
+  Default,
+  /// Timestamp, thread id, level.
+  Time,
+  /// Timestamp, thread id, level and the source location.
+  Verbose,
+}
+
+/// The settings handed to the Electron main process before it creates anything.
+///
+/// The Electron counterpart of `cef::Settings`: every field is a runtime-wide
+/// policy that has to be in place before the first window exists.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ElectronSettings {
+  /// Chromium's user-data directory.
+  pub cache_path: Option<PathBuf>,
+  /// Where Chromium writes its log.
+  pub log_file: Option<PathBuf>,
+  /// How verbose that log is.
+  pub log_severity: LogSeverity,
+  /// Which fields each line carries.
+  pub log_items: LogItems,
+  /// The User-Agent sent with every request.
+  pub user_agent: Option<String>,
+  /// The product token spliced into Chromium's own User-Agent.
+  pub user_agent_product: Option<String>,
+  /// Chromium's own UI locale.
+  pub locale: Option<String>,
+  /// The `Accept-Language` list and `navigator.language`.
+  pub accept_language_list: Option<String>,
+  /// Whether session cookies survive a restart.
+  pub persist_session_cookies: bool,
+  /// V8 flags.
+  pub javascript_flags: Option<String>,
+  /// The Chrome enterprise policy source.
+  pub chrome_policy_id: Option<String>,
+  /// Whether Chromium's process sandbox is disabled.
+  pub no_sandbox: bool,
+}
+
+/// A permission category, the Electron counterpart of `cef::ContentSettingTypes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContentSettingType {
+  /// Camera access.
+  MediaStreamCamera,
+  /// Microphone access.
+  MediaStreamMicrophone,
+  /// Geolocation.
+  Geolocation,
+  /// Desktop notifications.
+  Notifications,
+  /// Clipboard reads.
+  ClipboardRead,
+  /// Mouse lock.
+  MouseLock,
+  /// Fullscreen without a gesture.
+  Fullscreen,
+  /// Any category not listed above, by its Chromium name.
+  Other(&'static str),
+}
+
+impl ContentSettingType {
+  /// The Electron permission name this maps to.
+  pub(crate) fn permission(self) -> &'static str {
+    match self {
+      Self::MediaStreamCamera => "media",
+      Self::MediaStreamMicrophone => "media",
+      Self::Geolocation => "geolocation",
+      Self::Notifications => "notifications",
+      Self::ClipboardRead => "clipboard-read",
+      Self::MouseLock => "pointerLock",
+      Self::Fullscreen => "fullscreen",
+      Self::Other(name) => name,
+    }
+  }
+}
+
+/// The default answer for a permission, the Electron counterpart of
+/// `cef::ContentSettingValues`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContentSettingValue {
+  /// Allow without asking.
+  Allow,
+  /// Block without asking.
+  Block,
+  /// Ask the application's permission handler.
+  Ask,
+}
+
+impl ContentSettingValue {
+  /// The Electron permission-check answer.
+  pub(crate) fn answer(self) -> Option<bool> {
+    match self {
+      Self::Allow => Some(true),
+      Self::Block => Some(false),
+      Self::Ask => None,
+    }
+  }
+}
+
+/// Selects the [`ElectronRuntime`], e.g.
+/// `tauri::Builder::default().runtime(Electron::default())`.
+#[derive(Default)]
+pub struct Electron {
+  command_line_args: Vec<(String, Option<String>)>,
+  disabled_features: Vec<String>,
+  enabled_features: Vec<String>,
+  deep_link_schemes: Vec<String>,
+  cache_path: Option<PathBuf>,
+  secret_storage: SecretStorage,
+  profile_preferences: Vec<(String, serde_json::Value)>,
+  global_preferences: Vec<(String, serde_json::Value)>,
+  content_settings: Vec<(ContentSettingType, ContentSettingValue)>,
+  allow_chromium_command_line_args: bool,
+  log_file: Option<PathBuf>,
+  log_severity: Option<LogSeverity>,
+  log_items: Option<LogItems>,
+  locale: Option<String>,
+  accept_language_list: Option<String>,
+  user_agent: Option<String>,
+  user_agent_product: Option<String>,
+  javascript_flags: Option<String>,
+  chrome_policy_id: Option<String>,
+  persist_session_cookies: bool,
+  remote_debugging: RemoteDebugging,
+  devtools: DevToolsPolicy,
+  debug_environment: DebugEnvironment,
+  certificate_errors: CertificateErrorPolicy,
+  sandbox: SandboxPolicy,
+  downgrade: DowngradePolicy,
+  settings_callback: Option<Box<SettingsCallback>>,
+  window_event_handler: Option<Arc<NativeWindowEventHandler>>,
+  /// An explicit Electron executable, overriding the prepared distribution.
+  binary: Option<PathBuf>,
+  /// The application identifier, handed to Electron as its AppUserModelID.
+  identifier: Option<String>,
+  /// The declared API version, when the application names one.
+  api_version: Option<i32>,
+  /// How long Electron gets to start and connect back.
+  startup_timeout: Option<Duration>,
+}
+
+impl fmt::Debug for Electron {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Electron")
+      .field("command_line_args", &self.command_line_args)
+      .field("disabled_features", &self.disabled_features)
+      .field("enabled_features", &self.enabled_features)
+      .field("deep_link_schemes", &self.deep_link_schemes)
+      .field("cache_path", &self.cache_path)
+      .field("secret_storage", &self.secret_storage)
+      .field("profile_preferences", &self.profile_preferences)
+      .field("global_preferences", &self.global_preferences)
+      .field("content_settings", &self.content_settings)
+      .field(
+        "allow_chromium_command_line_args",
+        &self.allow_chromium_command_line_args,
+      )
+      .field("log_file", &self.log_file)
+      .field("log_severity", &self.log_severity)
+      .field("log_items", &self.log_items)
+      .field("locale", &self.locale)
+      .field("accept_language_list", &self.accept_language_list)
+      .field("user_agent", &self.user_agent)
+      .field("user_agent_product", &self.user_agent_product)
+      .field("javascript_flags", &self.javascript_flags)
+      .field("chrome_policy_id", &self.chrome_policy_id)
+      .field("persist_session_cookies", &self.persist_session_cookies)
+      .field("remote_debugging", &self.remote_debugging)
+      .field("devtools", &self.devtools)
+      .field("debug_environment", &self.debug_environment)
+      .field("certificate_errors", &self.certificate_errors)
+      .field("sandbox", &self.sandbox)
+      .field("downgrade", &self.downgrade)
+      .field("settings_callback", &self.settings_callback.is_some())
+      .field("window_event_handler", &self.window_event_handler.is_some())
+      .field("binary", &self.binary)
+      .field("identifier", &self.identifier)
+      .field("api_version", &self.api_version)
+      .field("startup_timeout", &self.startup_timeout)
+      .finish()
+  }
+}
+
+impl Electron {
+  /// Observes native window events before Tauri's own handling.
+  #[must_use]
+  pub fn on_window_event<F>(mut self, handler: F) -> Self
+  where
+    F: Fn(&str, &dyn NativeEventLoop, Arc<NativeWindow>, &NativeWindowEvent)
+      + Send
+      + Sync
+      + 'static,
+  {
+    self.window_event_handler = Some(Arc::new(handler));
+    self
+  }
+
+  /// Mutates the [`ElectronSettings`] immediately before Electron starts.
+  #[must_use]
+  pub fn with_settings<F>(mut self, callback: F) -> Self
+  where
+    F: FnOnce(&mut ElectronSettings) + Send + Sync + 'static,
+  {
+    self.settings_callback = Some(Box::new(callback));
+    self
+  }
+
+  /// Appends one Chromium switch, browser process only.
+  #[must_use]
+  pub fn command_line_arg<K: Into<String>, V: Into<String>>(
+    mut self,
+    key: K,
+    value: Option<V>,
+  ) -> Self {
+    self
+      .command_line_args
+      .push((key.into(), value.map(Into::into)));
+    self
+  }
+
+  /// Appends many Chromium switches, browser process only.
+  #[must_use]
+  pub fn command_line_args<K: Into<String>, V: Into<String>>(
+    mut self,
+    args: impl IntoIterator<Item = (K, Option<V>)>,
+  ) -> Self {
+    self.command_line_args.extend(
+      args
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.map(Into::into))),
+    );
+    self
+  }
+
+  /// The schemes recognised when the application is relaunched by a deep link.
+  #[must_use]
+  pub fn deep_link_schemes<S: Into<String>>(
+    mut self,
+    schemes: impl IntoIterator<Item = S>,
+  ) -> Self {
+    self
+      .deep_link_schemes
+      .extend(schemes.into_iter().map(Into::into));
+    self
+  }
+
+  /// Chromium's user-data directory.
+  #[must_use]
+  pub fn root_cache_path<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+    self.cache_path = Some(path.as_ref().to_path_buf());
+    self
+  }
+
+  /// What to do with a profile a newer milestone last used.
+  #[must_use]
+  pub fn downgrade(mut self, policy: DowngradePolicy) -> Self {
+    self.downgrade = policy;
+    self
+  }
+
+  /// Which key `os_crypt` uses.
+  #[must_use]
+  pub fn secret_storage(mut self, storage: SecretStorage) -> Self {
+    self.secret_storage = storage;
+    self
+  }
+
+  /// Sets one boolean profile preference.
+  #[must_use]
+  pub fn profile_preference<K: Into<String>>(mut self, name: K, enabled: bool) -> Self {
+    self
+      .profile_preferences
+      .push((name.into(), serde_json::Value::Bool(enabled)));
+    self
+  }
+
+  /// Sets one typed profile preference.
+  #[must_use]
+  pub fn profile_preference_value<K: Into<String>, V: Into<serde_json::Value>>(
+    mut self,
+    name: K,
+    value: V,
+  ) -> Self {
+    self.profile_preferences.push((name.into(), value.into()));
+    self
+  }
+
+  /// Sets one local-state preference.
+  #[must_use]
+  pub fn global_preference<K: Into<String>, V: Into<serde_json::Value>>(
+    mut self,
+    name: K,
+    value: V,
+  ) -> Self {
+    self.global_preferences.push((name.into(), value.into()));
+    self
+  }
+
+  /// The default answer for a permission, for every origin.
+  #[must_use]
+  pub fn default_content_setting(
+    mut self,
+    content_type: ContentSettingType,
+    value: ContentSettingValue,
+  ) -> Self {
+    self.content_settings.push((content_type, value));
+    self
+  }
+
+  /// Whether release builds honour Chromium switches from the process command line.
+  ///
+  /// Development builds always allow them.
+  #[must_use]
+  pub fn allow_chromium_command_line_args(mut self, allow: bool) -> Self {
+    self.allow_chromium_command_line_args = allow;
+    self
+  }
+
+  /// Where Chromium writes its log.
+  #[must_use]
+  pub fn log_file<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+    self.log_file = Some(path.as_ref().to_path_buf());
+    self
+  }
+
+  /// How verbose that log is.
+  #[must_use]
+  pub fn log_severity(mut self, severity: LogSeverity) -> Self {
+    self.log_severity = Some(severity);
+    self
+  }
+
+  /// Which fields each log line carries.
+  #[must_use]
+  pub fn log_items(mut self, items: LogItems) -> Self {
+    self.log_items = Some(items);
+    self
+  }
+
+  /// Chromium's own UI locale.
+  #[must_use]
+  pub fn locale<S: Into<String>>(mut self, locale: S) -> Self {
+    self.locale = Some(locale.into());
+    self
+  }
+
+  /// The `Accept-Language` list and `navigator.language`.
+  #[must_use]
+  pub fn accept_language_list<S: Into<String>>(mut self, languages: S) -> Self {
+    self.accept_language_list = Some(languages.into());
+    self
+  }
+
+  /// What to do with Chromium's process sandbox.
+  #[must_use]
+  pub fn sandbox(mut self, policy: SandboxPolicy) -> Self {
+    self.sandbox = policy;
+    self
+  }
+
+  /// Adds to `--disable-features`, merged with anything already configured.
+  #[must_use]
+  pub fn disable_features<S: Into<String>>(
+    mut self,
+    features: impl IntoIterator<Item = S>,
+  ) -> Self {
+    self
+      .disabled_features
+      .extend(features.into_iter().map(Into::into));
+    self
+  }
+
+  /// Adds to `--enable-features`, merged with anything already configured.
+  #[must_use]
+  pub fn enable_features<S: Into<String>>(
+    mut self,
+    features: impl IntoIterator<Item = S>,
+  ) -> Self {
+    self
+      .enabled_features
+      .extend(features.into_iter().map(Into::into));
+    self
+  }
+
+  /// Whether Chromium's diagnostic environment variables are honoured.
+  #[must_use]
+  pub fn debug_environment(mut self, policy: DebugEnvironment) -> Self {
+    self.debug_environment = policy;
+    self
+  }
+
+  /// Whether the DevTools protocol server runs, and over which transport.
+  #[must_use]
+  pub fn remote_debugging(mut self, remote_debugging: RemoteDebugging) -> Self {
+    self.remote_debugging = remote_debugging;
+    self
+  }
+
+  /// Whether a DevTools window may open at all.
+  #[must_use]
+  pub fn devtools(mut self, policy: DevToolsPolicy) -> Self {
+    self.devtools = policy;
+    self
+  }
+
+  /// How TLS certificate errors are handled.
+  #[must_use]
+  pub fn certificate_errors(mut self, policy: CertificateErrorPolicy) -> Self {
+    self.certificate_errors = policy;
+    self
+  }
+
+  /// How Chromium resolves the proxy.
+  #[must_use]
+  pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+    // `System` writes no preference at all, so an application that never calls
+    // this keeps Chromium's own resolution.
+    if proxy != ProxyConfig::System {
+      self
+        .profile_preferences
+        .push(("proxy".into(), proxy.to_preference()));
+    }
+    self
+  }
+
+  /// When a page may start playing media on its own.
+  #[must_use]
+  pub fn autoplay(mut self, policy: AutoplayPolicy) -> Self {
+    if let Some(value) = policy.as_switch_value() {
+      self
+        .command_line_args
+        .push(("autoplay-policy".into(), Some(value.into())));
+    }
+    self
+  }
+
+  /// Which local interfaces WebRTC may reveal.
+  #[must_use]
+  pub fn webrtc_ip_handling(mut self, policy: WebRtcIpHandling) -> Self {
+    if let Some(value) = policy.as_switch_value() {
+      self
+        .command_line_args
+        .push(("webrtc-ip-handling-policy".into(), Some(value.into())));
+    }
+    self
+  }
+
+  /// Whether the spell checker runs.
+  #[must_use]
+  pub fn spell_checking(mut self, enabled: bool) -> Self {
+    self
+      .profile_preferences
+      .push(("browser.enable_spellchecking".into(), enabled.into()));
+    self
+  }
+
+  /// Whether Safe Browsing runs.
+  #[must_use]
+  pub fn safe_browsing(mut self, enabled: bool) -> Self {
+    self
+      .profile_preferences
+      .push(("safebrowsing.enabled".into(), enabled.into()));
+    self
+  }
+
+  /// Whether Chromium's component updater runs.
+  #[must_use]
+  pub fn component_updates(mut self, enabled: bool) -> Self {
+    if !enabled {
+      self
+        .command_line_args
+        .push(("disable-component-update".into(), None));
+    }
+    self
+  }
+
+  /// The whole User-Agent string.
+  #[must_use]
+  pub fn user_agent<S: Into<String>>(mut self, user_agent: S) -> Self {
+    self.user_agent = Some(user_agent.into());
+    self
+  }
+
+  /// The product token spliced into Chromium's own User-Agent.
+  ///
+  /// Ignored when [`Self::user_agent`] is also set.
+  #[must_use]
+  pub fn user_agent_product<S: Into<String>>(mut self, product: S) -> Self {
+    self.user_agent_product = Some(product.into());
+    self
+  }
+
+  /// Whether session cookies survive a restart.
+  #[must_use]
+  pub fn persist_session_cookies(mut self, persist: bool) -> Self {
+    self.persist_session_cookies = persist;
+    self
+  }
+
+  /// V8 flags.
+  #[must_use]
+  pub fn javascript_flags<S: Into<String>>(mut self, flags: S) -> Self {
+    self.javascript_flags = Some(flags.into());
+    self
+  }
+
+  /// The Chrome enterprise policy source.
+  #[must_use]
+  pub fn chrome_policy_id<S: Into<String>>(mut self, policy_id: S) -> Self {
+    self.chrome_policy_id = Some(policy_id.into());
+    self
+  }
+
+  /// Declares the API version the application was compiled against.
+  ///
+  /// CEF gates its ABI on this number because the wrapper and the binary
+  /// distribution are versioned separately. Electron ships its JavaScript and
+  /// native halves from one distribution, so there is no ABI to declare: the value
+  /// is recorded for parity and reported when it disagrees with the release this
+  /// build pinned.
+  #[must_use]
+  pub fn electron_api_version(mut self, version: i32) -> Self {
+    let expected = ELECTRON_API_VERSION_LAST
+      .split('.')
+      .next()
+      .and_then(|major| major.parse::<i32>().ok());
+    if expected.is_some_and(|expected| expected != version) {
+      log::warn!(
+        "[electron] declared API version {version} differs from the pinned Electron release \
+         {ELECTRON_API_VERSION_LAST}; the distribution's own version wins"
+      );
+    }
+    self.api_version = Some(version);
+    self
+  }
+
+  /// An explicit Electron executable, overriding the prepared distribution.
+  #[must_use]
+  pub fn binary(mut self, binary: impl Into<PathBuf>) -> Self {
+    self.binary = Some(binary.into());
+    self
+  }
+
+  /// The application identifier, handed to Electron as its AppUserModelID.
+  #[must_use]
+  pub fn identifier<S: Into<String>>(mut self, identifier: S) -> Self {
+    self.identifier = Some(identifier.into());
+    self
+  }
+
+  /// How long Electron gets to start and connect back.
+  #[must_use]
+  pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+    self.startup_timeout = Some(timeout);
+    self
+  }
+
+  /// Resolves the Electron executable without downloading or repairing anything.
+  fn resolve_binary(&self) -> PathBuf {
+    if let Some(binary) = &self.binary {
+      return binary.clone();
+    }
+    if let Ok(binary) = electron_rs::electron_binary!(None::<&Path>) {
+      return binary;
+    }
+    // A packaged app keeps the distribution beside its executable, or under
+    // `resources/`. The bundler copies it to `resources/electron`, which on macOS
+    // is `Contents/Resources/electron` — one level up from `Contents/MacOS`.
+    if let Ok(executable) = std::env::current_exe() {
+      if let Some(dir) = executable.parent() {
+        for candidate in [
+          dir.join("electron"),
+          dir.join("resources").join("electron"),
+          dir.join("..").join("Resources").join("electron"),
+        ] {
+          if let Ok(binary) = electron_rs::electron_binary(&candidate) {
+            return binary;
+          }
+        }
+      }
+    }
+    PathBuf::from("electron")
+  }
+}
+
+use std::path::Path;
+
+/// Information about the webview that requested a new window.
+#[derive(Clone)]
+pub struct NewWindowOpener {
+  source_url: Option<url::Url>,
+}
+
+impl NewWindowOpener {
+  pub(crate) fn new(source_url: Option<url::Url>) -> Self {
+    Self { source_url }
+  }
+
+  /// The URL of the document that called `window.open`, when Electron reported it.
+  pub fn source_url(&self) -> Option<&url::Url> {
+    self.source_url.as_ref()
+  }
+}
+
+impl std::fmt::Debug for NewWindowOpener {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    // The URL can carry credentials, so only whether one was observed is printed.
+    f.debug_struct("NewWindowOpener")
+      .field("source_url_observed", &self.source_url.is_some())
+      .finish()
+  }
+}
+
+/// The `EventLoopProxy` handed to applications.
+#[derive(Clone, Debug)]
+pub struct EventProxy<T: UserEvent> {
+  context: RuntimeContext<T>,
+}
+
+impl<T: UserEvent> EventLoopProxy<T> for EventProxy<T> {
+  fn send_event(&self, event: T) -> Result<()> {
+    self.context.send_message(Message::UserEvent(event))
+  }
+}
+
+/// The cloneable handle every dispatcher holds.
+pub(crate) struct RuntimeContext<T: UserEvent> {
+  is_running: Arc<AtomicBool>,
+  windows: Arc<Mutex<HashMap<WindowId, AppWindow>>>,
+  pub(crate) run_tx: Sender<Message<T>>,
+  main_thread_id: std::thread::ThreadId,
+  next_window_id: Arc<AtomicU32>,
+  next_webview_id: Arc<AtomicU32>,
+  /// Connection to the Electron main process.
+  pub(crate) ipc: Arc<Ipc>,
+  /// The events Electron pushed, drained by the run loop.
+  pub(crate) events: Arc<Mutex<Receiver<electron_rs::Event>>>,
+  /// Custom protocols registered by Tauri, served through Electron's
+  /// `protocol.handle`.
+  pub(crate) protocol_handlers: Arc<Mutex<HashMap<String, request_handler::SchemeHandler>>>,
+  /// Page origin per webview label, injected as the `Origin` header on
+  /// custom-protocol requests.
+  pub(crate) webview_origins: Arc<Mutex<HashMap<String, String>>>,
+  /// Native window handle per window, asked from Electron once.
+  pub(crate) native_handles: Arc<Mutex<HashMap<WindowId, isize>>>,
+  /// Whether a DevTools window may open, resolved from [`DevToolsPolicy`].
+  pub(crate) devtools_allowed: bool,
+  /// How TLS certificate errors are handled.
+  pub(crate) certificate_errors: CertificateErrorPolicy,
+  /// The native-event observer, run before Tauri's own handling.
+  pub(crate) window_event_handler: Option<Arc<NativeWindowEventHandler>>,
+  /// The application theme, as last set.
+  pub(crate) theme: Arc<Mutex<Option<Theme>>>,
+  /// The app-wide `Accept-Language` list.
+  pub(crate) accept_language_list: Option<String>,
+}
+
+impl<T: UserEvent> Clone for RuntimeContext<T> {
+  fn clone(&self) -> Self {
+    Self {
+      is_running: Arc::clone(&self.is_running),
+      windows: Arc::clone(&self.windows),
+      run_tx: self.run_tx.clone(),
+      main_thread_id: self.main_thread_id,
+      next_window_id: Arc::clone(&self.next_window_id),
+      next_webview_id: Arc::clone(&self.next_webview_id),
+      ipc: Arc::clone(&self.ipc),
+      events: Arc::clone(&self.events),
+      protocol_handlers: Arc::clone(&self.protocol_handlers),
+      webview_origins: Arc::clone(&self.webview_origins),
+      native_handles: Arc::clone(&self.native_handles),
+      devtools_allowed: self.devtools_allowed,
+      certificate_errors: self.certificate_errors,
+      window_event_handler: self.window_event_handler.clone(),
+      theme: Arc::clone(&self.theme),
+      accept_language_list: self.accept_language_list.clone(),
+    }
+  }
+}
+
+impl<T: UserEvent> fmt::Debug for RuntimeContext<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("RuntimeContext")
+      .field("main_thread_id", &self.main_thread_id)
+      .field("devtools_allowed", &self.devtools_allowed)
+      .finish_non_exhaustive()
+  }
+}
+
+impl<T: UserEvent> RuntimeContext<T> {
+  /// Runs `task` on the runtime's own thread, inline when already there.
+  pub(crate) fn on_main_thread<R: Send + 'static>(
+    &self,
+    task: impl FnOnce(&Self) -> R + Send + 'static,
+  ) -> Result<R> {
+    if std::thread::current().id() == self.main_thread_id {
+      return Ok(task(self));
+    }
+    let context = self.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    self
+      .run_tx
+      .send(Message::Task(Box::new(move || {
+        let _ = tx.send(task(&context));
+      })))
+      .map_err(|_| Error::FailedToSendMessage)?;
+    rx.recv().map_err(|_| Error::FailedToReceiveMessage)
+  }
+
+  pub(crate) fn send_message(&self, message: Message<T>) -> Result<()> {
+    // Tasks run inline on the main thread; everything else goes to the loop.
+    if std::thread::current().id() == self.main_thread_id {
+      if let Message::Task(task) = message {
+        task();
+        return Ok(());
+      }
+    }
+    self.run_tx.send(message).map_err(|_| Error::FailedToSendMessage)
+  }
+
+  pub(crate) fn next_window_id(&self) -> WindowId {
+    self.next_window_id.fetch_add(1, Ordering::Relaxed).into()
+  }
+
+  pub(crate) fn next_webview_id(&self) -> u32 {
+    self.next_webview_id.fetch_add(1, Ordering::Relaxed)
+  }
+
+  pub(crate) fn is_main_thread(&self) -> bool {
+    std::thread::current().id() == self.main_thread_id
+  }
+
+  /// The native handle of a window, as Electron knows it.
+  pub(crate) fn native_handle(&self, id: WindowId) -> Result<isize> {
+    if !self.is_main_thread() {
+      return self.on_main_thread(move |context| context.native_handle(id))?;
+    }
+    if let Some(handle) = self
+      .native_handles
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .get(&id)
+    {
+      return Ok(*handle);
+    }
+    let value = self
+      .ipc
+      .call(
+        "window.nativeHandle",
+        serde_json::json!({ "windowId": crate::window::window_number(id) }),
+        IPC_TIMEOUT,
+      )
+      .map_err(create_window_err)?;
+    let handle = value["handle"]
+      .as_i64()
+      .ok_or_else(|| create_window_err("electron returned no native handle".to_string()))?;
+    let handle = handle as isize;
+    self
+      .native_handles
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(id, handle);
+    Ok(handle)
+  }
+
+  /// The window registered under `id`, if it still exists.
+  pub(crate) fn with_window<R>(&self, id: WindowId, f: impl FnOnce(&AppWindow) -> R) -> Option<R> {
+    self
+      .windows
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .get(&id)
+      .map(f)
+  }
+
+  /// Registers a window so dispatchers can find it.
+  pub(crate) fn insert_window(&self, id: WindowId, window: AppWindow) {
+    self
+      .windows
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(id, window);
+  }
+
+  /// Removes a window, returning whether it existed.
+  pub(crate) fn remove_window(&self, id: WindowId) -> bool {
+    self
+      .windows
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .remove(&id)
+      .is_some()
+  }
+
+  /// The labels of every live window.
+  pub(crate) fn window_labels(&self) -> Vec<String> {
+    self
+      .windows
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .values()
+      .map(|window| window.label.clone())
+      .collect()
+  }
+
+  /// Records the origin a webview's document is served from.
+  pub(crate) fn set_webview_origin(&self, label: &str, origin: String) {
+    self
+      .webview_origins
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(label.to_owned(), origin);
+  }
+
+  /// The origin recorded for a webview label.
+  pub(crate) fn webview_origin(&self, label: &str) -> Option<String> {
+    self
+      .webview_origins
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .get(label)
+      .cloned()
+  }
+
+  /// Registers a custom protocol handler.
+  pub(crate) fn register_protocol(&self, scheme: String, handler: request_handler::SchemeHandler) {
+    self
+      .protocol_handlers
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .insert(scheme, handler);
+  }
+
+  /// The handler registered for `scheme`.
+  pub(crate) fn protocol(&self, scheme: &str) -> Option<request_handler::SchemeHandler> {
+    self
+      .protocol_handlers
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .get(scheme)
+      .cloned()
+  }
+
+  /// The application theme as last set through the runtime.
+  pub(crate) fn theme(&self) -> Option<Theme> {
+    *self
+      .theme
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
+  /// Runs the native-event observer, when one was configured.
+  pub(crate) fn observe_native_event(
+    &self,
+    label: &str,
+    event_loop: &dyn NativeEventLoop,
+    window: Arc<NativeWindow>,
+    event: &NativeWindowEvent,
+  ) {
+    if let Some(handler) = &self.window_event_handler {
+      handler(label, event_loop, window, event);
+    }
+  }
+}
+
+/// A message for the run loop.
+pub(crate) enum Message<T: UserEvent> {
+  Task(Box<dyn FnOnce() + Send>),
+  Window(WindowId, WindowMessage),
+  Webview(u32, WebviewMessage),
+  UserEvent(T),
+  RequestExit(i32),
+  /// A window's native event, delivered to Tauri's run loop.
+  WindowEvent(WindowId, Box<WindowEvent>),
+}
 
 /// Timeout for a single IPC round trip with the Electron process.
 pub(crate) const IPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -47,7 +1216,7 @@ pub(crate) const IPC_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default time the Electron process gets to start and connect back.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn io_err(message: String) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn io_err(message: String) -> Box<dyn std::error::Error + Send + Sync> {
   Box::new(std::io::Error::other(message))
 }
 
@@ -59,1231 +1228,705 @@ pub(crate) fn create_webview_err(message: String) -> Error {
   Error::CreateWebview(io_err(message))
 }
 
-/// Tauri sizes are physical or logical; the Electron side converts to DIPs.
-pub(crate) fn size_payload(size: Size) -> Value {
-  match size {
-    Size::Physical(size) => {
-      json!({ "width": size.width, "height": size.height, "physical": true })
-    }
-    Size::Logical(size) => {
-      json!({ "width": size.width, "height": size.height, "physical": false })
-    }
-  }
-}
-
-pub(crate) fn position_payload(position: Position) -> Value {
-  match position {
-    Position::Physical(position) => json!({ "x": position.x, "y": position.y, "physical": true }),
-    Position::Logical(position) => json!({ "x": position.x, "y": position.y, "physical": false }),
-  }
-}
-
-pub(crate) fn rect_position(rect: &Value) -> PhysicalPosition<i32> {
-  PhysicalPosition {
-    x: rect["x"].as_i64().unwrap_or_default() as i32,
-    y: rect["y"].as_i64().unwrap_or_default() as i32,
-  }
-}
-
-pub(crate) fn rect_size(rect: &Value) -> PhysicalSize<u32> {
-  PhysicalSize {
-    width: rect["width"].as_u64().unwrap_or_default() as u32,
-    height: rect["height"].as_u64().unwrap_or_default() as u32,
-  }
-}
-
-type ShortcutMap = HashMap<String, Box<dyn Fn() + Send + 'static>>;
-
-pub(crate) enum Message {
-  Task(Box<dyn FnOnce() + Send>),
-  CloseWindow(WindowId),
-  DestroyWindow(WindowId),
-  UserEvent(Box<dyn Any + Send>),
-  Exit,
-}
-
-struct Webview {
-  /// Numeric id handed to the Electron process.
-  serial: u32,
-  /// Label Tauri gave the webview (`navigate` keeps its origin in sync).
-  label: String,
-  /// Handlers registered by Tauri to observe this webview's events.
-  handlers: Vec<(tauri_runtime::WebviewEventId, Rc<dyn Fn(&tauri_runtime::window::WebviewEvent) + Send>)>,
-}
-
-struct Window {
-  label: String,
-  /// Numeric id handed to the Electron process (Tauri's `WindowId` is opaque).
-  serial: u32,
-  webviews: Vec<Webview>,
-  /// Handlers registered by Tauri to observe this window's events.
-  handlers: Vec<(WindowEventId, Rc<dyn Fn(&WindowEvent) + Send>)>,
-  #[cfg(windows)]
-  menu_owner: Option<crate::window::imp::MenuOwner>,
-}
-
-#[derive(Clone)]
-pub struct RuntimeContext {
-  is_running: Arc<AtomicBool>,
-  windows: Arc<RefCell<HashMap<WindowId, Window>>>,
-  shortcuts: Arc<Mutex<ShortcutMap>>,
-  pub(crate) run_tx: SyncSender<Message>,
-  main_thread_id: std::thread::ThreadId,
-  next_window_id: Arc<AtomicU32>,
-  next_webview_id: Arc<AtomicU32>,
-  next_serial: Arc<AtomicU32>,
-  next_window_event_id: Arc<AtomicU32>,
-  next_webview_event_id: Arc<AtomicU32>,
-  /// Connection to the Electron main process.
-  pub(crate) ipc: Arc<Ipc>,
-  /// When set, `tauri://localhost` URLs are rewritten to this origin (dev server).
-  dev_url: Option<String>,
-  /// Window icon forwarded to Electron on `window.create`.
-  icon: Option<PathBuf>,
-  /// Tauri IPC handlers, invoked when the page posts a message through
-  /// `window.ipc.postMessage` (re-emitted by Electron as `ipc.message`).
-  ///
-  /// The handler is closed over the [`DetachedWebview`] it belongs to, so the
-  /// map does not need to know the runtime's generic parameters.
-  ipc_handlers: Arc<RefCell<HashMap<u32, Rc<dyn Fn(Request<String>) + Send>>>>,
-  /// Tauri's page-load, title and new-window callbacks, by webview serial.
-  webview_handlers: Arc<RefCell<HashMap<u32, WebviewHandlers>>>,
-  /// Custom protocols registered by Tauri, served through Electron's
-  /// `protocol.handle`.
-  protocol_handlers: Arc<RefCell<HashMap<String, (String, Rc<UriSchemeProtocolHandler>)>>>,
-  /// IPC responses retain their MIME type and the authenticated caller's label.
-  ipc_protocol_handlers: Arc<RefCell<HashMap<u32, (String, Rc<UriSchemeProtocolHandler>)>>>,
-  /// Page origin per webview label, injected as the `Origin` header on
-  /// custom-protocol requests (Electron reports the request URL instead).
-  webview_origins: Arc<RefCell<HashMap<String, String>>>,
-  /// Download and permission callbacks, by webview serial. Electron asks for
-  /// these asynchronously, so the run loop answers over IPC.
-  policy_handlers: Arc<RefCell<HashMap<u32, PolicyHandlers>>>,
-  /// Native window handle (HWND / NSView / X11 window) per window serial, asked
-  /// from Electron once. Used for the Win32 tweaks Electron has no API for;
-  /// `window_handle()` gives Tauri this handle everywhere except Windows menus,
-  /// which need a window of the calling thread (see `window::imp`).
-  native_handles: Arc<RefCell<HashMap<u32, isize>>>,
-}
-
-// SAFETY: Arc clones may cross threads; RefCell state and Rc callbacks are only
-// accessed on the runtime UI thread, through on_main_thread when called elsewhere.
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Send for RuntimeContext {}
-
-// SAFETY: Arc clones may cross threads; RefCell state and Rc callbacks are only
-// accessed on the runtime UI thread, through on_main_thread when called elsewhere.
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Sync for RuntimeContext {}
-
-impl RuntimeContext {
-  /// Only this thread may access the RefCells and their non-Sync callbacks.
-  fn on_main_thread<R: Send + 'static>(
-    &self,
-    task: impl FnOnce(&Self) -> R + Send + 'static,
-  ) -> Result<R> {
-    if std::thread::current().id() == self.main_thread_id {
-      return Ok(task(self));
-    }
-    let context = self.clone();
-    let (tx, rx) = sync_channel(1);
-    self.run_tx.send(Message::Task(Box::new(move || {
-      let _ = tx.send(task(&context));
-    }))).map_err(|_| Error::FailedToSendMessage)?;
-    rx.recv().map_err(|_| Error::FailedToReceiveMessage)
-  }
-
-  pub(crate) fn send_message(&self, message: Message) -> Result<()> {
-    // Tasks run inline on the main thread; everything else goes to the loop.
-    let is_main_thread = std::thread::current().id() == self.main_thread_id;
-    let message = match (is_main_thread, message) {
-      (true, Message::Task(task)) => {
-        task();
-        return Ok(());
-      }
-      (_, message) => message,
-    };
-    if !is_main_thread || self.is_running.load(Ordering::Relaxed) {
-      self
-        .run_tx
-        .send(message)
-        .map_err(|_| Error::FailedToSendMessage)
-    } else {
-      match message {
-        Message::Task(task) => task(),
-        Message::CloseWindow(id) | Message::DestroyWindow(id) => {
-          self.windows.borrow_mut().remove(&id);
-        }
-        // No run loop to deliver it to yet.
-        Message::UserEvent(_) | Message::Exit => {}
-      }
-      Ok(())
-    }
-  }
-
-  fn next_window_id(&self) -> WindowId {
-    self.next_window_id.fetch_add(1, Ordering::Relaxed).into()
-  }
-
-  fn next_webview_id(&self) -> u32 {
-    self.next_webview_id.fetch_add(1, Ordering::Relaxed)
-  }
-
-  fn next_serial(&self) -> u32 {
-    self.next_serial.fetch_add(1, Ordering::Relaxed)
-  }
-
-  fn window_for_serial(&self, serial: u32) -> Option<WindowId> {
-    self
-      .windows
-      .borrow()
-      .iter()
-      .find(|(_, window)| window.serial == serial)
-      .map(|(id, _)| *id)
-  }
-
-  pub(crate) fn serial_for_window(&self, id: WindowId) -> Option<u32> {
-    self.on_main_thread(move |context| {
-      context.windows.borrow().get(&id).map(|window| window.serial)
-    }).ok().flatten()
-  }
-
-  /// The native handle of a window, as Electron knows it. Cached because Tauri
-  /// asks for it on every menu/effect/decoration call.
-  pub(crate) fn native_handle(&self, id: WindowId) -> Result<isize> {
-    if std::thread::current().id() != self.main_thread_id {
-      return self.on_main_thread(move |context| context.native_handle(id))?;
-    }
-    let serial = self
-      .serial_for_window(id)
-      .ok_or_else(|| create_window_err("window is gone".to_string()))?;
-    if let Some(handle) = self.native_handles.borrow().get(&serial) {
-      return Ok(*handle);
-    }
-    let value = self
-      .ipc
-      .call(
-        "window.nativeHandle",
-        json!({ "windowId": serial }),
-        IPC_TIMEOUT,
-      )
-      .map_err(create_window_err)?;
-    let handle = value["handle"]
-      .as_i64()
-      .ok_or_else(|| create_window_err("electron returned no native handle".to_string()))?;
-    let handle = handle as isize;
-    self.native_handles.borrow_mut().insert(serial, handle);
-    Ok(handle)
-  }
-
-  #[cfg(windows)]
-  pub(crate) fn menu_owner_window(&self, id: WindowId) -> Result<isize> {
-    if std::thread::current().id() != self.main_thread_id {
-      return self.on_main_thread(move |context| context.menu_owner_window(id))?;
-    }
-    let mut windows = self.windows.borrow_mut();
-    let window = windows.get_mut(&id).ok_or_else(|| create_window_err("window is gone".into()))?;
-    if window.menu_owner.is_none() {
-      window.menu_owner = crate::window::imp::MenuOwner::new();
-    }
-    window.menu_owner.as_ref().map(|owner| owner.handle)
-      .ok_or_else(|| create_window_err("could not create menu owner".into()))
-  }
-
-  #[cfg(windows)]
-  fn sync_window_menus(&self) {
-    // ponytail: O(total menu items) per pump; use native mutation hooks if large
-    // menus make polling measurable. IPC and Electron rebuild only on changes.
-    let changed: Vec<_> = self.windows.borrow().iter().filter_map(|(id, window)| {
-      let owner = window.menu_owner.as_ref()?;
-      match crate::window::imp::menu_snapshot(owner.handle) {
-        Ok(menu) if menu != owner.mirrored => Some((*id, window.serial, menu)),
-        Ok(_) => None,
-        Err(error) => { eprintln!("[electron] menu snapshot failed: {error}"); None }
-      }
-    }).collect();
-    for (id, serial, menu) in changed {
-      match self.ipc.call("window.setMenu", json!({ "windowId": serial, "menu": menu }), IPC_TIMEOUT) {
-        Ok(_) => {
-          if let Some(owner) = self.windows.borrow_mut().get_mut(&id).and_then(|window| window.menu_owner.as_mut()) {
-            owner.mirrored = menu;
-          }
-        }
-        Err(error) => eprintln!("[electron] menu mirror failed: {error}"),
-      }
-    }
-  }
-
-  /// Tauri hands us `tauri://localhost/...` in production builds; when a dev
-  /// server URL is configured we rewrite to it so the probe can load Vite.
-  fn resolve_url(&self, url: &WebviewUrl) -> String {
-    let raw = match url {
-      WebviewUrl::External(url) => url.to_string(),
-      WebviewUrl::App(path) => format!(
-        "tauri://localhost/{}",
-        path.to_string_lossy().trim_start_matches('/')
-      ),
-      WebviewUrl::CustomProtocol(url) => url.to_string(),
-      // `WebviewUrl` is non-exhaustive.
-      _ => String::new(),
-    };
-    match (&self.dev_url, raw.strip_prefix("tauri://localhost")) {
-      (Some(dev), Some(rest)) => format!("{dev}{rest}"),
-      _ => raw,
-    }
-  }
-
-  /// Updates the remembered origin after a navigation.
-  pub(crate) fn set_webview_origin_by_serial(&self, serial: u32, url: &str) {
-    if std::thread::current().id() != self.main_thread_id {
-      let url = url.to_owned();
-      if let Err(error) = self.on_main_thread(move |context| context.set_webview_origin_by_serial(serial, &url)) {
-        eprintln!("[electron] failed to update webview origin: {error}");
-      }
-      return;
-    }
-    let label = self.windows.borrow().values().find_map(|window| {
-      window
-        .webviews
-        .iter()
-        .find(|webview| webview.serial == serial)
-        .map(|webview| webview.label.clone())
-    });
-    if let Some(label) = label {
-      self.set_webview_origin(&label, url);
-    }
-  }
-
-  /// Remembers the origin Electron should report for custom-protocol requests
-  /// issued by `label`'s page.
-  pub(crate) fn set_webview_origin(&self, label: &str, url: &str) {
-    match origin_of(url) {
-      Some(origin) => {
-        self
-          .webview_origins
-          .borrow_mut()
-          .insert(label.to_string(), origin);
-      }
-      None => {
-        self.webview_origins.borrow_mut().remove(label);
-      }
-    }
-  }
-
-  pub(crate) fn next_window_event_id(&self) -> WindowEventId {
-    self.next_window_event_id.fetch_add(1, Ordering::Relaxed)
-  }
-
-  pub(crate) fn next_webview_event_id(&self) -> WindowEventId {
-    self.next_webview_event_id.fetch_add(1, Ordering::Relaxed)
-  }
-
-  pub(crate) fn add_window_event_handler(
-    &self,
-    window_id: WindowId,
-    event_id: WindowEventId,
-    handler: impl Fn(&WindowEvent) + Send + 'static,
-  ) {
-    if let Err(error) = self.on_main_thread(move |context| {
-      if let Some(window) = context.windows.borrow_mut().get_mut(&window_id) {
-        window.handlers.push((event_id, Rc::new(handler)));
-      }
-    }) {
-      eprintln!("[electron] failed to register window handler: {error}");
-    }
-  }
-
-  pub(crate) fn add_webview_event_handler(
-    &self,
-    serial: u32,
-    event_id: tauri_runtime::WebviewEventId,
-    handler: impl Fn(&tauri_runtime::window::WebviewEvent) + Send + 'static,
-  ) {
-    if let Err(error) = self.on_main_thread(move |context| {
-      for window in context.windows.borrow_mut().values_mut() {
-        if let Some(webview) = window.webviews.iter_mut().find(|webview| webview.serial == serial) {
-          webview.handlers.push((event_id, Rc::new(handler)));
-          break;
-        }
-      }
-    }) {
-      eprintln!("[electron] failed to register webview handler: {error}");
-    }
-  }
-
-  /// Runs every handler Tauri registered for `window_id`.
-  pub(crate) fn emit_window_event(&self, window_id: WindowId, event: &WindowEvent) {
-    let handlers: Vec<_> = self
-      .windows
-      .borrow()
-      .get(&window_id)
-      .map(|window| {
-        window
-          .handlers
-          .iter()
-          .map(|(_, handler)| handler.clone())
-          .collect()
-      })
-      .unwrap_or_default();
-    for handler in handlers {
-      handler(event);
-    }
-  }
-}
-
-impl fmt::Debug for RuntimeContext {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("RuntimeContext").finish()
-  }
-}
-
-#[derive(Clone)]
-pub struct EventProxy {
-  pub(crate) run_tx: SyncSender<Message>,
-}
-
-impl fmt::Debug for EventProxy {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("EventProxy").finish()
-  }
-}
-
-impl<T: UserEvent> EventLoopProxy<T> for EventProxy {
-  fn send_event(&self, event: T) -> Result<()> {
-    self
-      .run_tx
-      .send(Message::UserEvent(Box::new(event)))
-      .map_err(|_| Error::EventLoopClosed)
-  }
-}
-
-#[derive(Debug)]
-pub struct ElectronRuntime {
-  is_running: Arc<AtomicBool>,
-  pub context: RuntimeContext,
-  run_rx: Receiver<Message>,
-  /// Events pushed by the Electron process (`window.closed`, `ipc.closed`, ...).
-  event_rx: Receiver<Value>,
-}
-
-impl ElectronRuntime {
-  fn init(
-    ipc: Arc<Ipc>,
-    event_rx: Receiver<Value>,
-    dev_url: Option<String>,
-    icon: Option<PathBuf>,
-  ) -> Self {
-    let is_running = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = sync_channel(256);
-    let context = RuntimeContext {
-      is_running: is_running.clone(),
-      windows: Default::default(),
-      shortcuts: Default::default(),
-      run_tx: tx,
-      main_thread_id: std::thread::current().id(),
-      next_window_id: Default::default(),
-      next_webview_id: Default::default(),
-      next_serial: Default::default(),
-      next_window_event_id: Default::default(),
-      next_webview_event_id: Default::default(),
-      ipc,
-      dev_url,
-      icon,
-      ipc_handlers: Default::default(),
-      webview_handlers: Default::default(),
-      protocol_handlers: Default::default(),
-      ipc_protocol_handlers: Default::default(),
-      webview_origins: Default::default(),
-      policy_handlers: Default::default(),
-      native_handles: Default::default(),
-    };
-    Self {
-      is_running,
-      context,
-      run_rx: rx,
-      event_rx,
-    }
-  }
-
-  fn start(attrs: Electron, custom_schemes: &[String]) -> Result<Self> {
-    let binary = attrs.resolve_binary();
-    let main_script = attrs.resolve_main_script(&binary);
-    if !main_script.exists() {
-      return Err(Error::CreateWindow(io_err(format!(
-        "Electron main script not found at {}; configure it with Electron::default().main_script(..)",
-        main_script.display()
-      ))));
-    }
-    eprintln!(
-      "[electron] launching {} {}",
-      binary.display(),
-      main_script.display()
-    );
-    let mut args = extra_args(&attrs.args);
-    switches::warn_about_dangerous_switches(&args);
-    // Chromium reads its diagnostic environment variables before any embedder
-    // hook runs, so this has to happen before Electron is spawned.
-    environment::sanitize(attrs.debug_environment, &mut args);
-    if !args.iter().any(|arg| arg.starts_with("--lang")) {
-      if let Some(list) = locale::system_accept_language_list() {
-        args.push(format!("--lang={list}"));
-      }
-    }
-    // Electron only accepts privileged schemes at startup, so they travel on the
-    // command line and are installed before `app.whenReady()`. `asset` is not in
-    // Tauri's `custom_schemes` (its handler is registered per webview), but it
-    // needs the same privileges for `convertFileSrc` fetches to work.
-    let mut schemes: Vec<String> = ["ipc", "tauri", "asset"]
-      .iter()
-      .map(|scheme| scheme.to_string())
-      .collect();
-    for scheme in custom_schemes.iter().chain(&attrs.schemes) {
-      let scheme = scheme.to_ascii_lowercase();
-      if !valid_scheme(&scheme) {
-        return Err(create_window_err(format!("invalid custom URL scheme: {scheme:?}")));
-      }
-      if !schemes.contains(&scheme) {
-        schemes.push(scheme);
-      }
-    }
-    args.push("--tauri-schemes".to_string());
-    args.push(schemes.join(","));
-    if let Some(identifier) = &attrs.identifier {
-      args.push("--tauri-identifier".to_string());
-      args.push(identifier.clone());
-    }
-    let (ipc, event_rx) = Ipc::launch(
-      &binary,
-      &main_script,
-      &args,
-      attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
-    )
-    .map_err(|message| Error::CreateWindow(io_err(message)))?;
-    let icon = attrs.resolve_icon().or_else(|| {
-      // A packaged app has no icon file beside it: the bundler embedded the
-      // icon in the executable, so copy it back out for Electron.
-      std::env::current_exe()
-        .ok()
-        .and_then(|exe| crate::app_icon::extract(&exe))
-    });
-    Ok(Self::init(ipc, event_rx, attrs.dev_url, icon))
-  }
-}
-
-/// Selects the [`ElectronRuntime`], e.g.
-/// `tauri::Builder::default().runtime(Electron::default())`.
-#[derive(Debug, Clone, Default)]
-pub struct Electron {
-  binary: Option<PathBuf>,
-  main_script: Option<PathBuf>,
-  args: Vec<String>,
-  /// Extra application protocols that must be privileged before Electron starts.
-  schemes: Vec<String>,
-  /// Dev server origin; `tauri://localhost` URLs are rewritten to it.
-  dev_url: Option<String>,
-  /// Window icon sent to Electron; defaults to the bundle icon.
-  icon: Option<PathBuf>,
-  /// Whether Chromium diagnostic environment variables are honoured.
-  debug_environment: DebugEnvironment,
-  /// App identifier, handed to Electron as its AppUserModelID (taskbar grouping).
-  identifier: Option<String>,
-  startup_timeout: Option<Duration>,
-}
-
-impl Electron {
-  pub fn new() -> Self {
-    Self::default()
-  }
-
-  pub fn binary(mut self, binary: impl Into<PathBuf>) -> Self {
-    self.binary = Some(binary.into());
-    self
-  }
-
-  pub fn main_script(mut self, script: impl Into<PathBuf>) -> Self {
-    self.main_script = Some(script.into());
-    self
-  }
-
-  /// Appended to the Electron command line (after the main script).
-  pub fn arg(mut self, arg: impl Into<String>) -> Self {
-    self.args.push(arg.into());
-    self
-  }
-
-  /// Privileges an application protocol before Electron starts.
-  ///
-  /// Tauri 3 alpha does not yet include builder-registered protocols in
-  /// `RuntimeInitArgs::custom_schemes`; name each of those here too.
-  pub fn custom_scheme(mut self, scheme: impl Into<String>) -> Self {
-    self.schemes.push(scheme.into());
-    self
-  }
-
-  pub fn dev_url(mut self, url: impl Into<String>) -> Self {
-    self.dev_url = Some(url.into().trim_end_matches('/').to_string());
-    self
-  }
-
-  /// Window/taskbar icon; defaults to `bundle.icon` from `tauri.conf.json`.
-  pub fn icon(mut self, icon: impl Into<PathBuf>) -> Self {
-    self.icon = Some(icon.into());
-    self
-  }
-
-  pub fn timeout(mut self, timeout: Duration) -> Self {
-    self.startup_timeout = Some(timeout);
-    self
-  }
-
-  /// Whether `SSLKEYLOGFILE`, `NODE_OPTIONS` and friends reach Electron.
-  /// `Auto` honours them in debug builds and refuses them in release builds.
-  pub fn debug_environment(mut self, policy: DebugEnvironment) -> Self {
-    self.debug_environment = policy;
-    self
-  }
-
-  fn resolve_binary(&self) -> PathBuf {
-    if let Some(binary) = std::env::var_os("TAURI_RUNTIME_ELECTRON_BINARY") {
-      return PathBuf::from(binary);
-    }
-    if let Some(binary) = &self.binary {
-      return binary.clone();
-    }
-    // `build.rs` stages a runtime under `target/electron/<platform>-<arch>` and
-    // reports it here, which covers `cargo install`-style builds without Node.
-    if let Some(staged) = option_env!("TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY") {
-      let staged = PathBuf::from(staged);
-      if staged.exists() {
-        return staged;
-      }
-    }
-    // A packaged app ships the runtime next to (or under `resources/` beside)
-    // its executable, so those layouts beat anything found in the source tree.
-    // `"resources": { "target/electron": "runtime" }` lands the staged payload in
-    // `runtime/<platform>-<arch>/`, which the bundle target below covers.
-    if let Ok(executable) = std::env::current_exe() {
-      if let Some(dir) = executable.parent() {
-        for candidate in [
-          dir.join("electron").join(electron_executable()),
-          dir.join("resources").join("electron").join(electron_executable()),
-          dir
-            .join("runtime")
-            .join(format!("{}-{}", crate::acquisition::platform(), crate::acquisition::arch()))
-            .join(electron_executable()),
-          dir
-            .join("resources")
-            .join("runtime")
-            .join(format!("{}-{}", crate::acquisition::platform(), crate::acquisition::arch()))
-            .join(electron_executable()),
-          dir.join("runtime").join(electron_executable()),
-        ] {
-          if candidate.exists() {
-            return candidate;
-          }
-        }
-      }
-    }
-    // Probe the usual pnpm/npm layout next to (or above) the current directory.
-    let name = format!("node_modules/electron/dist/{}", electron_executable());
-    let mut dir = std::env::current_dir().ok();
-    for _ in 0..6 {
-      let Some(current) = dir else { break };
-      let candidate = current.join(&name);
-      if candidate.exists() {
-        return candidate;
-      }
-      dir = current.parent().map(PathBuf::from);
-    }
-    // A packaged app ships no Electron payload; the first launch fetches it into
-    // the user cache (verified against the release checksums) and later launches
-    // reuse that copy.
-    match crate::acquisition::ensure_installed() {
-      Ok(binary) => return binary,
-      Err(error) => eprintln!("[electron] could not acquire Electron: {error}"),
-    }
-    PathBuf::from("electron")
-  }
-
-  fn resolve_main_script(&self, binary: &Path) -> PathBuf {
-    if let Some(script) = &self.main_script {
-      return script.clone();
-    }
-    // The staged runtime keeps `main.cjs` beside the Electron binary, which is
-    // the only layout a packaged app is guaranteed to have.
-    let sibling = binary.with_file_name("main.cjs");
-    if sibling.exists() {
-      return sibling;
-    }
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("electron/main.cjs");
-    if manifest.exists() {
-      return manifest;
-    }
-    // Packaged layout: the scripts are copied next to the Electron binary.
-    if let Some(binary) = option_env!("TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY") {
-      let sibling = PathBuf::from(binary).with_file_name("main.cjs");
-      if sibling.exists() {
-        return sibling;
-      }
-    }
-    if let Ok(executable) = std::env::current_exe() {
-      if let Some(dir) = executable.parent() {
-        for candidate in [dir.join("main.cjs"), dir.join("electron").join("main.cjs")] {
-          if candidate.exists() {
-            return candidate;
-          }
-        }
-      }
-    }
-    manifest
-  }
-
-  /// Bundle icon paths are relative to the app's `tauri.conf.json` (the crate
-  /// using the runtime), which is not this crate's own manifest dir.
-  fn resolve_icon(&self) -> Option<PathBuf> {
-    let icon = self.icon.as_ref()?;
-    // Electron resolves a relative icon path against its own cwd, so hand it an
-    // absolute one. Windows canonicalization yields a verbatim `\\?\` path that
-    // Electron's image loader cannot open, so strip that prefix again.
-    let absolute = |path: &PathBuf| {
-      let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-      match path.to_string_lossy().strip_prefix(r"\\?\") {
-        Some(stripped) => PathBuf::from(stripped),
-        None => path,
-      }
-    };
-    if icon.exists() {
-      return Some(absolute(icon));
-    }
-    let mut dir = std::env::current_dir().ok();
-    for _ in 0..6 {
-      let Some(current) = dir else { break };
-      let candidate = current.join(icon);
-      if candidate.exists() {
-        return Some(absolute(&candidate));
-      }
-      dir = current.parent().map(PathBuf::from);
-    }
-    eprintln!("[electron] window icon not found: {}", icon.display());
-    None
-  }
-}
-
-impl<T: UserEvent> RuntimeInitAttrs<T> for Electron {
-  type Runtime = ElectronRuntime;
+impl<T: UserEvent> tauri_runtime::RuntimeInitAttrs<T> for Electron {
+  type Runtime = ElectronRuntime<T>;
 
   fn apply_config(&mut self, config: &tauri_utils::config::Config) -> Result<()> {
-    // Debug builds are what `tauri dev` drives (the same condition Tauri's own
-    // `cfg(dev)` uses), so `tauri://localhost` must resolve to the dev server:
-    // the embedded assets are not bundled in that mode.
-    if self.dev_url.is_none() && cfg!(debug_assertions) {
-      self.dev_url = config
-        .build
-        .dev_url
-        .as_ref()
-        .map(|url| url.as_str().trim_end_matches('/').to_string());
+    /// The `deep-link` plugin's desktop configuration, as one entry or a list.
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum DesktopDeepLinks {
+      One(DeepLinkProtocol),
+      Many(Vec<DeepLinkProtocol>),
     }
-    if self.identifier.is_none() {
-      self.identifier = Some(config.identifier.clone());
+
+    #[derive(serde::Deserialize)]
+    struct DeepLinkProtocol {
+      schemes: Vec<String>,
     }
-    if self.icon.is_some() {
+
+    let Some(value) = config
+      .plugins
+      .0
+      .get("deep-link")
+      .and_then(|plugin| plugin.get("desktop"))
+    else {
       return Ok(());
-    }
-    // Prefer the `.ico` on Windows (crisp at every size), otherwise whatever the
-    // bundle list points at first.
-    let prefer_ico = cfg!(windows);
-    let icon = config
-      .bundle
-      .icon
-      .iter()
-      .find(|icon| prefer_ico && icon.ends_with(".ico"))
-      .or_else(|| config.bundle.icon.iter().find(|icon| icon.ends_with(".png")))
-      .or_else(|| config.bundle.icon.first());
-    if let Some(icon) = icon {
-      // Keep it relative: it is relative to the app's `src-tauri`, not to this
-      // crate, so `resolve_icon` searches upward from the working directory.
-      self.icon = Some(PathBuf::from(icon));
+    };
+    let links: DesktopDeepLinks =
+      serde_json::from_value(value.clone()).map_err(Error::Json)?;
+    let protocols = match links {
+      DesktopDeepLinks::One(protocol) => vec![protocol],
+      DesktopDeepLinks::Many(protocols) => protocols,
+    };
+    for protocol in protocols {
+      self.deep_link_schemes.extend(protocol.schemes);
     }
     Ok(())
   }
 }
 
-/// The app identifier comes from Tauri's `RuntimeInitArgs`, not from these
-/// attributes, but Electron needs it on the command line before it starts: it
-/// names the Chromium profile, so two Tauri apps sharing the cached executable
-/// would otherwise share (and corrupt) one profile.
-fn with_identifier(mut attrs: Electron, identifier: String) -> Electron {
-  if attrs.identifier.is_none() && !identifier.is_empty() {
-    attrs.identifier = Some(identifier);
+impl<T: UserEvent> From<Electron> for tauri_runtime::dynamic::DynRuntimeInitAttrs<T> {
+  fn from(attrs: Electron) -> Self {
+    Self::new(attrs)
   }
-  attrs
 }
 
-impl ElectronRuntime {
-  /// Processes the events Electron has sent since the last call. `run` loops
-  /// over this forever; `run_iteration` calls it once and returns, which is what
-  /// Tauri's polling drivers need.
-  fn pump<T: UserEvent, F: FnMut(RunEvent<T>)>(&mut self, mut callback: &mut F, once: bool) {
-    // Polling drivers call this repeatedly: messages Tauri sends must queue for
-    // the next pump instead of running inline.
-    self.is_running.store(true, Ordering::Relaxed);
-    if !once {
-      callback(RunEvent::Ready);
+/// The runtime handle: everything an application can do without the run loop.
+pub struct ElectronRuntimeHandle<T: UserEvent> {
+  context: RuntimeContext<T>,
+}
+
+impl<T: UserEvent> Clone for ElectronRuntimeHandle<T> {
+  fn clone(&self) -> Self {
+    Self {
+      context: self.context.clone(),
+    }
+  }
+}
+
+impl<T: UserEvent> fmt::Debug for ElectronRuntimeHandle<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ElectronRuntimeHandle").finish_non_exhaustive()
+  }
+}
+
+impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle<T> {
+  type Runtime = ElectronRuntime<T>;
+
+  fn create_proxy(&self) -> EventProxy<T> {
+    EventProxy {
+      context: self.context.clone(),
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  fn set_activation_policy(&self, activation_policy: tauri_runtime::ActivationPolicy) -> Result<()> {
+    let policy = match activation_policy {
+      tauri_runtime::ActivationPolicy::Regular => "regular",
+      tauri_runtime::ActivationPolicy::Accessory => "accessory",
+      tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
+      _ => "regular",
+    };
+    self
+      .context
+      .ipc
+      .call("app.activationPolicy", serde_json::json!({ "policy": policy }), IPC_TIMEOUT)
+      .map(|_| ())
+      .map_err(create_window_err)
+  }
+
+  #[cfg(target_os = "macos")]
+  fn set_dock_visibility(&self, visible: bool) -> Result<()> {
+    self
+      .context
+      .ipc
+      .call("app.dockVisibility", serde_json::json!({ "visible": visible }), IPC_TIMEOUT)
+      .map(|_| ())
+      .map_err(create_window_err)
+  }
+
+  fn request_exit(&self, code: i32) -> Result<()> {
+    self.context.send_message(Message::RequestExit(code))
+  }
+
+  fn create_window<F: Fn(RawWindow) + Send + 'static>(
+    &self,
+    pending: PendingWindow<T, Self::Runtime>,
+    after_window_creation: Option<F>,
+  ) -> Result<DetachedWindow<T, Self::Runtime>> {
+    create_window_detached(&self.context, pending, after_window_creation)
+  }
+
+  fn create_webview(
+    &self,
+    window_id: WindowId,
+    pending: PendingWebview<T, Self::Runtime>,
+  ) -> Result<DetachedWebview<T, Self::Runtime>> {
+    create_webview_detached(&self.context, window_id, pending)
+  }
+
+  fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
+    self.context.send_message(Message::Task(Box::new(f)))
+  }
+
+  fn display_handle(&self) -> std::result::Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
+    // Electron owns the display server connection, so the runtime has no handle of
+    // its own to lend. `SendRawDisplayHandle` keeps the type honest without
+    // pretending a foreign-process connection is ours.
+    let handle = SendRawDisplayHandle::none();
+    Ok(unsafe { DisplayHandle::borrow_raw(handle.as_raw()) })
+  }
+
+  fn primary_monitor(&self) -> Result<Option<Monitor>> {
+    let displays = self
+      .context
+      .ipc
+      .call("window.displays", serde_json::json!({}), IPC_TIMEOUT)
+      .map_err(create_window_err)?;
+    Ok(native_monitor_to_tauri_monitor(&displays["primary"]))
+  }
+
+  fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
+    let display = self
+      .context
+      .ipc
+      .call(
+        "window.displayForPoint",
+        serde_json::json!({ "x": x, "y": y }),
+        IPC_TIMEOUT,
+      )
+      .map_err(create_window_err)?;
+    Ok(native_monitor_to_tauri_monitor(&display))
+  }
+
+  fn available_monitors(&self) -> Result<Vec<Monitor>> {
+    let displays = self
+      .context
+      .ipc
+      .call("window.displays", serde_json::json!({}), IPC_TIMEOUT)
+      .map_err(create_window_err)?;
+    Ok(
+      displays["displays"]
+        .as_array()
+        .map(|list| {
+          list
+            .iter()
+            .filter_map(native_monitor_to_tauri_monitor)
+            .collect()
+        })
+        .unwrap_or_default(),
+    )
+  }
+
+  fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
+    let value = self
+      .context
+      .ipc
+      .call("window.cursorPosition", serde_json::json!({}), IPC_TIMEOUT)
+      .map_err(create_window_err)?;
+    Ok(PhysicalPosition {
+      x: value["x"].as_f64().unwrap_or_default(),
+      y: value["y"].as_f64().unwrap_or_default(),
+    })
+  }
+
+  fn set_theme(&self, theme: Option<Theme>) {
+    if let Err(error) = apply_app_theme(&self.context, theme) {
+      log::warn!("[electron] set theme failed: {error}");
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  fn show(&self) -> Result<()> {
+    self
+      .context
+      .ipc
+      .call("app.show", serde_json::json!({}), IPC_TIMEOUT)
+      .map(|_| ())
+      .map_err(create_window_err)
+  }
+
+  #[cfg(target_os = "macos")]
+  fn hide(&self) -> Result<()> {
+    self
+      .context
+      .ipc
+      .call("app.hide", serde_json::json!({}), IPC_TIMEOUT)
+      .map(|_| ())
+      .map_err(create_window_err)
+  }
+
+  fn set_device_event_filter(&self, _filter: DeviceEventFilter) {
+    // No Electron equivalent: Chromium owns the input pipeline and never hands this
+    // runtime a device event stream to filter.
+    crate::unsupported::report("RuntimeHandle::set_device_event_filter");
+  }
+
+  fn custom_scheme_url(&self, scheme: &str, https: bool) -> String {
+    // Electron serves every registered scheme over the HTTP-family alias, because
+    // Chromium only reports a total length for partial media responses there.
+    let protocol = if https { "https" } else { "http" };
+    format!("{protocol}://{scheme}.localhost")
+  }
+
+  fn webview_version(&self) -> Result<String> {
+    webview::webview_version()
+  }
+
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  fn fetch_data_store_identifiers<F: FnOnce(Vec<[u8; 16]>) + Send + 'static>(
+    &self,
+    cb: F,
+  ) -> Result<()> {
+    // Electron keeps one session per partition name, not a WKWebsiteDataStore
+    // registry, so there is no identifier list to hand out.
+    cb(Vec::new());
+    Ok(())
+  }
+
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  fn remove_data_store<F: FnOnce(Result<()>) + Send + 'static>(
+    &self,
+    _uuid: [u8; 16],
+    cb: F,
+  ) -> Result<()> {
+    // See `fetch_data_store_identifiers`: partitions are cleared by name through
+    // `webview.clearBrowsingData`, not by an opaque identifier.
+    cb(Ok(()));
+    Ok(())
+  }
+}
+
+/// The application theme is app-wide in Electron: `nativeTheme.themeSource`.
+fn apply_app_theme<T: UserEvent>(context: &RuntimeContext<T>, theme: Option<Theme>) -> Result<()> {
+  let name = match theme {
+    Some(Theme::Dark) => "dark",
+    Some(Theme::Light) => "light",
+    _ => "system",
+  };
+  context
+    .ipc
+    .call("app.theme", serde_json::json!({ "theme": name }), IPC_TIMEOUT)
+    .map(|_| ())
+    .map_err(create_window_err)?;
+  *context
+    .theme
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner()) = theme;
+  Ok(())
+}
+
+/// The runtime itself: the run loop and the window/webview factories.
+pub struct ElectronRuntime<T: UserEvent = tauri::EventLoopMessage> {
+  is_running: Arc<AtomicBool>,
+  pub(crate) context: RuntimeContext<T>,
+  run_rx: Receiver<Message<T>>,
+}
+
+impl<T: UserEvent> fmt::Debug for ElectronRuntime<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ElectronRuntime")
+      .field("context", &self.context)
+      .field("is_running", &self.is_running.load(Ordering::Relaxed))
+      .finish_non_exhaustive()
+  }
+}
+
+impl<T: UserEvent> ElectronRuntime<T> {
+  fn init(ipc: Arc<Ipc>, events: Receiver<electron_rs::Event>, attrs: &Electron) -> Self {
+    let is_running = Arc::new(AtomicBool::new(false));
+    let (run_tx, run_rx) = mpsc::channel();
+    let context = RuntimeContext {
+      is_running: Arc::clone(&is_running),
+      windows: Default::default(),
+      run_tx,
+      main_thread_id: std::thread::current().id(),
+      next_window_id: Default::default(),
+      next_webview_id: Default::default(),
+      ipc,
+      events: Arc::new(Mutex::new(events)),
+      protocol_handlers: Default::default(),
+      webview_origins: Default::default(),
+      native_handles: Default::default(),
+      devtools_allowed: resolve_devtools_allowed(attrs.devtools),
+      certificate_errors: attrs.certificate_errors,
+      window_event_handler: attrs.window_event_handler.clone(),
+      theme: Default::default(),
+      accept_language_list: attrs.accept_language_list.clone(),
+    };
+    Self {
+      is_running,
+      context,
+      run_rx,
+    }
+  }
+
+  /// Starts Electron and connects to it.
+  fn start(mut attrs: Electron, custom_schemes: &[String]) -> Result<Self> {
+    let binary = attrs.resolve_binary();
+    log::debug!("[electron] launching {}", binary.display());
+
+    let mut args = Vec::new();
+
+    // Chromium reads its diagnostic environment variables before any embedder hook
+    // runs, so the policy has to be applied before Electron is spawned.
+    let is_dev = tauri::is_dev();
+    if crate::environment::neutralizes_tls_key_log(attrs.debug_environment, is_dev) {
+      push_switch(&mut args, "ssl-key-log-file", Some(""));
+    }
+    crate::environment::remove_crash_reporter_overrides(attrs.debug_environment, is_dev);
+
+    // Switches the runtime always sets, mirroring the reference's
+    // `internal_command_line_args`.
+    push_switch(&mut args, "no-first-run", None);
+    if let Some(severity) = attrs.log_severity {
+      push_switch(&mut args, "log-severity", Some(severity.as_switch_value()));
+    }
+    if let Some(file) = &attrs.log_file {
+      push_switch(&mut args, "log-file", Some(&file.display().to_string()));
+    }
+    if let Some(locale) = &attrs.locale {
+      push_switch(&mut args, "lang", Some(locale));
+    }
+    if let Some(list) = attrs
+      .accept_language_list
+      .clone()
+      .or_else(crate::locale::system_accept_language_list)
+    {
+      push_switch(&mut args, "accept-lang", Some(&list));
+    }
+    if let Some(flags) = &attrs.javascript_flags {
+      push_switch(&mut args, "js-flags", Some(flags));
+    }
+    if let Some(policy_id) = &attrs.chrome_policy_id {
+      push_switch(&mut args, "chrome-policy-id", Some(policy_id));
+    }
+    if let Some(product) = &attrs.user_agent_product {
+      if attrs.user_agent.is_some() {
+        log::warn!(
+          "[electron] user_agent_product is ignored because a whole user_agent was set"
+        );
+      } else {
+        push_switch(&mut args, "user-agent-product", Some(product));
+      }
+    }
+    if attrs.persist_session_cookies {
+      push_switch(&mut args, "persist-session-cookies", None);
+    }
+    if !attrs.allow_chromium_command_line_args && !is_dev {
+      // Release builds refuse Chromium switches from the process command line,
+      // unless the application asked for them.
+      push_switch(&mut args, "disable-features", Some("AllowCommandLineSwitchesFromProcess"));
+    }
+    match &attrs.remote_debugging {
+      RemoteDebugging::Disabled => {}
+      RemoteDebugging::Port {
+        port,
+        allowed_origins,
+      } => {
+        if *port < 1024 {
+          log::warn!(
+            "[electron] remote debugging port {port} is privileged; refusing to listen on it"
+          );
+        } else {
+          push_switch(&mut args, "remote-debugging-port", Some(&port.to_string()));
+          if !allowed_origins.is_empty() {
+            push_switch(&mut args, "remote-allow-origins", Some(&allowed_origins.join(",")));
+          }
+        }
+      }
+      RemoteDebugging::Pipe => push_switch(&mut args, "remote-debugging-pipe", None),
+    }
+    if let Some(value) = secret_storage_switch(attrs.secret_storage, is_dev) {
+      push_switch(&mut args, value.0, Some(value.1));
+    }
+    if let Some(decision) = crate::sandbox::resolve_sandbox_decision(attrs.sandbox) {
+      if decision.no_sandbox {
+        push_switch(&mut args, "no-sandbox", None);
+      }
+    }
+    // Merged feature switches, so a caller's own `--disable-features` is not lost.
+    let disabled = attrs.disabled_features.clone();
+    let enabled = attrs.enabled_features.clone();
+    crate::switches::append_merged_switch(&mut args, "disable-features", &disabled);
+    crate::switches::append_merged_switch(&mut args, "enable-features", &enabled);
+    for (key, value) in &attrs.command_line_args {
+      match value {
+        Some(value) => args.push(format!("--{key}={value}")),
+        None => args.push(format!("--{key}")),
+      }
     }
 
-    'event_loop: loop {
-      // Events pushed by the Electron process.
-      while let Ok(event) = self.event_rx.try_recv() {
-        match event["event"].as_str() {
-          #[cfg(windows)]
-          Some("menu.command") => {
-            let params = &event["params"];
-            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
-            let Some(command) = params["commandId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
-            let owner = self.context.windows.borrow().values()
-              .find(|window| window.serial == serial)
-              .and_then(|window| window.menu_owner.as_ref().map(|owner| owner.handle));
-            if let Some(owner) = owner {
-              if crate::window::imp::menu_snapshot(owner).is_ok_and(|menu| menu_command_enabled(&menu, command)) {
-                crate::window::imp::dispatch_menu_command(owner, command);
-              }
-            }
-          }
-          Some("window.themeChanged") => {
-            let params = &event["params"];
-            let Some(serial) = params["windowId"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue };
-            let Some(id) = self.context.window_for_serial(serial) else { continue };
-            let theme = match params["theme"].as_str() {
-              Some("dark") => Theme::Dark,
-              Some("light") => Theme::Light,
-              _ => continue,
-            };
-            #[cfg(windows)]
-            if let Some(dark) = params["dark"].as_bool() {
-              match self.context.native_handle(id).map_err(|error| error.to_string())
-                .and_then(|handle| crate::window::imp::set_theme(handle, dark))
-              {
-                Ok(()) => {},
-                Err(error) => eprintln!("[electron] native window theme failed: {error}"),
-              }
-            }
-            let label = self.context.windows.borrow().get(&id).map(|window| window.label.clone());
-            if let Some(label) = label {
-              self.context.emit_window_event(id, &WindowEvent::ThemeChanged(theme));
-              callback(RunEvent::WindowEvent { label, event: WindowEvent::ThemeChanged(theme) });
-            }
-          }
-          Some("window.closeRequested") => {
-            let serial = event["params"]["windowId"].as_u64().unwrap_or_default() as u32;
-            let Some(id) = self.context.window_for_serial(serial) else {
-              continue;
-            };
-            close_window(&self.context, id, &mut callback);
-          }
-          Some("window.closed") => {
-            let serial = event["params"]["windowId"].as_u64().unwrap_or_default() as u32;
-            let Some(id) = self.context.window_for_serial(serial) else {
-              continue;
-            };
-            if window_closed(&self.context, id, &mut callback) {
-              break 'event_loop;
-            }
-          }
-          Some("window.event") => {
-            let params = &event["params"];
-            let serial = params["windowId"].as_u64().unwrap_or_default() as u32;
-            let Some(id) = self.context.window_for_serial(serial) else {
-              continue;
-            };
-            let Some(label) = self
-              .context
-              .windows
-              .borrow()
-              .get(&id)
-              .map(|window| window.label.clone())
-            else {
-              continue;
-            };
-            let Some(window_event) = window_event_for(params) else {
-              continue;
-            };
-            self.context.emit_window_event(id, &window_event);
-            callback(RunEvent::WindowEvent {
-              label,
-              event: window_event,
-            });
-          }
-          Some(name @ ("webview.loadStarted" | "webview.loadFinished")) => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
-              continue;
-            };
-            let handler = self.context.webview_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.page_load.clone());
-            if let Some(handler) = handler
-            {
-              let page_load = if name == "webview.loadStarted" {
-                PageLoadEvent::Started
-              } else {
-                PageLoadEvent::Finished
-              };
-              handler(url, page_load);
-            }
-          }
-          Some("webview.titleChanged") => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let title = params["title"].as_str().unwrap_or_default().to_string();
-            let handler = self.context.webview_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.title.clone());
-            if let Some(handler) = handler
-            {
-              handler(title);
-            }
-          }
-          Some("webview.newWindow") => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
-              continue;
-            };
-            let features = params["features"].as_str().unwrap_or_default();
-            // Electron always denies the popup: the answer may create a Tauri
-            // window (whose URL is loaded into it), allow a bare popup, or deny.
-            let handler = self.context.webview_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.new_window.clone());
-            let response = handler.map(|handler| handler(url.clone(), features));
-            match response {
-              Some(NewWindowResponse::Create { window_id }) => {
-                let target = self.context.serial_for_window(window_id);
-                match target {
-                  Some(window_serial) => {
-                    if let Err(error) = self.context.ipc.call(
-                      "webview.navigate",
-                      json!({ "webviewId": window_serial, "url": url.as_str() }),
-                      IPC_TIMEOUT,
-                    ) {
-                      eprintln!("[electron] failed to open {url} in window: {error}");
-                    }
-                  }
-                  None => eprintln!("[electron] new window requested for a closed window: {url}"),
-                }
-              }
-              Some(NewWindowResponse::Allow) => {
-                let (size, _position) = crate::popup::window_features(features);
-                if let Err(error) = self.context.ipc.call(
-                  "webview.openUrl",
-                  json!({
-                    "url": url.as_str(),
-                    "width": size.map(|size| size.width),
-                    "height": size.map(|size| size.height),
-                  }),
-                  IPC_TIMEOUT,
-                ) {
-                  eprintln!("[electron] failed to open popup {url}: {error}");
-                }
-              }
-              Some(NewWindowResponse::Deny) | None => {
-                eprintln!("[electron] denied new window request for {url}");
-              }
-            }
-          }
-          Some("webview.processGone") => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let termination = WebContentProcessTermination {
-              reason: termination_reason(params["reason"].as_str().unwrap_or_default()),
-              error_code: params["exitCode"].as_i64().map(|code| code as i32),
-              error_string: params["reason"].as_str().map(str::to_string),
-            };
-            eprintln!(
-              "[electron] webview {serial} process gone: {reason}",
-              reason = termination.error_string.as_deref().unwrap_or("unknown")
-            );
-            let handler = self.context.webview_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.process_gone.clone());
-            if let Some(handler) = handler
-            {
-              handler(termination);
-            }
-          }
-          Some("download.requested") => {
-            let params = &event["params"];
-            let (Some(id), Some(serial)) = (params["id"].as_u64(), params["webviewId"].as_u64())
-            else {
-              continue;
-            };
-            let mut destination = PathBuf::from(params["destination"].as_str().unwrap_or_default());
-            let handler = self
-              .context
-              .policy_handlers
-              .borrow()
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.download.clone());
-            // A webview without a handler keeps Electron's own destination.
-            let allow = match handler {
-              Some(handler) => url::Url::parse(params["url"].as_str().unwrap_or_default())
-                .map(|url| {
-                  handler(DownloadEvent::Requested {
-                    url,
-                    destination: &mut destination,
-                  })
-                })
-                .unwrap_or(false),
-              None => true,
-            };
-            if let Err(error) = self.context.ipc.call(
-              "webview.downloadResponse",
-              json!({ "id": id, "allow": allow, "destination": destination }),
-              IPC_TIMEOUT,
-            ) {
-              eprintln!("[electron] failed to answer a download request: {error}");
-            }
-          }
-          Some("download.finished") => {
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let Ok(url) = url::Url::parse(params["url"].as_str().unwrap_or_default()) else {
-              continue;
-            };
-            let path = params["path"].as_str().map(PathBuf::from);
-            let success = params["success"].as_bool().unwrap_or(false);
-            let handler = self
-              .context
-              .policy_handlers
-              .borrow()
-              .get(&(serial as u32))
-              .and_then(|handlers| handlers.download.clone());
-            if let Some(handler) = handler {
-              handler(DownloadEvent::Finished { url, path, success });
-            }
-          }
-          Some("permission.requested") => {
-            let params = &event["params"];
-            let (Some(id), Some(serial)) = (params["id"].as_u64(), params["webviewId"].as_u64())
-            else {
-              continue;
-            };
-            let kind = permission_kind(params["kind"].as_str().unwrap_or_default());
-            let handler = self.context.policy_handlers.borrow()
-              .get(&(serial as u32)).and_then(|handlers| handlers.permission.clone());
-            let response = match (kind, handler) {
-              (Some(kind), Some(handler)) => permission_response_name(handler(kind)),
-              // Tauri's `Default` means the runtime default; Electron's own
-              // default for an unhandled permission is to deny it.
-              _ => "default",
-            };
-            if let Err(error) = self.context.ipc.call(
-              "webview.permissionResponse",
-              json!({ "id": id, "response": response }),
-              IPC_TIMEOUT,
-            ) {
-              eprintln!("[electron] failed to answer a permission request: {error}");
-            }
-          }
-          Some("ipc.message") => {
+    // The cache path is per application, so two apps never share a profile.
+    let cache_path = attrs.cache_path.clone().unwrap_or_else(|| {
+      let root = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
+      let identifier = attrs
+        .identifier
+        .clone()
+        .unwrap_or_else(|| "tauri-runtime-electron".to_owned());
+      root.join(identifier).join("electron")
+    });
+    create_dir_all(&cache_path).map_err(|error| {
+      create_window_err(format!("create {}: {error}", cache_path.display()))
+    })?;
+    crate::downgrade::prepare_root_cache_path(&cache_path, attrs.downgrade)
+      .map_err(create_window_err)?;
+    // The breadcrumb is only meaningful if Electron really uses this directory as
+    // its profile, so the path has to reach Chromium as well.
+    push_switch(&mut args, "user-data-dir", Some(&cache_path.display().to_string()));
 
+    let mut settings = ElectronSettings {
+      cache_path: Some(cache_path),
+      log_file: attrs.log_file.clone(),
+      log_severity: attrs.log_severity.unwrap_or(LogSeverity::Default),
+      log_items: attrs.log_items.unwrap_or_default(),
+      user_agent: attrs.user_agent.clone(),
+      user_agent_product: attrs.user_agent_product.clone(),
+      locale: attrs.locale.clone(),
+      accept_language_list: attrs.accept_language_list.clone(),
+      persist_session_cookies: attrs.persist_session_cookies,
+      javascript_flags: attrs.javascript_flags.clone(),
+      chrome_policy_id: attrs.chrome_policy_id.clone(),
+      no_sandbox: attrs.sandbox == SandboxPolicy::Disabled,
+    };
+    if let Some(callback) = attrs.settings_callback.take() {
+      callback(&mut settings);
+    }
 
-            let params = &event["params"];
-            let Some(serial) = params["webviewId"].as_u64() else {
-              continue;
-            };
-            let Some(handler) = self
-              .context
-              .ipc_handlers
-              .borrow()
-              .get(&(serial as u32))
-              .cloned()
-            else {
-              eprintln!("[electron] ipc message for unknown webview {serial}");
-              continue;
-            };
-            let body = params["body"].as_str().unwrap_or_default().to_string();
-            let url = params["url"].as_str().unwrap_or_default().to_string();
-            match Request::builder().uri(url).body(body) {
-              Ok(request) => handler(request),
-              Err(error) => eprintln!("[electron] invalid ipc request url: {error}"),
-            }
-          }
-          Some("protocol.request") => {
-            let params = &event["params"];
-            let Some(id) = params["id"].as_u64() else { continue };
-            let scheme = params["scheme"].as_str().unwrap_or_default().to_string();
-            let selected = if scheme == "ipc" {
-              params["webviewId"].as_u64().and_then(|serial| {
-                self.context.ipc_protocol_handlers.borrow().get(&(serial as u32)).cloned()
-              })
-            } else {
-              self.context.protocol_handlers.borrow().get(&scheme).cloned()
-            };
-            let Some((label, handler)) = selected else {
-              let _ = self.context.ipc.call("protocol.respond", json!({ "id": id, "status": 403 }), IPC_TIMEOUT);
-              continue;
-            };
-            let uri = params["uri"].as_str().unwrap_or_default().to_string();
-            let body = params["body"]
-              .as_str()
-              .and_then(|body| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).ok())
-              .unwrap_or_default();
-            let mut builder = Request::builder()
-              .method(params["method"].as_str().unwrap_or("GET"))
-              .uri(&uri);
-            if let Some(headers) = params["headers"].as_object() {
-              for (name, value) in headers {
-                if let Some(value) = value.as_str() {
-                  builder = builder.header(name.as_str(), value);
-                }
-              }
-            }
-            let mut request = match builder.body(body) {
-              Ok(request) => request,
-              Err(error) => {
-                eprintln!("[electron] invalid protocol request {uri}: {error}");
-                let _ = self.context.ipc.call("protocol.respond", json!({ "id": id, "status": 400 }), IPC_TIMEOUT);
-                continue;
-              }
-            };
-            // Electron reports the request URL (e.g. `ipc://localhost`) as the
-            // Origin header. Tauri validates that header against the page URL to
-            // decide between local and remote contexts, so rewrite it to the
-            // origin of the webview that issued the request.
-            let origin = if scheme == "ipc" {
-              params["pageUrl"].as_str().and_then(origin_of)
-            } else {
-              self.context.webview_origins.borrow().get(&label).cloned()
-            };
-            if let Some(origin) = origin {
-              if let Ok(value) = http::HeaderValue::from_str(&origin) {
-                request.headers_mut().insert(http::header::ORIGIN, value);
-              }
-            }
-            let ipc = self.context.ipc.clone();
-            let request_uri = uri.clone();
-            let responder: Box<dyn FnOnce(Response<std::borrow::Cow<'static, [u8]>>) + Send> =
-              Box::new(move |response: Response<std::borrow::Cow<'static, [u8]>>| {
-                use base64::Engine;
-                let headers: serde_json::Map<String, Value> = response
-                  .headers()
-                  .iter()
-                  .filter_map(|(name, value)| {
-                    value
-                      .to_str()
-                      .ok()
-                      .map(|value| (name.to_string(), Value::String(value.to_string())))
-                  })
-                  .collect();
-                let body = base64::engine::general_purpose::STANDARD.encode(response.body().as_ref());
-                if let Err(error) = ipc.call(
-                  "protocol.respond",
-                  json!({
-                    "id": id,
-                    "status": response.status().as_u16(),
-                    "headers": headers,
-                    "body": body,
-                  }),
-                  IPC_TIMEOUT,
-                ) {
-                  eprintln!("[electron] failed to answer protocol request {request_uri}: {error}");
-                }
-              });
-            handler(&label, request, responder);
-          }
-          Some("ipc.closed") => break 'event_loop,
-          _ => {}
+    // Electron only accepts privileged schemes at startup, so they travel on the
+    // command line and are installed before `app.whenReady()`. `asset` is not in
+    // Tauri's `custom_schemes` (its handler is registered per webview), but it needs
+    // the same privileges for `convertFileSrc` fetches to work.
+    let mut schemes: Vec<String> = ["ipc", "tauri", "asset"]
+      .iter()
+      .map(|scheme| (*scheme).to_owned())
+      .collect();
+    for scheme in custom_schemes.iter().chain(&attrs.deep_link_schemes) {
+      let scheme = scheme.to_ascii_lowercase();
+      if !is_valid_scheme(&scheme) {
+        return Err(create_window_err(format!(
+          "invalid custom URL scheme: {scheme:?}"
+        )));
+      }
+      if !schemes.contains(&scheme) {
+        schemes.push(scheme);
+      }
+    }
+    push_switch(&mut args, "tauri-schemes", Some(&schemes.join(",")));
+    if let Some(identifier) = &attrs.identifier {
+      push_switch(&mut args, "tauri-identifier", Some(identifier.as_str()));
+    }
+    push_switch(&mut args, API_VERSION_SWITCH, Some(ELECTRON_API_VERSION_LAST));
+
+    let (ipc, events) = Ipc::launch(
+      &binary,
+      &args,
+      attrs.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
+    )
+    .map_err(create_window_err)?;
+
+    // Preferences and content settings travel as one startup payload: Electron has
+    // to apply them before the first session is used.
+    if !attrs.profile_preferences.is_empty()
+      || !attrs.global_preferences.is_empty()
+      || !attrs.content_settings.is_empty()
+    {
+      let preferences = attrs
+        .profile_preferences
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+      let global = attrs
+        .global_preferences
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+      let content = attrs
+        .content_settings
+        .iter()
+        .map(|(kind, value)| {
+          (
+            kind.permission().to_owned(),
+            serde_json::json!({ "answer": value.answer() }),
+          )
+        })
+        .collect::<serde_json::Map<_, _>>();
+      ipc
+        .call(
+          "app.configure",
+          serde_json::json!({
+            "preferences": preferences,
+            "globalPreferences": global,
+            "contentSettings": content,
+            "certificateErrors": match attrs.certificate_errors {
+              CertificateErrorPolicy::ChromeInterstitial => "interstitial",
+              CertificateErrorPolicy::Cancel => "cancel",
+            },
+            "devtoolsAllowed": resolve_devtools_allowed(attrs.devtools),
+          }),
+          IPC_TIMEOUT,
+        )
+        .map_err(create_window_err)?;
+    }
+
+    Ok(Self::init(ipc, events, &attrs))
+  }
+
+  /// Drains Electron's event stream and Tauri's message queue once.
+  fn pump<F: FnMut(RunEvent<T>)>(&mut self, callback: &mut F, block: bool) -> bool {
+    let mut delivered = false;
+
+    if block {
+      // Wait for at least one message so `run_iteration` never spins.
+      match self.run_rx.recv_timeout(Duration::from_millis(1)) {
+        Ok(message) => {
+          self.handle_message(message, callback);
+          delivered = true;
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+      }
+    }
+    while let Ok(message) = self.run_rx.try_recv() {
+      self.handle_message(message, callback);
+      delivered = true;
+    }
+
+    // Electron events first, so a window that closed is gone before Tauri asks
+    // about it.
+    let events: Vec<electron_rs::Event> = {
+      let receiver = self
+        .context
+        .events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      let mut batch = Vec::new();
+      loop {
+        match receiver.try_recv() {
+          Ok(event) => batch.push(event),
+          Err(_) => break,
         }
       }
+      batch
+    };
+    for event in events {
+      delivered = true;
+      if !self.handle_electron_event(event, callback) {
+        return false;
+      }
+    }
+    delivered
+  }
 
-      // Messages sent by Tauri (window operations run on the main thread).
-      while let Ok(message) = self.run_rx.try_recv() {
-        match message {
-          Message::Task(task) => task(),
-          Message::CloseWindow(id) => {
-            if close_window(&self.context, id, &mut callback) {
-              break 'event_loop;
-            }
-          }
-          Message::DestroyWindow(id) => {
-            let removed = self.context.windows.borrow_mut().remove(&id).is_some();
-            if removed && exit_if_empty(&self.context, &mut callback) {
-              break 'event_loop;
-            }
-          }
-          Message::UserEvent(event) => {
-            if let Ok(event) = event.downcast::<T>() {
-              callback(RunEvent::UserEvent(*event));
-            }
-          }
-          Message::Exit => break 'event_loop,
+  /// Turns one Electron event into Tauri events. Returns `false` to stop the loop.
+  fn handle_electron_event<F: FnMut(RunEvent<T>)>(
+    &mut self,
+    event: electron_rs::Event,
+    callback: &mut F,
+  ) -> bool {
+    client::dispatch(&self.context, event, callback)
+  }
+
+  fn handle_message<F: FnMut(RunEvent<T>)>(&mut self, message: Message<T>, callback: &mut F) {
+    match message {
+      Message::Task(task) => task(),
+      Message::UserEvent(event) => callback(RunEvent::UserEvent(event)),
+      Message::RequestExit(code) => {
+        // Tauri answers through the channel: `Prevent` keeps the loop running, and
+        // anything else lets it stop.
+        let (tx, rx) = mpsc::channel();
+        callback(RunEvent::ExitRequested {
+          code: Some(code),
+          tx,
+        });
+        if rx.try_recv().is_err() {
+          self.is_running.store(false, Ordering::Relaxed);
         }
       }
-
-      callback(RunEvent::MainEventsCleared);
-
-      // Native UI (tray icons, menus) lives on this thread and posts window
-      // messages here; Electron owns its own process, so nothing else pumps them.
-      pump_thread_messages();
-      #[cfg(windows)]
-      {
-        for (owner, method) in crate::window::imp::take_menu_actions() {
-          let target = self.context.windows.borrow().iter().find_map(|(id, window)| {
-            window.menu_owner.as_ref().filter(|menu| menu.handle == owner)
-              .map(|_| (*id, window.serial))
-          });
-          let Some((id, serial)) = target else { continue };
-          if method == "window.close" {
-            if close_window(&self.context, id, &mut callback) {
-              break 'event_loop;
-            }
-          } else if let Err(error) = self.context.ipc.call(method, json!({ "windowId": serial }), IPC_TIMEOUT) {
-            eprintln!("[electron] native menu action failed: {error}");
-          }
-        }
-        self.context.sync_window_menus();
+      Message::Window(id, message) => crate::window::handle_window_message(&self.context, id, message),
+      Message::Webview(id, message) => {
+        crate::webview::handle_webview_message(&self.context, id, message)
       }
+      Message::WindowEvent(id, event) => {
+        callback(RunEvent::WindowEvent {
+          label: self
+            .context
+            .with_window(id, |window| window.label.clone())
+            .unwrap_or_default(),
+          event: *event,
+        });
+      }
+    }
+  }
 
-      if once {
+  /// Runs the loop until Electron disconnects or the application exits.
+  fn run_loop<F: FnMut(RunEvent<T>)>(&mut self, mut callback: F) {
+    self.is_running.store(true, Ordering::Relaxed);
+    callback(RunEvent::Ready);
+    loop {
+      if !self.pump(&mut callback, true) {
         break;
       }
-
-      std::thread::sleep(Duration::from_millis(10));
+      if !self.is_running.load(Ordering::Relaxed) {
+        break;
+      }
     }
-
-    if once {
-      return;
-    }
-
     self.is_running.store(false, Ordering::Relaxed);
-    eprintln!("[electron] run loop finished, shutting the runtime down");
-    self.context.ipc.shutdown();
-    callback(RunEvent::Exit);
   }
-
 }
 
-impl<T: UserEvent> Runtime<T> for ElectronRuntime {
-  type WindowDispatcher = ElectronWindowDispatcher;
-  type WebviewDispatcher = ElectronWebviewDispatcher;
-  type Handle = ElectronRuntimeHandle;
-  type EventLoopProxy = EventProxy;
-  type RuntimeWebviewAttributes = ();
+/// Appends one Chromium switch, with `=value` when there is a value.
+fn push_switch(args: &mut Vec<String>, key: &str, value: Option<&str>) {
+  match value {
+    Some(value) => args.push(format!("--{key}={value}")),
+    None => args.push(format!("--{key}")),
+  }
+}
+
+/// The switch that selects Chromium's `os_crypt` key, when the policy asks for one.
+///
+/// Windows is untouched: DPAPI is always the key, and Chromium has no switch that
+/// would replace it.
+fn secret_storage_switch(storage: SecretStorage, is_dev: bool) -> Option<(&'static str, &'static str)> {
+  let mock = match storage {
+    SecretStorage::Auto => is_dev,
+    SecretStorage::Mock => true,
+    SecretStorage::System => false,
+  };
+  if !mock {
+    return None;
+  }
+  if cfg!(target_os = "macos") {
+    Some(("use-mock-keychain", ""))
+  } else if cfg!(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+  )) {
+    Some(("password-store", "basic"))
+  } else {
+    None
+  }
+}
+
+/// Whether a DevTools window may open, resolved from the policy and the build.
+fn resolve_devtools_allowed(policy: DevToolsPolicy) -> bool {
+  match policy {
+    DevToolsPolicy::Auto => tauri::is_dev() || cfg!(feature = "devtools"),
+    DevToolsPolicy::Allowed => true,
+    DevToolsPolicy::Disallowed => false,
+  }
+}
+
+/// A URL scheme is a lower-case ASCII letter followed by letters, digits, `+`, `-`
+/// or `.`, per RFC 3986.
+fn is_valid_scheme(scheme: &str) -> bool {
+  let mut chars = scheme.chars();
+  matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+    && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+impl<T: UserEvent> Runtime<T> for ElectronRuntime<T> {
+  type WindowDispatcher = ElectronWindowDispatcher<T>;
+  type WebviewDispatcher = ElectronWebviewDispatcher<T>;
+  type Handle = ElectronRuntimeHandle<T>;
+  type EventLoopProxy = EventProxy<T>;
+  type RuntimeWebviewAttributes = ElectronWebviewAttributes;
   type RuntimeInitAttrs = Electron;
-  type WindowOpener = ();
-  type Webview = ();
+  type WindowOpener = NewWindowOpener;
+  type Webview = Webview;
 
   fn new(args: RuntimeInitArgs<Electron>) -> Result<Self> {
     let identifier = args.identifier.clone();
-    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
+    let mut attrs = args.runtime_init_attrs;
+    // The application's own identifier wins; Tauri's is the fallback.
+    if attrs.identifier.is_none() {
+      attrs.identifier = Some(identifier);
+    }
+    Self::start(attrs, &args.custom_schemes)
   }
 
   #[cfg(any(
@@ -1295,13 +1938,12 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "openbsd"
   ))]
   fn new_any_thread(args: RuntimeInitArgs<Electron>) -> Result<Self> {
-    let identifier = args.identifier.clone();
-    Self::start(with_identifier(args.runtime_init_attrs, identifier), &args.custom_schemes)
+    Self::new(args)
   }
 
-  fn create_proxy(&self) -> EventProxy {
+  fn create_proxy(&self) -> Self::EventLoopProxy {
     EventProxy {
-      run_tx: self.context.run_tx.clone(),
+      context: self.context.clone(),
     }
   }
 
@@ -1311,12 +1953,12 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     }
   }
 
-  fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
+  fn create_window<F: Fn(RawWindow) + Send + 'static>(
     &self,
     pending: PendingWindow<T, Self>,
     after_window_creation: Option<F>,
   ) -> Result<DetachedWindow<T, Self>> {
-    create_window_impl(&self.context, pending, after_window_creation)
+    create_window_detached(&self.context, pending, after_window_creation)
   }
 
   fn create_webview(
@@ -1324,121 +1966,72 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     window_id: WindowId,
     pending: PendingWebview<T, Self>,
   ) -> Result<DetachedWebview<T, Self>> {
-    create_webview_impl(&self.context, window_id, pending)
+    create_webview_detached(&self.context, window_id, pending)
   }
 
   fn primary_monitor(&self) -> Option<Monitor> {
-    let displays = self
-      .context
-      .ipc
-      .call("window.displays", json!({}), IPC_TIMEOUT)
-      .ok()?;
-    platform::monitor_from_value(&displays["primary"])
+    self.handle().primary_monitor().ok().flatten()
   }
 
   fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
-    let display = self
-      .context
-      .ipc
-      .call("window.displayForPoint", json!({ "x": x, "y": y }), IPC_TIMEOUT)
-      .ok()?;
-    platform::monitor_from_value(&display)
+    self.handle().monitor_from_point(x, y).ok().flatten()
   }
 
   fn available_monitors(&self) -> Vec<Monitor> {
-    self
-      .context
-      .ipc
-      .call("window.displays", json!({}), IPC_TIMEOUT)
-      .ok()
-      .and_then(|displays| {
-        displays["displays"]
-          .as_array()
-          .map(|list| list.iter().filter_map(platform::monitor_from_value).collect())
-      })
-      .unwrap_or_default()
+    self.handle().available_monitors().unwrap_or_default()
+  }
+
+  fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
+    self.handle().cursor_position()
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    let theme = match theme {
-      Some(Theme::Dark) => "dark",
-      Some(_) => "light",
-      None => "system",
-    };
-    if let Err(error) = self
-      .context
-      .ipc
-      .call("app.theme", json!({ "theme": theme }), IPC_TIMEOUT)
-    {
-      eprintln!("[electron] set theme failed: {error}");
-    }
+    self.handle().set_theme(theme);
   }
 
-  // Electron exposes these application-level switches through `app`, not the
-  // window: macOS activation policy, dock icon visibility, and app show/hide.
   #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn set_activation_policy(&mut self, activation_policy: tauri_runtime::ActivationPolicy) {
-    let policy = match activation_policy {
-      tauri_runtime::ActivationPolicy::Regular => "regular",
-      tauri_runtime::ActivationPolicy::Accessory => "accessory",
-      tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
-      _ => "regular",
-    };
-    if let Err(error) = self.context.ipc.call(
-      "app.activationPolicy",
-      json!({ "policy": policy }),
-      IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] set activation policy failed: {error}");
+    if let Err(error) = self.handle().set_activation_policy(activation_policy) {
+      log::warn!("[electron] set activation policy failed: {error}");
     }
   }
 
   #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn set_dock_visibility(&mut self, visible: bool) {
-    if let Err(error) = self.context.ipc.call(
-      "app.dockVisibility",
-      json!({ "visible": visible }),
-      IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] set dock visibility failed: {error}");
-    }
-  }
-
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn set_activate_ignoring_other_apps(&mut self, ignore: bool) {
-    // There is no direct equivalent; focusing with `steal` is the closest.
-    if let Err(error) = self
-      .context
-      .ipc
-      .call("app.focus", json!({ "steal": ignore }), IPC_TIMEOUT)
-    {
-      eprintln!("[electron] focus app failed: {error}");
+    // No Electron equivalent: `app.focus({ steal: true })` is the closest, and it
+    // only affects activation, not the "ignore other apps" flag.
+    if let Err(error) = self.context.ipc.call(
+      "app.focus",
+      serde_json::json!({ "steal": ignore }),
+      IPC_TIMEOUT,
+    ) {
+      log::warn!("[electron] focus app failed: {error}");
     }
   }
 
   #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn set_dock_visibility(&mut self, visible: bool) {
+    if let Err(error) = self.handle().set_dock_visibility(visible) {
+      log::warn!("[electron] set dock visibility failed: {error}");
+    }
+  }
+
+  #[cfg(target_os = "macos")]
   fn show(&self) {
-    if let Err(error) = self.context.ipc.call("app.show", json!({}), IPC_TIMEOUT) {
-      eprintln!("[electron] show app failed: {error}");
+    if let Err(error) = self.handle().show() {
+      log::warn!("[electron] show app failed: {error}");
     }
   }
 
   #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn hide(&self) {
-    if let Err(error) = self.context.ipc.call("app.hide", json!({}), IPC_TIMEOUT) {
-      eprintln!("[electron] hide app failed: {error}");
+    if let Err(error) = self.handle().hide() {
+      log::warn!("[electron] hide app failed: {error}");
     }
   }
 
-  fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {
-    // No Electron equivalent: Chromium owns the input pipeline and never hands
-    // this runtime a device event stream to filter.
-    crate::unsupported::report("Runtime::set_device_event_filter");
+  fn set_device_event_filter(&mut self, filter: DeviceEventFilter) {
+    self.handle().set_device_event_filter(filter);
   }
 
   #[cfg(any(
@@ -1451,894 +2044,19 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime {
     target_os = "openbsd"
   ))]
   fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, mut callback: F) {
+    self.is_running.store(true, Ordering::Relaxed);
     self.pump(&mut callback, true);
+    self.is_running.store(false, Ordering::Relaxed);
   }
 
-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
-    self.run(callback);
+  fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
+    let mut runtime = self;
+    runtime.run_loop(callback);
+  }
 
+  fn run_return<F: FnMut(RunEvent<T>)>(mut self, callback: F) -> i32 {
+    let mut callback = callback;
+    self.run_loop(&mut callback);
     0
   }
-
-  fn run<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) {
-    let mut runtime = self;
-    runtime.pump(&mut callback, false);
-  }
-
-  fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
-    let point = self
-      .context
-      .ipc
-      .call("window.cursorPosition", json!({}), IPC_TIMEOUT)
-      .map_err(create_window_err)?;
-    Ok(PhysicalPosition::new(
-      point["x"].as_f64().unwrap_or_default(),
-      point["y"].as_f64().unwrap_or_default(),
-    ))
-  }
 }
-
-/// Name of the Electron executable on the host platform.
-fn electron_executable() -> &'static str {
-  if cfg!(windows) {
-    "electron.exe"
-  } else {
-    "electron"
-  }
-}
-
-/// Translates an Electron window event into the Tauri equivalent.
-fn window_event_for(params: &Value) -> Option<WindowEvent> {
-  match params["event"].as_str()? {
-    "resize" => Some(WindowEvent::Resized(rect_size(&params["contentBounds"]))),
-    "move" => Some(WindowEvent::Moved(rect_position(&params["bounds"]))),
-    "focus" => Some(WindowEvent::Focused(true)),
-    "blur" => Some(WindowEvent::Focused(false)),
-    _ => None,
-  }
-}
-
-/// Emits `WindowEvent::CloseRequested` for `id`; returns `true` if the runtime
-/// should exit (window was removable and the app has no windows left).
-/// Asks Tauri whether the window may close. Electron keeps the window alive
-/// until the answer comes back, so `prevent_close` is actually honoured.
-/// Returns `true` when the close should proceed.
-fn request_close<T: UserEvent, F: FnMut(RunEvent<T>)>(
-  context: &RuntimeContext,
-  id: WindowId,
-  callback: &mut F,
-) -> bool {
-  let Some(label) = context
-    .windows
-    .borrow()
-    .get(&id)
-    .map(|window| window.label.clone())
-  else {
-    return false;
-  };
-
-  let (tx, rx) = channel();
-  let close_requested = WindowEvent::CloseRequested { signal_tx: tx };
-  context.emit_window_event(id, &close_requested);
-  callback(RunEvent::WindowEvent {
-    label,
-    event: close_requested,
-  });
-  !matches!(rx.try_recv(), Ok(true))
-}
-
-/// Forgets a window Electron already destroyed. Returns `true` when the app
-/// should exit because no window is left.
-fn window_closed<T: UserEvent, F: FnMut(RunEvent<T>)>(
-  context: &RuntimeContext,
-  id: WindowId,
-  callback: &mut F,
-) -> bool {
-  let Some(label) = context
-    .windows
-    .borrow()
-    .get(&id)
-    .map(|window| window.label.clone())
-  else {
-    return false;
-  };
-
-  context.emit_window_event(id, &WindowEvent::Destroyed);
-  if let Some(window) = context.windows.borrow_mut().remove(&id) {
-    for webview in window.webviews {
-      context.ipc_protocol_handlers.borrow_mut().remove(&webview.serial);
-      context.ipc_handlers.borrow_mut().remove(&webview.serial);
-      context.webview_handlers.borrow_mut().remove(&webview.serial);
-      context.policy_handlers.borrow_mut().remove(&webview.serial);
-      context.webview_origins.borrow_mut().remove(&webview.label);
-    }
-    context.native_handles.borrow_mut().remove(&window.serial);
-  }
-  callback(RunEvent::WindowEvent {
-    label,
-    event: WindowEvent::Destroyed,
-  });
-  exit_if_empty(context, callback)
-}
-
-/// Runs the close handshake for a window that asked to close: ask Tauri, and
-/// only tell Electron to destroy the window when nobody prevented it.
-fn close_window<T: UserEvent, F: FnMut(RunEvent<T>)>(
-  context: &RuntimeContext,
-  id: WindowId,
-  callback: &mut F,
-) -> bool {
-  if !request_close(context, id, callback) {
-    return false;
-  }
-  if let Some(serial) = context.serial_for_window(id) {
-    if let Err(error) = context.ipc.call(
-      "window.destroy",
-      serde_json::json!({ "windowId": serial }),
-      IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] failed to destroy window {serial}: {error}");
-    }
-  }
-  false
-}
-
-/// Emits `RunEvent::ExitRequested` when no windows remain; returns `true` when
-/// the app should exit.
-fn exit_if_empty<T: UserEvent, F: FnMut(RunEvent<T>)>(
-  context: &RuntimeContext,
-  callback: &mut F,
-) -> bool {
-  if !context.windows.borrow().is_empty() {
-    return false;
-  }
-  let (tx, rx) = channel();
-  callback(RunEvent::ExitRequested { code: None, tx });
-  !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent))
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn run_window_creation_callback(callback: impl FnOnce(RawWindow<'_>), _handle: isize) {
-  callback(RawWindow {
-    #[cfg(windows)]
-    hwnd: _handle,
-    _marker: &std::marker::PhantomData,
-  });
-}
-
-pub(crate) fn create_window_impl<T: UserEvent, F: Fn(RawWindow<'_>) + Send + 'static>(
-  context: &RuntimeContext,
-  pending: PendingWindow<T, ElectronRuntime>,
-  after_window_creation: Option<F>,
-) -> Result<DetachedWindow<T, ElectronRuntime>> {
-  if std::thread::current().id() != context.main_thread_id {
-    return context.on_main_thread(move |context| create_window_impl(context, pending, after_window_creation))?;
-  }
-  let PendingWindow {
-    label,
-    window_builder,
-    mut webview,
-  } = pending;
-
-  let id = context.next_window_id();
-  let serial = context.next_serial();
-  let webview_id = webview.as_ref().map(|_| context.next_webview_id());
-
-  if let Some(webview) = webview.as_mut() {
-    for (scheme, handler) in webview.uri_scheme_protocols.drain() {
-      let handler: Rc<UriSchemeProtocolHandler> = Rc::from(handler);
-      if scheme == "ipc" {
-        context.ipc_protocol_handlers.borrow_mut().insert(
-          webview_id.expect("a pending webview has a serial"), (webview.label.clone(), handler.clone()),
-        );
-      }
-      // Asset protocols are session-wide; commands use an authenticated
-      // per-webview handler instead of inheriting the first window's identity.
-      context
-        .protocol_handlers
-        .borrow_mut()
-        .entry(scheme.clone())
-        .or_insert_with(|| (webview.label.clone(), handler));
-      if let Err(error) = context.ipc.call(
-        "protocol.register",
-        json!({ "scheme": scheme }),
-        IPC_TIMEOUT,
-      ) {
-        eprintln!("[electron] failed to register protocol {scheme}: {error}");
-      }
-    }
-  }
-
-  // Handlers Electron must ask about later; announced in the create payload so
-  // the main process knows whether to intercept downloads and permissions.
-  let policy = match (webview.as_mut(), webview_id) {
-    (Some(pending_webview), Some(webview_serial)) => {
-      let (download, permission) =
-        register_policy_handlers(context, webview_serial, pending_webview);
-      json!({ "download": download, "permission": permission })
-    }
-    _ => json!(null),
-  };
-
-  let mut payload = json!({ "windowId": serial, "label": label });
-  // The whole window configuration travels to the main process; `main.cjs`
-  // applies what Electron can express and reports the rest.
-  payload["window"] =
-    serde_json::to_value(&window_builder.config).map_err(|error| create_window_err(error.to_string()))?;
-  if let Some(icon) = &window_builder.icon {
-    use base64::Engine as _;
-    // Electron builds an image from raw BGRA pixels, so swap the channels here
-    // instead of shipping a PNG encoder.
-    let mut bgra = icon.rgba.clone();
-    for pixel in bgra.chunks_exact_mut(4) {
-      pixel.swap(0, 2);
-    }
-    payload["windowIcon"] = json!({
-      "bgra": base64::engine::general_purpose::STANDARD.encode(bgra),
-      "width": icon.width,
-      "height": icon.height,
-    });
-  }
-  if let Some(icon) = &context.icon {
-    payload["icon"] = json!(icon.display().to_string());
-  }
-  if let (Some(webview), Some(webview_id)) = (&webview, webview_id) {
-    payload["webview"] = json!({
-      "webviewId": webview_id,
-      "url": context.resolve_url(&webview.webview_attributes.url),
-      "initScripts": initialization_scripts(webview)?,
-      "policy": policy,
-    });
-  }
-
-  if !window_builder.unsupported.is_empty() {
-    eprintln!(
-      "[electron] window {label}: ignoring unsupported builder options: {}",
-      window_builder.unsupported.join(", ")
-    );
-  }
-
-  context
-    .ipc
-    .call("window.create", payload, IPC_TIMEOUT)
-    .map_err(create_window_err)?;
-  eprintln!("[electron] created window {label} (serial {serial})");
-
-  context.windows.borrow_mut().insert(
-    id,
-    Window {
-      label: label.clone(),
-      serial,
-      webviews: webview_id
-        .map(|serial| Webview {
-          serial,
-          label: label.clone(),
-          handlers: Vec::new(),
-        })
-        .into_iter()
-        .collect(),
-      handlers: Vec::new(),
-      #[cfg(windows)]
-      menu_owner: None,
-    },
-  );
-
-  // Options Electron has no API for, applied to the native window handle.
-  #[cfg(windows)]
-  if window_builder.owner.is_some()
-    || window_builder.parent.is_some()
-    || window_builder.config.always_on_bottom
-  {
-    let handle = context.native_handle(id)?;
-    if window_builder.config.always_on_bottom {
-      crate::window::imp::send_to_bottom(handle);
-    }
-    if let Some(owner) = window_builder.owner.or(window_builder.parent) {
-      // Tauri resolves parent/owner through window_handle(), so translate our
-      // per-window menu owner back to the actual Electron window.
-      let parent_id = context.windows.borrow().iter().find_map(|(id, window)| {
-        window.menu_owner.as_ref().filter(|menu| menu.handle == owner).map(|_| *id)
-      });
-      let owner = match parent_id {
-        Some(id) => context.native_handle(id)?,
-        None => owner,
-      };
-      crate::window::imp::set_owner(handle, owner);
-    }
-  }
-
-  // Tauri hands over a raw NSWindow pointer; Electron only understands its own
-  // windows, so map the pointer back to the window it belongs to.
-  #[cfg(target_os = "macos")]
-  if let Some(parent) = window_builder.macos_parent {
-    let parent_serial = context
-      .native_handles
-      .borrow()
-      .iter()
-      .find(|(_, handle)| **handle == parent)
-      .map(|(serial, _)| *serial);
-    match parent_serial {
-      Some(parent_serial) => {
-        if let Err(error) = context.ipc.call(
-          "window.setParentWindow",
-          json!({ "windowId": serial, "parentId": parent_serial }),
-          IPC_TIMEOUT,
-        ) {
-          eprintln!("[electron] window {label}: parenting failed: {error}");
-        }
-      }
-      None => crate::unsupported::report("WindowBuilder::parent (unknown window)"),
-    }
-  }
-
-  if let (Some(pending_webview), Some(webview_serial)) = (webview.as_mut(), webview_id) {
-    let url = context.resolve_url(&pending_webview.webview_attributes.url);
-    if let Some(origin) = origin_of(&url) {
-      context
-        .webview_origins
-        .borrow_mut()
-        .insert(label.clone(), origin);
-    }
-    if let Some(handler) = pending_webview.ipc_handler.take() {
-      register_ipc_handler::<T>(
-        context,
-        webview_serial,
-        label.clone(),
-        url,
-        handler,
-      );
-    }
-    register_webview_handlers::<T>(context, webview_serial, pending_webview);
-  }
-
-  if let Some(callback) = after_window_creation {
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-      let context = context.clone();
-      let (tx, rx) = sync_channel(1);
-      #[cfg(windows)]
-      let task_context = context.clone();
-      let task = Message::Task(Box::new(move || {
-        let result: Result<()> = (|| {
-          #[cfg(windows)]
-          let handle = task_context.menu_owner_window(id)?;
-          #[cfg(target_os = "macos")]
-          let handle = 0;
-          run_window_creation_callback(callback, handle);
-          Ok(())
-        })();
-        let _ = tx.send(result);
-      }));
-      if std::thread::current().id() == context.main_thread_id {
-        context.send_message(task)?;
-      } else {
-        // send_message runs tasks inline before the loop starts, which would
-        // create muda's owner on a worker. Always queue this native callback.
-        context.run_tx.send(task).map_err(|_| Error::FailedToSendMessage)?;
-      }
-      rx.recv().map_err(|_| Error::FailedToReceiveMessage)??;
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-      // RawWindow requires a valid GtkApplicationWindow. Electron has none;
-      // never hand a GTK consumer a null or a foreign-process pointer.
-      let _ = callback;
-      crate::unsupported::report("after_window_creation (Electron has no GTK window)");
-    }
-  }
-
-  let webview = webview_id.map(|webview_id| DetachedWindowWebview {
-    webview: DetachedWebview {
-      label: label.clone(),
-      dispatcher: ElectronWebviewDispatcher {
-        id: webview_id,
-        context: context.clone(),
-        url: Arc::new(Mutex::new(
-          webview
-            .as_ref()
-            .map(|webview| context.resolve_url(&webview.webview_attributes.url))
-            .unwrap_or_default(),
-        )),
-        last_evaluated_script: Default::default(),
-      },
-    },
-    use_https_scheme: false,
-    devtools: webview
-      .as_ref()
-      .and_then(|webview| webview.webview_attributes.devtools),
-  });
-
-  Ok(DetachedWindow {
-    id,
-    label,
-    dispatcher: ElectronWindowDispatcher {
-      id,
-      context: context.clone(),
-    },
-    webview,
-  })
-}
-
-pub(crate) fn create_webview_impl<T: UserEvent>(
-  context: &RuntimeContext,
-  window_id: WindowId,
-  mut pending: PendingWebview<T, ElectronRuntime>,
-) -> Result<DetachedWebview<T, ElectronRuntime>> {
-  if std::thread::current().id() != context.main_thread_id {
-    return context.on_main_thread(move |context| create_webview_impl(context, window_id, pending))?;
-  }
-  let serial = context
-    .serial_for_window(window_id)
-    .ok_or_else(|| create_webview_err("window does not exist".into()))?;
-  let webview_id = context.next_webview_id();
-
-  let url = context.resolve_url(&pending.webview_attributes.url);
-  if let Some(origin) = origin_of(&url) {
-    context
-      .webview_origins
-      .borrow_mut()
-      .insert(pending.label.clone(), origin);
-  }
-
-  // Schemes must be installed before the page is loaded, otherwise the initial
-  // `tauri://` navigation fails with ERR_FAILED.
-  for (scheme, handler) in pending.uri_scheme_protocols.drain() {
-    let handler: Rc<UriSchemeProtocolHandler> = Rc::from(handler);
-    if scheme == "ipc" {
-      context.ipc_protocol_handlers.borrow_mut().insert(webview_id, (pending.label.clone(), handler.clone()));
-    }
-    context
-      .protocol_handlers
-      .borrow_mut()
-      .entry(scheme.clone())
-      .or_insert_with(|| (pending.label.clone(), handler));
-    if let Err(error) = context.ipc.call(
-      "protocol.register",
-      json!({ "scheme": scheme }),
-      IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] failed to register protocol {scheme}: {error}");
-    }
-  }
-
-  let (download, permission) = register_policy_handlers(context, webview_id, &mut pending);
-  let payload = json!({
-    "windowId": serial,
-    "webviewId": webview_id,
-    "url": url,
-    "initScripts": initialization_scripts(&pending)?,
-    "bounds": pending.webview_attributes.bounds.map(|bounds| json!({
-      "position": position_payload(bounds.position),
-      "size": size_payload(bounds.size),
-    })),
-    "autoResize": pending.webview_attributes.auto_resize,
-    "policy": { "download": download, "permission": permission },
-  });
-  context
-    .ipc
-    .call("webview.create", payload, IPC_TIMEOUT)
-    .map_err(create_webview_err)?;
-
-  if let Some(window) = context.windows.borrow_mut().get_mut(&window_id) {
-    window.webviews.push(Webview {
-      serial: webview_id,
-      label: pending.label.clone(),
-      handlers: Vec::new(),
-    });
-  }
-
-  if let Some(handler) = pending.ipc_handler.take() {
-    register_ipc_handler::<T>(
-      context,
-      webview_id,
-      pending.label.clone(),
-      url.clone(),
-      handler,
-    );
-  }
-  register_webview_handlers::<T>(context, webview_id, &mut pending);
-
-  Ok(DetachedWebview {
-    label: pending.label,
-    dispatcher: ElectronWebviewDispatcher {
-      id: webview_id,
-      context: context.clone(),
-      url: Arc::new(Mutex::new(
-        context.resolve_url(&pending.webview_attributes.url),
-      )),
-      last_evaluated_script: Default::default(),
-    },
-  })
-}
-
-fn valid_scheme(scheme: &str) -> bool {
-  let mut bytes = scheme.bytes();
-  bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
-    && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-}
-
-/// Extra Electron switches, e.g. `TAURI_RUNTIME_ELECTRON_ARGS="--remote-debugging-port=9222"`.
-fn extra_args(args: &[String]) -> Vec<String> {
-  let mut all = args.to_vec();
-  if let Ok(extra) = std::env::var("TAURI_RUNTIME_ELECTRON_ARGS") {
-    all.extend(extra.split_whitespace().map(str::to_string));
-  }
-  all
-}
-
-/// Stores Tauri's IPC handler so the run loop can feed it messages posted by
-/// the page (`window.ipc.postMessage`). The closure captures the detached
-/// webview so the stored type does not depend on `T`.
-fn register_ipc_handler<T: UserEvent>(
-  context: &RuntimeContext,
-  webview_id: u32,
-  label: String,
-  url: String,
-  handler: WebviewIpcHandler<T, ElectronRuntime>,
-) {
-  let detached = DetachedWebview::<T, ElectronRuntime> {
-    label,
-    dispatcher: ElectronWebviewDispatcher {
-      id: webview_id,
-      context: context.clone(),
-      url: Arc::new(Mutex::new(url)),
-      last_evaluated_script: Default::default(),
-    },
-  };
-  let handler: Rc<dyn Fn(Request<String>) + Send> =
-    Rc::new(move |request| handler(detached.clone(), request));
-  context.ipc_handlers.borrow_mut().insert(webview_id, handler);
-}
-
-fn initialization_scripts<T: UserEvent, R: Runtime<T>>(
-  pending: &PendingWebview<T, R>,
-) -> Result<Vec<String>> {
-  pending
-    .webview_attributes
-    .initialization_scripts
-    .iter()
-    .map(|script| native_ipc_script(&script.script))
-    .collect()
-}
-
-fn native_ipc_script(script: &str) -> Result<String> {
-  // A protocol Request has no trusted sender. Keep Tauri's typed protocol,
-  // invoke key and isolation encryption, but transport it through native IPC.
-  if script.contains("const __TAURI_INVOKE_KEY__ =")
-    && script.contains("const fetchChannelDataCommand =")
-    && script.contains("Object.defineProperty(window.__TAURI_INTERNALS__, 'postMessage'")
-  {
-    let marker = "let customProtocolIpcFailed = false";
-    if script.matches(marker).count() != 1 {
-      return Err(create_webview_err("Tauri IPC transport changed; native sender attribution requires an update".into()));
-    }
-    Ok(script.replacen(marker, NATIVE_IPC_FETCH, 1))
-  } else {
-    Ok(script.to_owned())
-  }
-}
-
-const NATIVE_IPC_FETCH: &str = r#"let customProtocolIpcFailed = false
-  const fetch = async (url, options) => {
-    const body = Array.isArray(options.body) ? new Uint8Array(options.body) : options.body
-    const reply = await window.ipc.fetch({
-      url, method: options.method,
-      headers: [...options.headers],
-      body: new Uint8Array(await new Response(body).arrayBuffer())
-    })
-    const bytes = Uint8Array.from(atob(reply.body ?? ''), c => c.charCodeAt(0))
-    return new Response(bytes, { status: reply.status, headers: reply.headers })
-  }"#;
-
-/// Scheme+host of `url`, e.g. `tauri://localhost` — the origin Tauri sees for
-/// a local page.
-fn origin_of(url: &str) -> Option<String> {
-  let url = url::Url::parse(url).ok()?;
-  let host = url.host_str()?;
-  Some(match url.port() {
-    Some(port) => format!("{}://{host}:{port}", url.scheme()),
-    None => format!("{}://{host}", url.scheme()),
-  })
-}
-
-/// Tauri's webview-scoped callbacks, stored so the run loop can feed them the
-/// events Electron forwards.
-pub(crate) struct WebviewHandlers {
-  pub(crate) page_load: Option<Rc<dyn Fn(url::Url, PageLoadEvent) + Send>>,
-  pub(crate) title: Option<Rc<dyn Fn(String) + Send>>,
-  pub(crate) new_window:
-    Option<Rc<dyn Fn(url::Url, &str) -> NewWindowResponse + Send + Sync>>,
-  pub(crate) process_gone: Option<Rc<dyn Fn(WebContentProcessTermination) + Send>>,
-}
-
-/// The callbacks Electron asks about out of band: a download question and
-/// permission requests. Both are answered over IPC instead of blocking.
-#[derive(Default)]
-pub(crate) struct PolicyHandlers {
-  download: Option<Arc<DownloadHandler>>,
-  permission: Option<Arc<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
-}
-
-impl PolicyHandlers {
-  fn is_empty(&self) -> bool {
-    self.download.is_none() && self.permission.is_none()
-  }
-}
-
-/// Permission kinds the runtime can name; Electron reports richer strings that
-/// also cover permissions Tauri has no kind for.
-fn permission_kind(name: &str) -> Option<PermissionKind> {
-  Some(match name {
-    "microphone" => PermissionKind::Microphone,
-    "camera" => PermissionKind::Camera,
-    "geolocation" => PermissionKind::Geolocation,
-    "notifications" => PermissionKind::Notifications,
-    "clipboard-read" => PermissionKind::ClipboardRead,
-    "display-capture" => PermissionKind::DisplayCapture,
-    "midi" => PermissionKind::Midi,
-    "sensors" => PermissionKind::Sensors,
-    "media-key-system-access" => PermissionKind::MediaKeySystemAccess,
-    _ => return None,
-  })
-}
-
-fn permission_response_name(response: PermissionResponse) -> &'static str {
-  match response {
-    PermissionResponse::Allow => "allow",
-    PermissionResponse::Deny => "deny",
-    _ => "default",
-  }
-}
-
-fn register_webview_handlers<T: UserEvent>(
-  context: &RuntimeContext,
-  webview_id: u32,
-  pending: &mut PendingWebview<T, ElectronRuntime>,
-) {
-  let page_load = pending.on_page_load_handler.take().map(|handler| {
-    Rc::new(move |url: url::Url, event: PageLoadEvent| handler(url, event))
-      as Rc<dyn Fn(url::Url, PageLoadEvent) + Send>
-  });
-  let title = pending
-    .document_title_changed_handler
-    .take()
-    .map(|handler| Rc::new(move |title: String| handler(title)) as Rc<dyn Fn(String) + Send>);
-  let process_gone = pending
-    .on_web_content_process_terminate_handler
-    .take()
-    .map(|handler| {
-      Rc::new(move |termination: WebContentProcessTermination| handler(termination))
-        as Rc<dyn Fn(WebContentProcessTermination) + Send>
-    });
-  let new_window = pending.new_window_handler.take().map(|handler| {
-    Rc::new(move |url: url::Url, features: &str| {
-      let (size, position) = crate::popup::window_features(features);
-      handler(
-        url,
-        NewWindowFeatures::<T, ElectronRuntime>::new(size, position, ()),
-      )
-    }) as Rc<dyn Fn(url::Url, &str) -> NewWindowResponse + Send + Sync>
-  });
-  context.webview_handlers.borrow_mut().insert(
-    webview_id,
-    WebviewHandlers {
-      page_load,
-      title,
-      new_window,
-      process_gone,
-    },
-  );
-}
-
-/// Moves the download and permission callbacks off the attributes and records
-/// which of them Electron should ask about. Returns `(download, permission)`.
-fn register_policy_handlers<T: UserEvent>(
-  context: &RuntimeContext,
-  webview_id: u32,
-  pending: &mut PendingWebview<T, ElectronRuntime>,
-) -> (bool, bool) {
-  let handlers = PolicyHandlers {
-    download: pending.download_handler.take(),
-    permission: pending.permission_request_handler.take().map(Arc::from),
-  };
-  let wired = (handlers.download.is_some(), handlers.permission.is_some());
-  if !handlers.is_empty() {
-    context
-      .policy_handlers
-      .borrow_mut()
-      .insert(webview_id, handlers);
-  }
-  wired
-}
-
-/// Maps Electron's `render-process-gone` reason onto Tauri's classification.
-fn termination_reason(reason: &str) -> WebContentProcessTerminationReason {
-  match reason {
-    "clean-exit" => WebContentProcessTerminationReason::Normal,
-    "abnormal-exit" => WebContentProcessTerminationReason::Abnormal,
-    "killed" => WebContentProcessTerminationReason::Killed,
-    "crashed" => WebContentProcessTerminationReason::Crashed,
-    "oom" => WebContentProcessTerminationReason::OutOfMemory,
-    "launch-failed" => WebContentProcessTerminationReason::LaunchFailed,
-    "integrity-failure" => WebContentProcessTerminationReason::IntegrityFailure,
-    _ => WebContentProcessTerminationReason::Unknown,
-  }
-}
-
-/// Reject stale, disabled, hidden, separator and submenu commands, including
-/// children of a disabled submenu. WM_COMMAND carries only a 16-bit item ID.
-#[cfg(any(windows, test))]
-fn menu_command_enabled(menu: &Value, command: u32) -> bool {
-  command <= u16::MAX as u32 && menu.as_array().is_some_and(|items| items.iter().any(|item| {
-    item["enabled"].as_bool() == Some(true) && item["type"] != "separator" &&
-      if item["submenu"].is_array() {
-        menu_command_enabled(&item["submenu"], command)
-      } else {
-        item["commandId"].as_u64() == Some(command as u64)
-      }
-  }))
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn worker_state_access_and_reentrant_handlers_stay_on_the_ui_thread() {
-    let (_events, event_rx) = channel();
-    let runtime = ElectronRuntime::init(Ipc::test_connection(), event_rx, None, None);
-    let context = runtime.context.clone();
-    let id = context.next_window_id();
-    context.windows.borrow_mut().insert(id, Window {
-      label: "worker".into(), serial: 42,
-      webviews: vec![Webview { serial: 7, label: "guest".into(), handlers: vec![] }],
-      handlers: vec![],
-      #[cfg(windows)]
-      menu_owner: None,
-    });
-    let main_thread = std::thread::current().id();
-    assert_eq!(context.on_main_thread(|_| std::thread::current().id()).unwrap(), main_thread);
-    let worker = std::thread::spawn(move || {
-      assert_eq!(context.serial_for_window(id), Some(42));
-      let events = context.clone();
-      context.add_window_event_handler(id, 1, move |_| {
-        assert_eq!(std::thread::current().id(), main_thread);
-        events.on_main_thread(|context| context.windows.borrow_mut().clear()).unwrap();
-      });
-      context.add_webview_event_handler(7, 2, |_| {});
-      context.set_webview_origin_by_serial(7, "https://example.com/path");
-      context.send_message(Message::Task(Box::new(move || {
-        assert_eq!(std::thread::current().id(), main_thread);
-      }))).unwrap();
-      context.on_main_thread(move |context| {
-        assert_eq!(std::thread::current().id(), main_thread);
-        assert_eq!(context.webview_origins.borrow().get("guest").map(String::as_str), Some("https://example.com"));
-        assert_eq!(context.windows.borrow()[&id].webviews[0].handlers.len(), 1);
-        context.emit_window_event(id, &WindowEvent::Destroyed);
-        assert!(context.windows.borrow().is_empty());
-      }).unwrap();
-    });
-    // A worker started during setup must queue tasks even before run() starts.
-    while !worker.is_finished() {
-      match runtime.run_rx.recv_timeout(Duration::from_millis(100)) {
-        Ok(Message::Task(task)) => task(),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
-        _ => panic!("unexpected runtime task"),
-      }
-    }
-    worker.join().unwrap();
-  }
-
-  #[test]
-  fn validates_custom_scheme_names() {
-    for scheme in ["stream", "test+v1", "a-b.c", "UPPER", "x1"] {
-      assert!(valid_scheme(scheme), "{scheme:?}");
-    }
-    for scheme in ["", "1stream", "stream,ipc", "a b", "https://", "a\n", "中文"] {
-      assert!(!valid_scheme(scheme), "{scheme:?}");
-    }
-  }
-
-  #[test]
-  fn selects_native_ipc_without_changing_user_scripts() {
-    let source = "const __TAURI_INVOKE_KEY__ = 'key';\nconst fetchChannelDataCommand = 'channel';\nlet customProtocolIpcFailed = false;\nObject.defineProperty(window.__TAURI_INTERNALS__, 'postMessage', {});";
-    let native = native_ipc_script(source).unwrap();
-    assert_eq!(native, source.replace("let customProtocolIpcFailed = false", NATIVE_IPC_FETCH));
-    assert!(native.contains("const fetch = async"));
-    assert!(native.contains("let customProtocolIpcFailed = false"));
-    assert!(native_ipc_script(&source.replace("let customProtocolIpcFailed = false", "let changed = false")).is_err());
-    let user_script = "let customProtocolIpcFailed = false";
-    assert_eq!(native_ipc_script(user_script).unwrap(), user_script);
-  }
-
-  #[cfg(windows)]
-  #[test]
-  fn window_creation_callback_initializes_the_menu_owner_once() {
-    use std::cell::Cell;
-    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::{
-      AppendMenuW, CreateMenu, DestroyMenu, DestroyWindow, MF_STRING, SetMenu,
-    }};
-    let owner = crate::window::imp::MenuOwner::new().unwrap();
-    let menu = unsafe { CreateMenu() }.unwrap();
-    unsafe { AppendMenuW(menu, MF_STRING, 1001, windows::core::w!("Builder menu")) }.unwrap();
-    let calls = Cell::new(0);
-    let thread = std::thread::current().id();
-    run_window_creation_callback(|raw| {
-      calls.set(calls.get() + 1);
-      assert_eq!(std::thread::current().id(), thread);
-      assert_eq!(raw.hwnd, owner.handle);
-      unsafe { SetMenu(HWND(raw.hwnd as *mut _), Some(menu)) }.unwrap();
-    }, owner.handle);
-    assert_eq!(calls.get(), 1);
-    let snapshot = crate::window::imp::menu_snapshot(owner.handle).unwrap();
-    assert_eq!(snapshot[0]["label"], "Builder menu");
-    assert_eq!(snapshot[0]["commandId"], 1001);
-    // This test owns the menu and has no muda association, so it can clean up.
-    unsafe {
-      SetMenu(HWND(owner.handle as *mut _), None).unwrap();
-      DestroyMenu(menu).unwrap();
-      DestroyWindow(HWND(owner.handle as *mut _)).unwrap();
-    }
-  }
-
-  #[test]
-  fn accepts_only_live_enabled_menu_commands() {
-    let mut menu = json!([{ "commandId": 900, "enabled": true, "submenu": [
-      { "commandId": 1001, "enabled": true, "checked": false },
-      { "commandId": 1002, "enabled": false },
-      { "type": "separator", "commandId": 1003, "enabled": true }
-    ] }]);
-    assert!(menu_command_enabled(&menu, 1001));
-    for command in [900, 1002, 1003, 9999, 65536] {
-      assert!(!menu_command_enabled(&menu, command));
-    }
-    menu[0]["enabled"] = json!(false);
-    assert!(!menu_command_enabled(&menu, 1001));
-    assert!(!menu_command_enabled(&Value::Null, 1001));
-    menu[0]["enabled"] = json!(true);
-    menu[0]["submenu"] = json!([]);
-    assert!(!menu_command_enabled(&menu, 1001));
-  }
-
-  #[test]
-  fn maps_electron_termination_reasons() {
-    assert_eq!(termination_reason("crashed"), WebContentProcessTerminationReason::Crashed);
-    assert_eq!(termination_reason("oom"), WebContentProcessTerminationReason::OutOfMemory);
-    assert_eq!(termination_reason("clean-exit"), WebContentProcessTerminationReason::Normal);
-    assert_eq!(termination_reason("nonsense"), WebContentProcessTerminationReason::Unknown);
-  }
-
-  #[test]
-  fn maps_permission_names_both_ways() {
-    assert_eq!(permission_kind("camera"), Some(PermissionKind::Camera));
-    assert_eq!(permission_kind("clipboard-read"), Some(PermissionKind::ClipboardRead));
-    assert_eq!(permission_kind("openExternal"), None);
-    assert_eq!(permission_response_name(PermissionResponse::Allow), "allow");
-    assert_eq!(permission_response_name(PermissionResponse::Deny), "deny");
-    assert_eq!(permission_response_name(PermissionResponse::Default), "default");
-  }
-}
-
-/// Drains the thread's window-message queue.
-///
-/// `tray-icon` and `muda` (used by `tauri::tray` and the menu API) create hidden
-/// windows on the calling thread and only dispatch their callbacks from that
-/// thread's message loop. Electron pumps its own process, not this one, so the
-/// runtime has to do it.
-#[cfg(windows)]
-fn pump_thread_messages() {
-  use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-  };
-
-  let mut message = MSG::default();
-  while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-    unsafe {
-      let _ = TranslateMessage(&message);
-      DispatchMessageW(&message);
-    }
-  }
-}
-
-#[cfg(not(windows))]
-fn pump_thread_messages() {}

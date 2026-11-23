@@ -7,3 +7,7 @@ target
 .eslintcache
 .temp/
 .cache/
+skills
+# A git worktree of this same repository, checked out from `main` as the v2
+# reference source. It is not a submodule and must not be committed.
+source/tauri-runtime-electron-v2/

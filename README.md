@@ -34,18 +34,20 @@ tauri::Builder::default()
 
 ```
 
-### 2. Tauri Bundle Configuration
+### 2. Bundling
 
-To bundle the Electron runtime with your application without triggering downloads on first launch, add the staged target directory to your `tauri.conf.json`:
+Nothing to configure. The crate's build script prepares the Electron
+distribution and reports it with `cargo:runtime=electron` and
+`cargo:electron_dir=…`, the same contract `tauri-runtime-cef` uses for its
+framework. The CLI resolves that directory and the bundler copies it to
+`resources/electron`, which is where the runtime looks for it at launch — so a
+`tauri.conf.json` needs no `bundle > resources` entry.
 
-```json
-{
-  "bundle": {
-    "resources": { "target/electron": "runtime" }
-  }
-}
-
-```
+The bundler support is a patch against Tauri v3, kept in
+[`docs/parity/tauri-electron-runtime-bundling.patch`](docs/parity/tauri-electron-runtime-bundling.patch)
+and applied to the `source/tauri` submodule. Without it, the runtime still finds
+a distribution placed beside the executable by hand, and `cargo run` finds the
+one the build script staged.
 
 ---
 

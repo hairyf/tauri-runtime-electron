@@ -1,36 +1,79 @@
-//! Newline-delimited JSON RPC over a loopback TCP socket.
+//! The `electron-rs` Ipc: Electron process ownership, the event stream and
+//! synchronous RPC.
 //!
-//! The Rust side owns the listener and spawns the Electron main process with the
-//! chosen port as an argument. Electron connects back, sends a `ready` event, and
-//! from then on both sides exchange `{"id": n, "method": ..., "params": ...}` /
-//! `{"id": n, "result": ...}` (or `{"id": n, "error": "..."}`) plus
-//! `{"event": ..., "params": ...}` notifications.
+//! `electron-rs` owns the Electron main process, the loopback socket, the
+//! handshake, the JavaScript command table and the event stream. The
+//! `tauri-runtime` traits are synchronous, so this module is the only place
+//! that enters the async client: one dedicated thread runs a Tokio runtime,
+//! and every call is dispatched to it and awaited on the caller's thread.
 
 use std::{
-  collections::HashMap,
-  io::{BufRead, BufReader, Write},
-  net::{TcpListener, TcpStream},
-  path::PathBuf,
-  process::{Child, Command},
-  sync::{
-    atomic::{AtomicU64, Ordering},
-    mpsc::{channel, Receiver, Sender},
-    Arc, Mutex,
-  },
-  time::{Duration, Instant},
+  collections::HashSet,
+  future::Future,
+  path::{Path, PathBuf},
+  sync::{Arc, Mutex, OnceLock, mpsc},
+  time::Duration,
 };
 
-use serde_json::{json, Value};
+use electron_rs::{Electron, RpcRequest};
+use serde_json::Value;
+use tokio::runtime::Runtime;
 
-/// Error message returned by the Electron side.
+/// The error text the Electron side reports for a failed request.
 pub(crate) type IpcResult = std::result::Result<Value, String>;
 
+type Task = Box<dyn FnOnce(&Runtime) + Send>;
+
+/// Interns the method names so [`Raw`] can hand `electron-rs` a `&'static str`.
+///
+/// The set of method names is fixed by the command table, so the leak is bounded
+/// by the number of distinct methods the runtime ever calls.
+fn intern(method: &str) -> &'static str {
+  static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+  let mut names = NAMES
+    .get_or_init(Default::default)
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some(name) = names.get(method) {
+    return name;
+  }
+  let leaked: &'static str = Box::leak(method.to_owned().into_boxed_str());
+  names.insert(leaked);
+  leaked
+}
+
+/// A request whose method and payload the runtime already built.
+///
+/// The runtime keeps its wire-shaped call sites; `electron-rs` still owns the
+/// transport, the id allocation and the response matching.
+struct Raw {
+  method: &'static str,
+  params: Value,
+  timeout: Duration,
+}
+
+impl serde::Serialize for Raw {
+  fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    self.params.serialize(serializer)
+  }
+}
+
+impl RpcRequest for Raw {
+  type Response = Value;
+  const METHOD: &'static str = "";
+  fn method(&self) -> &'static str {
+    self.method
+  }
+  fn timeout(&self) -> Duration {
+    self.timeout
+  }
+}
+
+/// A connected Electron process plus the thread that drives its async client.
 pub(crate) struct Ipc {
-  writer: Mutex<TcpStream>,
-  pending: Mutex<HashMap<u64, Sender<IpcResult>>>,
-  next_id: AtomicU64,
-  child: Mutex<Option<Child>>,
-  /// Version reported by the Electron process during the handshake.
+  electron: Arc<Electron>,
+  tasks: mpsc::SyncSender<Task>,
+  /// Version reported by Electron during the handshake.
   pub(crate) version: String,
 }
 
@@ -43,227 +86,132 @@ impl std::fmt::Debug for Ipc {
 }
 
 impl Ipc {
-  #[cfg(test)]
-  pub(crate) fn test_connection() -> Arc<Self> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let _peer = listener.accept().unwrap();
-    Arc::new(Self {
-      writer: Mutex::new(stream), pending: Mutex::new(HashMap::new()),
-      next_id: AtomicU64::new(1), child: Mutex::new(None), version: String::new(),
-    })
-  }
-
-  /// Spawns `electron <main_script> --port <port>` and waits for the handshake.
+  /// Launches the prepared Electron distribution and waits for the handshake.
   ///
-  /// The returned receiver yields every notification the Electron side sends.
+  /// The returned receiver yields every notification the Electron side sends,
+  /// including the final `ipc.closed`.
   pub(crate) fn launch(
-    binary: &PathBuf,
-    main_script: &PathBuf,
-    extra_args: &[String],
+    binary: &Path,
+    args: &[String],
     timeout: Duration,
-  ) -> std::result::Result<(Arc<Ipc>, Receiver<Value>), String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-      .map_err(|e| format!("failed to bind IPC listener: {e}"))?;
-    let port = listener
-      .local_addr()
-      .map_err(|e| format!("failed to read IPC listener address: {e}"))?
-      .port();
-
-    let mut command = Command::new(binary);
-    command
-      .arg(main_script)
-      .arg("--port")
-      .arg(port.to_string())
-      .args(extra_args);
-    #[cfg(windows)]
-    {
-      use std::os::windows::process::CommandExt;
-      // Keep the Rust console clean: Electron is a GUI process, no extra window needed.
-      command.creation_flags(0x0800_0000);
-    }
-    let mut child = command.spawn().map_err(|e| {
-      format!(
-        "failed to spawn electron binary {}: {e}",
-        binary.display()
-      )
-    })?;
-
-    listener
-      .set_nonblocking(true)
-      .map_err(|e| format!("failed to configure IPC listener: {e}"))?;
-    let deadline = Instant::now() + timeout;
-    let stream = loop {
-      match listener.accept() {
-        Ok((stream, _)) => {
-          // On Windows the accepted socket inherits the listener's non-blocking mode.
-          stream
-            .set_nonblocking(false)
-            .map_err(|e| format!("failed to configure IPC stream: {e}"))?;
-          break stream;
-        }
-        Err(e) if Instant::now() >= deadline => {
-          let _ = child.kill();
-          return Err(format!(
-            "electron did not connect within {timeout:?}: {e} (is the electron binary at {} correct?)",
-            binary.display()
-          ));
-        }
-        Err(_) => std::thread::sleep(Duration::from_millis(20)),
-      }
-    };
-
-    let handshake = read_line(&stream, timeout);
-    let handshake = match handshake {
-      Ok(line) => line,
-      Err(e) => {
-        let _ = child.kill();
-        return Err(format!("electron handshake failed: {e}"));
-      }
-    };
-    let handshake: Value = serde_json::from_str(&handshake)
-      .map_err(|e| format!("invalid electron handshake: {e}"))?;
-    if handshake.get("event").and_then(Value::as_str) != Some("ready") {
-      let _ = child.kill();
-      return Err(format!("unexpected electron handshake: {handshake}"));
-    }
-    let version = handshake
-      .pointer("/params/electron")
-      .and_then(Value::as_str)
-      .unwrap_or("unknown")
-      .to_string();
-
-    let writer = stream
-      .try_clone()
-      .map_err(|e| format!("failed to clone IPC stream: {e}"))?;
-    let (event_tx, event_rx) = channel();
-    let ipc = Arc::new(Ipc {
-      writer: Mutex::new(writer),
-      pending: Mutex::new(HashMap::new()),
-      next_id: AtomicU64::new(0),
-      child: Mutex::new(Some(child)),
-      version,
-    });
-
-    let reader_ipc = ipc.clone();
+  ) -> std::result::Result<(Arc<Self>, mpsc::Receiver<Value>), String> {
+    let binary: PathBuf = binary.to_path_buf();
+    let args = args.to_vec();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (tasks, receiver) = mpsc::sync_channel::<Task>(1024);
     std::thread::Builder::new()
-      .name("electron-ipc".into())
+      .name("electron-rpc-adapter".into())
       .spawn(move || {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        loop {
-          line.clear();
-          match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+          .enable_time()
+          .build()
+        {
+          Ok(runtime) => runtime,
+          Err(error) => {
+            let _ = ready_tx.send(Err(format!("create the Electron RPC runtime: {error}")));
+            return;
           }
-          let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-          };
-          reader_ipc.dispatch(message, &event_tx);
+        };
+        let electron = runtime.block_on(Electron::with_args(&binary, 0, &args, timeout));
+        match electron {
+          Ok(electron) => {
+            if ready_tx.send(Ok(electron)).is_err() {
+              return;
+            }
+          }
+          Err(error) => {
+            let _ = ready_tx.send(Err(error.to_string()));
+            return;
+          }
         }
-        // The Electron process is gone; let the event loop wind down.
-        let _ = event_tx.send(json!({ "event": "ipc.closed" }));
+        while let Ok(task) = receiver.recv() {
+          task(&runtime);
+        }
       })
-      .map_err(|e| format!("failed to start IPC reader thread: {e}"))?;
+      .map_err(|error| format!("start the Electron RPC adapter: {error}"))?;
 
-    Ok((ipc, event_rx))
+    let electron = ready_rx.recv().map_err(|_| {
+      "the Electron RPC adapter stopped before the handshake completed".to_string()
+    })??;
+    let version = electron.version.clone();
+    let events = electron
+      .events()
+      .map_err(|error| format!("subscribe to Electron events: {error}"))?;
+    Ok((
+      Arc::new(Self {
+        electron,
+        tasks,
+        version,
+      }),
+      events,
+    ))
   }
 
   /// Performs a synchronous RPC. `timeout` guards against a wedged Electron process.
-  pub(crate) fn call(
-    &self,
-    method: &str,
-    params: Value,
-    timeout: Duration,
-  ) -> IpcResult {
-    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = channel();
-    self.pending.lock().unwrap().insert(id, tx);
-
-    let request = json!({ "id": id, "method": method, "params": params });
-    let mut line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    line.push('\n');
-    {
-      let mut writer = self.writer.lock().unwrap();
-      if let Err(e) = writer
-        .write_all(line.as_bytes())
-        .and_then(|()| writer.flush())
-      {
-        self.pending.lock().unwrap().remove(&id);
-        return Err(format!("failed to write to electron ({method}): {e}"));
-      }
-    }
-
-    match rx.recv_timeout(timeout) {
-      Ok(result) => result,
-      Err(_) => {
-        self.pending.lock().unwrap().remove(&id);
-        Err(format!("electron did not answer `{method}` in {timeout:?}"))
-      }
+  pub(crate) fn call(&self, method: &str, params: Value, timeout: Duration) -> IpcResult {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    self.dispatch(
+      Raw {
+        method: intern(method),
+        params,
+        timeout,
+      },
+      move |result| {
+        let _ = sender.send(result);
+      },
+    )?;
+    // `recv` reports the channel closing separately from the request's own answer,
+    // so the two results are flattened into one.
+    let receive = || -> IpcResult {
+      receiver
+        .recv()
+        .map_err(|_| format!("the Electron RPC adapter stopped answering `{method}`"))?
+    };
+    // A blocking receive inside a Tokio worker would stall the reactor, so the
+    // worker hands the thread back before waiting.
+    let on_worker = tokio::runtime::Handle::try_current()
+      .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if on_worker {
+      tokio::task::block_in_place(receive)
+    } else {
+      receive()
     }
   }
 
-  fn dispatch(&self, message: Value, events: &Sender<Value>) {
-    let Some(id) = message.get("id").and_then(Value::as_u64) else {
-      let _ = events.send(message);
-      return;
-    };
-    let Some(waiter) = self.pending.lock().unwrap().remove(&id) else {
-      return;
-    };
-    let result = if let Some(error) = message.get("error").and_then(Value::as_str) {
-      Err(error.to_string())
-    } else {
-      Ok(message.get("result").cloned().unwrap_or(Value::Null))
-    };
-    let _ = waiter.send(result);
+  /// Runs `request` on the adapter thread and feeds the result to `callback`.
+  fn dispatch<R: RpcRequest>(
+    &self,
+    request: R,
+    callback: impl FnOnce(std::result::Result<R::Response, String>) + Send + 'static,
+  ) -> std::result::Result<(), String> {
+    let electron = Arc::clone(&self.electron);
+    self
+      .tasks
+      .try_send(Box::new(move |runtime| {
+        let mut task = Box::pin(async move {
+          callback(
+            electron
+              .call(request)
+              .await
+              .map_err(|error| error.to_string()),
+          );
+        });
+        // Reserve the client's writer order before accepting the next request.
+        let complete = runtime.block_on(std::future::poll_fn(|cx| {
+          std::task::Poll::Ready(task.as_mut().poll(cx).is_ready())
+        }));
+        if !complete {
+          runtime.spawn(task);
+        }
+      }))
+      .map_err(|error| match error {
+        mpsc::TrySendError::Disconnected(_) => "the Electron RPC adapter has stopped".to_string(),
+        mpsc::TrySendError::Full(_) => "the Electron RPC adapter task queue is full".to_string(),
+      })
   }
 
   /// Closes the socket and terminates the Electron process.
   pub(crate) fn shutdown(&self) {
-    if let Ok(writer) = self.writer.lock() {
-      let _ = writer.shutdown(std::net::Shutdown::Both);
-    }
-    if let Some(mut child) = self.child.lock().unwrap().take() {
-      let _ = child.kill();
-      let _ = child.wait();
-    }
-  }
-}
-
-fn read_line(stream: &TcpStream, timeout: Duration) -> std::result::Result<String, String> {
-  stream
-    .set_read_timeout(Some(timeout))
-    .map_err(|e| e.to_string())?;
-  let mut line = String::new();
-  let mut reader = BufReader::new(stream);
-  reader
-    .read_line(&mut line)
-    .map_err(|e| e.to_string())?;
-  if line.trim().is_empty() {
-    return Err("electron closed the socket during the handshake".into());
-  }
-  // Only the handshake has a read deadline; idle apps keep this socket open.
-  stream.set_read_timeout(None).map_err(|e| e.to_string())?;
-  Ok(line)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn handshake_does_not_leave_an_idle_read_deadline() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (stream, _) = listener.accept().unwrap();
-    peer.write_all(b"{\"event\":\"ready\"}\n").unwrap();
-    assert_eq!(
-      read_line(&stream, Duration::from_secs(1)).unwrap(),
-      "{\"event\":\"ready\"}\n"
-    );
-    assert_eq!(stream.read_timeout().unwrap(), None);
-    assert_eq!(stream.try_clone().unwrap().read_timeout().unwrap(), None);
+    self.electron.shutdown();
   }
 }

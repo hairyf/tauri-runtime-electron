@@ -2,282 +2,164 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use crate::runtime::{
-  ElectronRuntime, EventProxy, Message, RuntimeContext, create_webview_impl, create_window_impl,
-};
-use crate::platform::monitor_from_value;
-use serde_json::json;
-use tauri_runtime::{
-  DeviceEventFilter, Result, RuntimeHandle, UserEvent,
-  dpi::PhysicalPosition,
-  monitor::Monitor,
-  webview::{DetachedWebview, PendingWebview},
-  window::{DetachedWindow, PendingWindow, RawWindow, WindowId},
-};
-use tauri_utils::Theme;
+//! Raw-handle wrappers.
+//!
+//! `raw_window_handle`'s handles are not `Send`, but a window's handle has to
+//! travel between the thread that asks for it and the one that answers. The
+//! newtypes below make that trip explicit; the handle is only borrowed where it
+//! is used, exactly as the reference does for winit's handles.
+//!
+//! Electron hands the runtime a *number* (`window.nativeHandle`), not a live
+//! object, so nothing here owns anything: the value is a snapshot of a handle
+//! the Electron main process owns, and it is only as valid as that window.
 
-// Chromium only interprets Content-Range totals on HTTP-family media URLs.
-// Keep app/IPC/isolation origins direct; the literal placeholder is intentional.
-fn scheme_url(scheme: &str, https: bool) -> String {
-  if matches!(scheme, "tauri" | "ipc" | "isolation") || scheme.starts_with("isolation-") {
-    format!("{scheme}://localhost")
-  } else {
-    format!("{}://{scheme}.localhost", if https { "https" } else { "http" })
-  }
-}
+pub(crate) struct SendRawWindowHandle(pub raw_window_handle::RawWindowHandle);
+unsafe impl Send for SendRawWindowHandle {}
 
-#[cfg(test)]
-#[test]
-fn resource_urls_use_http_without_changing_app_or_isolation_origins() {
-  for https in [false, true] {
-    for scheme in ["tauri", "ipc", "isolation", "isolation-123"] {
-      assert_eq!(scheme_url(scheme, https), format!("{scheme}://localhost"));
+pub(crate) struct SendRawDisplayHandle(pub raw_window_handle::RawDisplayHandle);
+unsafe impl Send for SendRawDisplayHandle {}
+
+impl SendRawWindowHandle {
+  /// Wraps the native handle Electron reported for a window.
+  ///
+  /// `window.nativeHandle` gives the runtime one integer: an `HWND` on Windows,
+  /// the content `NSView*` on macOS, the X11 `Window` on Linux. A zero handle
+  /// means Electron could not name one, and `None` is returned rather than
+  /// borrowing a handle that names nothing.
+  pub(crate) fn from_native(handle: isize) -> Option<Self> {
+    if handle == 0 {
+      return None;
     }
-  }
-  assert_eq!(scheme_url("stream", false), "http://stream.localhost");
-  assert_eq!(scheme_url("asset", true), "https://asset.localhost");
-  assert_eq!(scheme_url("{protocol}", false), "http://{protocol}.localhost");
-  assert_eq!(scheme_url("{protocol}", true), "https://{protocol}.localhost");
-}
 
-#[derive(Debug, Clone)]
-pub struct ElectronRuntimeHandle {
-  pub(crate) context: RuntimeContext,
-}
-
-impl<T: UserEvent> RuntimeHandle<T> for ElectronRuntimeHandle {
-  type Runtime = ElectronRuntime;
-
-  fn create_proxy(&self) -> EventProxy {
-    EventProxy {
-      run_tx: self.context.run_tx.clone(),
-    }
-  }
-
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn set_activation_policy(
-    &self,
-    activation_policy: tauri_runtime::ActivationPolicy,
-  ) -> Result<()> {
-    let policy = match activation_policy {
-      tauri_runtime::ActivationPolicy::Regular => "regular",
-      tauri_runtime::ActivationPolicy::Accessory => "accessory",
-      tauri_runtime::ActivationPolicy::Prohibited => "prohibited",
-      _ => "regular",
+    #[cfg(windows)]
+    let raw = {
+      let hwnd = std::num::NonZeroIsize::new(handle)?;
+      raw_window_handle::RawWindowHandle::Win32(raw_window_handle::Win32WindowHandle::new(hwnd))
     };
-    self
-      .context
-      .ipc
-      .call(
-        "app.activationPolicy",
-        json!({ "policy": policy }),
-        crate::runtime::IPC_TIMEOUT,
-      )
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(())
+
+    #[cfg(target_os = "macos")]
+    let raw = {
+      let ns_view = std::ptr::NonNull::new(handle as *mut std::ffi::c_void)?;
+      raw_window_handle::RawWindowHandle::AppKit(raw_window_handle::AppKitWindowHandle::new(
+        ns_view,
+      ))
+    };
+
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    let raw = raw_window_handle::RawWindowHandle::Xlib(raw_window_handle::XlibWindowHandle::new(
+      handle as std::ffi::c_ulong,
+    ));
+
+    #[cfg(not(any(
+      windows,
+      target_os = "macos",
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    )))]
+    let raw = {
+      let _ = handle;
+      return None;
+    };
+
+    Some(Self(raw))
+  }
+}
+
+impl SendRawDisplayHandle {
+  /// A display handle for a runtime that owns no display connection.
+  ///
+  /// Electron owns the display server connection inside its own process, so this
+  /// runtime has none of its own to lend. The value is the platform's empty
+  /// handle: it names no connection, and dereferencing it is meaningless.
+  pub(crate) fn none() -> Self {
+    #[cfg(windows)]
+    let raw =
+      raw_window_handle::RawDisplayHandle::Windows(raw_window_handle::WindowsDisplayHandle::new());
+
+    #[cfg(target_os = "macos")]
+    let raw =
+      raw_window_handle::RawDisplayHandle::AppKit(raw_window_handle::AppKitDisplayHandle::new());
+
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    let raw =
+      raw_window_handle::RawDisplayHandle::Xlib(raw_window_handle::XlibDisplayHandle::new(None, 0));
+
+    #[cfg(not(any(
+      windows,
+      target_os = "macos",
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    )))]
+    let raw = raw_window_handle::RawDisplayHandle::Web(raw_window_handle::WebDisplayHandle::new());
+
+    Self(raw)
   }
 
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  fn set_dock_visibility(&self, visible: bool) -> Result<()> {
-    self
-      .context
-      .ipc
-      .call(
-        "app.dockVisibility",
-        json!({ "visible": visible }),
-        crate::runtime::IPC_TIMEOUT,
-      )
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(())
+  pub(crate) fn as_raw(&self) -> raw_window_handle::RawDisplayHandle {
+    self.0
   }
+}
 
-  fn request_exit(&self, _code: i32) -> Result<()> {
-    self.context.send_message(Message::Exit)
+/// Owned copy of a window's raw handles, for a surface that outlives the borrow.
+///
+/// The reference keeps this for `softbuffer`, which paints the window background
+/// under a CEF child that draws with per-pixel alpha. Electron paints its own
+/// window background (the root view and the compositor's background), so nothing
+/// in this runtime constructs a software surface; the type is kept, with the
+/// reference's contract, so the module keeps its shape.
+#[cfg(windows)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SoftbufferWindowHandle {
+  display: raw_window_handle::RawDisplayHandle,
+  window: raw_window_handle::RawWindowHandle,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+impl SoftbufferWindowHandle {
+  /// Captures both raw handles of the window Electron reported, `None` when the
+  /// handle names nothing.
+  pub(crate) fn new(handle: isize) -> Option<Self> {
+    Some(Self {
+      display: SendRawDisplayHandle::none().as_raw(),
+      window: SendRawWindowHandle::from_native(handle)?.0,
+    })
   }
+}
 
-  fn custom_scheme_url(&self, scheme: &str, https: bool) -> String {
-    scheme_url(scheme, https)
-  }
-
-  fn webview_version(&self) -> Result<String> {
-    Ok(self.context.ipc.version.clone())
-  }
-
-  /// Create a new webview window.
-  fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
-    &self,
-    pending: PendingWindow<T, Self::Runtime>,
-    after_window_creation: Option<F>,
-  ) -> Result<DetachedWindow<T, Self::Runtime>> {
-    create_window_impl(&self.context, pending, after_window_creation)
-  }
-
-  fn create_webview(
-    &self,
-    window_id: WindowId,
-    pending: PendingWebview<T, Self::Runtime>,
-  ) -> Result<DetachedWebview<T, Self::Runtime>> {
-    create_webview_impl(&self.context, window_id, pending)
-  }
-
-  /// Run a task on the main thread.
-  fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
-    self.context.send_message(Message::Task(Box::new(f)))
-  }
-
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for SoftbufferWindowHandle {
   fn display_handle(
     &self,
   ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-    #[cfg(target_os = "linux")]
-    return Ok(unsafe {
-      raw_window_handle::DisplayHandle::borrow_raw(raw_window_handle::RawDisplayHandle::Xlib(
-        raw_window_handle::XlibDisplayHandle::new(None, 0),
-      ))
-    });
-    #[cfg(target_os = "macos")]
-    return Ok(unsafe {
-      raw_window_handle::DisplayHandle::borrow_raw(raw_window_handle::RawDisplayHandle::AppKit(
-        raw_window_handle::AppKitDisplayHandle::new(),
-      ))
-    });
-    #[cfg(windows)]
-    return Ok(unsafe {
-      raw_window_handle::DisplayHandle::borrow_raw(raw_window_handle::RawDisplayHandle::Windows(
-        raw_window_handle::WindowsDisplayHandle::new(),
-      ))
-    });
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    unimplemented!();
+    Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(self.display) })
   }
+}
 
-  fn primary_monitor(&self) -> Result<Option<Monitor>> {
-    let displays = self
-      .context
-      .ipc
-      .call("window.displays", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(monitor_from_value(&displays["primary"]))
-  }
-
-  fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
-    let display = self
-      .context
-      .ipc
-      .call(
-        "window.displayForPoint",
-        json!({ "x": x, "y": y }),
-        crate::runtime::IPC_TIMEOUT,
-      )
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(monitor_from_value(&display))
-  }
-
-  fn available_monitors(&self) -> Result<Vec<Monitor>> {
-    let displays = self
-      .context
-      .ipc
-      .call("window.displays", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(
-      displays["displays"]
-        .as_array()
-        .map(|list| list.iter().filter_map(monitor_from_value).collect())
-        .unwrap_or_default(),
-    )
-  }
-
-  fn set_theme(&self, theme: Option<Theme>) {
-    let theme = match theme {
-      Some(Theme::Dark) => "dark",
-      Some(_) => "light",
-      None => "system",
-    };
-    if let Err(error) = self.context.ipc.call(
-      "app.theme",
-      json!({ "theme": theme }),
-      crate::runtime::IPC_TIMEOUT,
-    ) {
-      eprintln!("[electron] set theme failed: {error}");
-    }
-  }
-
-  /// Shows the application, but does not automatically focus it.
-  #[cfg(target_os = "macos")]
-  /// Shows the application (macOS `app.show()`; a no-op elsewhere).
-  fn show(&self) -> Result<()> {
-    self
-      .context
-      .ipc
-      .call("app.show", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(())
-  }
-
-  /// Hides the application.
-  #[cfg(target_os = "macos")]
-  /// Hides the application (macOS `app.hide()`; a no-op elsewhere).
-  fn hide(&self) -> Result<()> {
-    self
-      .context
-      .ipc
-      .call("app.hide", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(())
-  }
-
-  fn set_device_event_filter(&self, _: DeviceEventFilter) {
-    // No Electron equivalent: there is no device event stream to filter.
-    crate::unsupported::report("RuntimeHandle::set_device_event_filter");
-  }
-
-  #[cfg(target_os = "android")]
-  fn find_class<'a>(
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for SoftbufferWindowHandle {
+  fn window_handle(
     &self,
-    env: &mut jni::JNIEnv<'a>,
-    activity: &jni::objects::JObject<'_>,
-    name: impl Into<String>,
-  ) -> std::result::Result<jni::objects::JClass<'a>, jni::errors::Error> {
-    todo!()
-  }
-
-  #[cfg(target_os = "android")]
-  fn run_on_android_context<F>(&self, f: F)
-  where
-    F: FnOnce(&mut jni::JNIEnv<'_>, &jni::objects::JObject<'_>, &jni::objects::JObject<'_>)
-      + Send
-      + 'static,
-  {
-    todo!()
-  }
-
-  #[cfg(any(target_os = "macos", target_os = "ios"))]
-  fn fetch_data_store_identifiers<F: FnOnce(Vec<[u8; 16]>) + Send + 'static>(
-    &self,
-    _cb: F,
-  ) -> Result<()> {
-    todo!()
-  }
-
-  #[cfg(any(target_os = "macos", target_os = "ios"))]
-  fn remove_data_store<F: FnOnce(Result<()>) + Send + 'static>(
-    &self,
-    _uuid: [u8; 16],
-    _cb: F,
-  ) -> Result<()> {
-    todo!()
-  }
-
-  fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
-    let point = self
-      .context
-      .ipc
-      .call("window.cursorPosition", json!({}), crate::runtime::IPC_TIMEOUT)
-      .map_err(crate::runtime::create_window_err)?;
-    Ok(PhysicalPosition::new(
-      point["x"].as_f64().unwrap_or_default(),
-      point["y"].as_f64().unwrap_or_default(),
-    ))
+  ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+    Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.window) })
   }
 }

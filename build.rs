@@ -1,108 +1,92 @@
-//! Stages an Electron runtime for the current target so `cargo run` works
-//! without a Node toolchain.
+//! Prepares the Electron distribution this crate drives, and tells the bundler
+//! where it is.
 //!
-//! Resolution order and download behaviour live in `src/acquisition_shared.rs`
-//! (the same file the runtime uses), so a build never disagrees with a launch.
-//! The staged copy lands in `target/electron/<platform>-<arch>` and is exported
-//! as `TAURI_RUNTIME_ELECTRON_ELECTRON_DIR` / `_BINARY` for the runtime.
-//!
-//! Failures only warn: a build without network still links, and the runtime
-//! downloads Electron on first launch instead.
+//! Mirrors `tauri-runtime-cef`'s build script: the runtime crate, not the
+//! application, owns its webview engine payload. `cargo:runtime=electron` and
+//! `cargo:electron_dir=…` are exposed to the build scripts of crates depending on
+//! this one as `DEP_TAURI_RUNTIME_ELECTRON_RUNTIME` and
+//! `DEP_TAURI_RUNTIME_ELECTRON_ELECTRON_DIR`, which is how `tauri-build` and the
+//! bundler learn that the application embeds its own Chromium.
 
-include!("src/acquisition_shared.rs");
+mod build_support;
+
+use std::env;
+use tauri_utils::platform::Target;
 
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
-  println!("cargo:rerun-if-changed=src/acquisition_shared.rs");
-  // The staging step copies these next to Electron; without the hints an edit
-  // would keep the old copy until something else forced a rebuild.
-  println!("cargo:rerun-if-changed=electron/main.cjs");
-  println!("cargo:rerun-if-changed=electron/preload.cjs");
-  println!("cargo:rerun-if-env-changed=TAURI_RUNTIME_ELECTRON_ELECTRON_DIR");
-  println!("cargo:rerun-if-env-changed=TAURI_RUNTIME_ELECTRON_DOWNLOAD");
-  println!("cargo:rerun-if-env-changed=ELECTRON_MIRROR");
-  println!("cargo:rerun-if-env-changed=ELECTRON_CUSTOM_DIR");
-  println!("cargo:rerun-if-env-changed=ELECTRON_CACHE");
-
-  if env::var("TAURI_RUNTIME_ELECTRON_DOWNLOAD").is_ok_and(|value| value == "0") {
-    return;
+  println!("cargo:rerun-if-changed=build_support.rs");
+  // The bundler ships the distribution this build prepares. Emitting the
+  // instruction before the preparation means a failed download still leaves the
+  // bundler with a coherent (if empty) answer instead of a stale one.
+  println!("cargo:runtime=electron");
+  if let Err(error) = prepare() {
+    panic!("Electron build failed: {error}");
   }
+}
 
-  let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-  let searched = [manifest.clone(), env::current_dir().unwrap_or_default()];
-  let source = match explicit_dir()
-    .or_else(|| searched.iter().find_map(|dir| local_install(dir)))
-    .or_else(cached_dist)
-  {
-    Some(path) => path,
-    None => match download() {
-      Ok(path) => path,
-      Err(error) => {
-        println!("cargo:warning=electron download skipped: {error}");
-        return;
-      }
-    },
+fn prepare() -> Result<(), String> {
+  for key in ["CARGO_TARGET_DIR", "INIT_CWD", "PWD", "TAURI_CONFIG"] {
+    println!("cargo:rerun-if-env-changed={key}");
+  }
+  let mut builder = electron_rs::ElectronBuilder::new(electron_rs::DEFAULT_VERSION);
+  // A crate built outside an application (`cargo check` of the library alone, a
+  // workspace with no binary target) has no Cargo build directory to stage into.
+  // That is not a failure: the runtime resolves the distribution at launch, and a
+  // real application build always has one.
+  let Ok(directory) = builder.directory() else {
+    println!(
+      "cargo:warning=no Cargo build directory in this context; Electron is staged by the application build"
+    );
+    return Ok(());
   };
-
-  match stage(&source) {
-    Ok(staged) => {
-      println!(
-        "cargo:rustc-env=TAURI_RUNTIME_ELECTRON_ELECTRON_DIR={}",
-        staged.display()
-      );
-      let binary = staged.join(executable());
-      println!(
-        "cargo:rustc-env=TAURI_RUNTIME_ELECTRON_ELECTRON_BINARY={}",
-        binary.display()
-      );
-      // Re-stage when someone deletes or moves the runtime, like cef-dll-sys does.
-      println!("cargo:rerun-if-changed={}", staged.display());
+  let target_root = directory
+    .parent()
+    .and_then(|path| path.parent())
+    .ok_or("Electron output has no Cargo target root")?;
+  let output_root = directory.parent().ok_or("Electron output has no parent")?;
+  let _preparation = build_support::lock_preparation(output_root)?;
+  let triple = env::var("TARGET").map_err(|error| error.to_string())?;
+  let target = Target::from_triple(&triple);
+  let app = build_support::discover(target_root, target)?;
+  if let Some(app) = app {
+    for input in &app.inputs {
+      println!("cargo:rerun-if-changed={}", input.display());
     }
-    Err(error) => println!("cargo:warning=could not stage electron: {error}"),
-  }
-}
-
-
-/// Copies `source` into `$CARGO_TARGET_DIR/electron/<platform>-<arch>` (once per
-/// version) and returns that path.
-fn stage(source: &Path) -> Result<PathBuf, String> {
-  let target = target_dir()?
-    .join("electron")
-    .join(format!("{}-{}", platform(), arch()));
-  let marker = target.join(format!(".version-{VERSION}"));
-  if !marker.exists() {
-    let _ = fs::remove_dir_all(&target);
-    copy_dir(source, &target)?;
-  }
-  // The main-process scripts change far more often than the distribution, so
-  // they are refreshed on every build instead of only with a fresh stage.
-  let scripts = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("electron");
-  for name in ["main.cjs", "preload.cjs"] {
-    let from = scripts.join(name);
-    if from.exists() {
-      fs::copy(&from, target.join(name))
-        .map_err(|error| format!("{}: {error}", from.display()))?;
+    if let Some(icon) = &app.icon {
+      println!("cargo:rerun-if-changed={}", icon.display());
+    }
+    println!("cargo:rustc-env=ELECTRON_RS_TAURI_PRODUCT_NAME={}", app.name);
+    if let Some(identifier) = &app.identifier {
+      println!("cargo:rustc-env=ELECTRON_RS_TAURI_IDENTIFIER={identifier}");
+    }
+    builder = builder.app_name(app.name);
+    if matches!(target, Target::Windows | Target::MacOS) {
+      if let Some(identifier) = app.identifier {
+        builder = builder.identifier(identifier);
+      }
+      if let Some(icon) = app.icon {
+        builder = builder.icon(icon);
+      }
     }
   }
-  fs::write(marker, VERSION).map_err(|error| format!("{}: {error}", target.display()))?;
-  Ok(target)
-}
-
-/// `$CARGO_TARGET_DIR`, else the profile directory above `OUT_DIR`.
-fn target_dir() -> Result<PathBuf, String> {
-  if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
-    return Ok(PathBuf::from(dir));
+  let builder = builder.output(&directory);
+  let prepared = builder.build().map_err(|error| error.to_string())?;
+  if let Some(warning) = prepared.cleanup_warning {
+    println!("cargo:warning={warning}");
   }
-  let out = PathBuf::from(env::var("OUT_DIR").map_err(|_| "no OUT_DIR")?);
-  out
-    .ancestors()
-    .find(|dir| {
-      dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "debug" || name == "release")
-    })
-    .and_then(Path::parent)
-    .map(Path::to_path_buf)
-    .ok_or_else(|| format!("could not locate the target directory above {}", out.display()))
+  let output_root = prepared
+    .directory
+    .parent()
+    .ok_or("Electron output has no parent")?;
+  build_support::prune_foreign_distributions(output_root, &prepared.directory)?;
+  // The bundler copies this directory into the application bundle. It is the same
+  // path the runtime resolves at launch, so a packaged app and a `cargo run` find
+  // the same distribution.
+  println!("cargo:electron_dir={}", prepared.directory.display());
+  println!(
+    "cargo:rustc-env=ELECTRON_RS_STAGED_BINARY={}",
+    prepared.binary.display()
+  );
+  Ok(())
 }

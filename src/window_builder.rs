@@ -3,277 +3,334 @@
 // SPDX-License-Identifier: MIT
 
 use tauri_runtime::{
-  Icon, Result,
-  dpi::{PixelUnit, Size},
+  Error, Icon, Result,
+  dpi::{PhysicalSize, Size},
   window::{WindowBuilder, WindowBuilderBase, WindowSizeConstraints},
 };
 use tauri_utils::{
   Theme,
-  config::{PreventOverflowConfig, PreventOverflowMargin, WindowConfig},
+  config::{Color, PreventOverflowConfig, WindowConfig},
+};
+
+use crate::window::{
+  AppWindowAttrs, max_size_constraint, min_size_constraint, tauri_icon_is_valid,
 };
 
 #[cfg(target_os = "macos")]
 use tauri_runtime::dpi::Position;
 
-#[cfg(target_os = "macos")]
-use tauri_utils::TitleBarStyle;
-
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 
-/// RGBA icon handed to `WindowBuilder::icon`; the runtime turns it into
-/// something Electron can paint.
-#[derive(Debug, Clone)]
-pub(crate) struct IconData {
-  pub rgba: Vec<u8>,
-  pub width: u32,
-  pub height: u32,
-}
+#[cfg(target_os = "macos")]
+use tauri_utils::TitleBarStyle;
 
-/// Mirrors the window onto an Electron `BrowserWindow`.
+/// The `WindowBuilder` implementation.
 ///
-/// Every builder option lands in [`WindowConfig`] (serialized into the
-/// `window.create` payload) or in one of the fields below, so nothing is
-/// silently dropped. Options Electron cannot express are listed in
-/// `unsupported` and reported when the window is created.
-#[derive(Debug, Clone)]
-pub struct ElectronWindowBuilder {
-  pub(crate) config: WindowConfig,
-  pub(crate) icon: Option<IconData>,
-  pub(crate) unsupported: Vec<&'static str>,
-  /// Owning window handle (Windows: sets the owner, not the parent).
-  #[cfg(windows)]
-  pub(crate) owner: Option<isize>,
-  #[cfg(windows)]
-  pub(crate) parent: Option<isize>,
-  /// Parent window (macOS keeps the NSWindow pointer until the window exists).
-  #[cfg(target_os = "macos")]
-  pub(crate) macos_parent: Option<isize>,
+/// The reference wraps winit's `WindowAttributes`, which is where every attribute
+/// it can set lives. Electron has no such object: a window is a `window.create`
+/// payload, so [`AppWindowAttrs`] carries the same attributes as plain fields and
+/// [`crate::window::create_window_detached`] turns them into that payload.
+#[derive(Clone, Default, Debug)]
+pub struct WindowBuilderWrapper {
+  pub(crate) attrs: AppWindowAttrs,
 }
 
-impl Default for ElectronWindowBuilder {
-  fn default() -> Self {
-    Self {
-      config: WindowConfig::default(),
-      icon: None,
-      unsupported: Vec::new(),
-      #[cfg(windows)]
-      owner: None,
-      #[cfg(windows)]
-      parent: None,
-      #[cfg(target_os = "macos")]
-      macos_parent: None,
-    }
-  }
-}
+impl WindowBuilderBase for WindowBuilderWrapper {}
 
-impl ElectronWindowBuilder {
-  fn unsupported(mut self, option: &'static str) -> Self {
-    if !self.unsupported.contains(&option) {
-      self.unsupported.push(option);
-    }
-    self
-  }
-
-  fn with(mut self, apply: impl FnOnce(&mut WindowConfig)) -> Self {
-    apply(&mut self.config);
-    self
-  }
-}
-
-impl WindowBuilderBase for ElectronWindowBuilder {}
-
-impl WindowBuilder for ElectronWindowBuilder {
+impl WindowBuilder for WindowBuilderWrapper {
   fn new() -> Self {
-    Self::default()
+    Self {
+      attrs: AppWindowAttrs {
+        title: Some("Tauri App".into()),
+        visible: true,
+        focused: true,
+        ..Default::default()
+      },
+    }
   }
 
   fn with_config(config: &WindowConfig) -> Self {
-    Self {
-      config: config.clone(),
-      ..Self::default()
+    let mut builder = Self::new()
+      .title(config.title.to_string())
+      .inner_size(config.width, config.height)
+      .resizable(config.resizable)
+      .fullscreen(config.fullscreen)
+      .focused(config.focus)
+      .focusable(config.focusable)
+      .visible(config.visible)
+      .decorations(config.decorations)
+      .maximized(config.maximized)
+      .content_protected(config.content_protected)
+      .closable(config.closable)
+      .maximizable(config.maximizable)
+      .minimizable(config.minimizable)
+      .skip_taskbar(config.skip_taskbar)
+      .shadow(config.shadow)
+      .visible_on_all_workspaces(config.visible_on_all_workspaces)
+      .theme(config.theme);
+    if config.always_on_bottom {
+      builder = builder.always_on_bottom(true);
+    } else if config.always_on_top {
+      builder = builder.always_on_top(true);
     }
-  }
-
-  fn center(self) -> Self {
-    self.with(|config| {
-      config.center = true;
-      config.x = None;
-      config.y = None;
-    })
-  }
-
-  fn position(self, x: f64, y: f64) -> Self {
-    self.with(|config| {
-      config.x = Some(x);
-      config.y = Some(y);
-      config.center = false;
-    })
-  }
-
-  fn inner_size(self, width: f64, height: f64) -> Self {
-    self.with(|config| {
-      config.width = width;
-      config.height = height;
-    })
-  }
-
-  fn min_inner_size(self, min_width: f64, min_height: f64) -> Self {
-    self.with(|config| {
-      config.min_width = Some(min_width);
-      config.min_height = Some(min_height);
-    })
-  }
-
-  fn max_inner_size(self, max_width: f64, max_height: f64) -> Self {
-    self.with(|config| {
-      config.max_width = Some(max_width);
-      config.max_height = Some(max_height);
-    })
-  }
-
-  fn inner_size_constraints(self, constraints: WindowSizeConstraints) -> Self {
-    self.with(|config| {
-      if let Some(width) = constraints.min_width {
-        config.min_width = Some(units(width));
+    builder = builder.transparent(config.transparent);
+    let mut constraints = WindowSizeConstraints::default();
+    if let Some(min_width) = config.min_width {
+      constraints.min_width = Some(tauri_runtime::dpi::LogicalUnit::new(min_width).into());
+    }
+    if let Some(min_height) = config.min_height {
+      constraints.min_height = Some(tauri_runtime::dpi::LogicalUnit::new(min_height).into());
+    }
+    if let Some(max_width) = config.max_width {
+      constraints.max_width = Some(tauri_runtime::dpi::LogicalUnit::new(max_width).into());
+    }
+    if let Some(max_height) = config.max_height {
+      constraints.max_height = Some(tauri_runtime::dpi::LogicalUnit::new(max_height).into());
+    }
+    builder = builder.inner_size_constraints(constraints);
+    if let Some(color) = config.background_color {
+      builder = builder.background_color(color);
+    }
+    if let (Some(x), Some(y)) = (config.x, config.y) {
+      builder = builder.position(x, y);
+    }
+    #[cfg(target_os = "macos")]
+    {
+      builder = builder
+        .hidden_title(config.hidden_title)
+        .title_bar_style(config.title_bar_style);
+      if let Some(position) = &config.traffic_light_position {
+        builder = builder.traffic_light_position(tauri_runtime::dpi::LogicalPosition::new(
+          position.x, position.y,
+        ));
       }
-      if let Some(height) = constraints.min_height {
-        config.min_height = Some(units(height));
+      if let Some(identifier) = &config.tabbing_identifier {
+        builder = builder.tabbing_identifier(identifier);
       }
-      if let Some(width) = constraints.max_width {
-        config.max_width = Some(units(width));
-      }
-      if let Some(height) = constraints.max_height {
-        config.max_height = Some(units(height));
-      }
-    })
+    }
+    if config.center {
+      builder = builder.center();
+    }
+    if let Some(window_classname) = &config.window_classname {
+      builder = builder.window_classname(window_classname);
+    }
+    if let Some(prevent_overflow) = &config.prevent_overflow {
+      builder = match prevent_overflow {
+        PreventOverflowConfig::Enable(true) => builder.prevent_overflow(),
+        PreventOverflowConfig::Margin(margin) => {
+          let margin = PhysicalSize::new(margin.width, margin.height);
+          builder.prevent_overflow_with_margin(margin.into())
+        }
+        _ => builder,
+      };
+    }
+    builder
   }
 
-  fn prevent_overflow(self) -> Self {
-    self.with(|config| config.prevent_overflow = Some(PreventOverflowConfig::Enable(true)))
+  fn center(mut self) -> Self {
+    self.attrs.center = true;
+    self
   }
 
-  fn prevent_overflow_with_margin(self, margin: Size) -> Self {
-    self.with(|config| {
-      let physical: tauri_runtime::dpi::PhysicalSize<f64> = margin.to_physical(1.0);
-      config.prevent_overflow = Some(PreventOverflowConfig::Margin(PreventOverflowMargin {
-        width: physical.width.round() as u32,
-        height: physical.height.round() as u32,
-      }))
-    })
+  fn position(mut self, x: f64, y: f64) -> Self {
+    self.attrs.position = Some(tauri_runtime::dpi::LogicalPosition::new(x, y).into());
+    self
   }
 
-  fn resizable(self, resizable: bool) -> Self {
-    self.with(|config| config.resizable = resizable)
+  fn inner_size(mut self, width: f64, height: f64) -> Self {
+    self.attrs.inner_size = Some(tauri_runtime::dpi::LogicalSize::new(width, height).into());
+    self
   }
 
-  fn maximizable(self, maximizable: bool) -> Self {
-    self.with(|config| config.maximizable = maximizable)
+  fn min_inner_size(mut self, min_width: f64, min_height: f64) -> Self {
+    self.attrs.min_inner_size =
+      Some(tauri_runtime::dpi::LogicalSize::new(min_width, min_height).into());
+    self
   }
 
-  fn minimizable(self, minimizable: bool) -> Self {
-    self.with(|config| config.minimizable = minimizable)
+  fn max_inner_size(mut self, max_width: f64, max_height: f64) -> Self {
+    self.attrs.max_inner_size =
+      Some(tauri_runtime::dpi::LogicalSize::new(max_width, max_height).into());
+    self
   }
 
-  fn closable(self, closable: bool) -> Self {
-    self.with(|config| config.closable = closable)
+  fn inner_size_constraints(mut self, constraints: WindowSizeConstraints) -> Self {
+    self.attrs.min_inner_size = min_size_constraint(constraints.min_width, constraints.min_height);
+    self.attrs.max_inner_size = max_size_constraint(constraints.max_width, constraints.max_height);
+    self
   }
 
-  fn title<S: Into<String>>(self, title: S) -> Self {
-    self.with(|config| config.title = title.into())
+  fn prevent_overflow(mut self) -> Self {
+    self.attrs.prevent_overflow = Some(PhysicalSize::new(0, 0).into());
+    self
   }
 
-  fn fullscreen(self, fullscreen: bool) -> Self {
-    self.with(|config| config.fullscreen = fullscreen)
+  fn prevent_overflow_with_margin(mut self, margin: Size) -> Self {
+    self.attrs.prevent_overflow = Some(margin);
+    self
   }
 
-  fn focused(self, focused: bool) -> Self {
-    self.with(|config| config.focus = focused)
+  fn resizable(mut self, resizable: bool) -> Self {
+    self.attrs.resizable = resizable;
+    self
   }
 
-  fn focusable(self, focusable: bool) -> Self {
-    self.with(|config| config.focusable = focusable)
+  fn maximizable(mut self, maximizable: bool) -> Self {
+    self.attrs.maximizable = maximizable;
+    self
   }
 
-  fn maximized(self, maximized: bool) -> Self {
-    self.with(|config| config.maximized = maximized)
+  fn minimizable(mut self, minimizable: bool) -> Self {
+    self.attrs.minimizable = minimizable;
+    self
   }
 
-  fn visible(self, visible: bool) -> Self {
-    self.with(|config| config.visible = visible)
+  fn closable(mut self, closable: bool) -> Self {
+    self.attrs.closable = closable;
+    self
   }
 
-  fn transparent(self, transparent: bool) -> Self {
-    self.with(|config| config.transparent = transparent)
+  fn title<S: Into<String>>(mut self, title: S) -> Self {
+    self.attrs.title = Some(title.into());
+    self
   }
 
-  fn decorations(self, decorations: bool) -> Self {
-    self.with(|config| config.decorations = decorations)
+  fn fullscreen(mut self, fullscreen: bool) -> Self {
+    self.attrs.fullscreen = fullscreen;
+    self
   }
 
-  fn always_on_bottom(self, always_on_bottom: bool) -> Self {
-    self.with(|config| config.always_on_bottom = always_on_bottom)
+  fn focused(mut self, focused: bool) -> Self {
+    self.attrs.focused = focused;
+    self
   }
 
-  fn always_on_top(self, always_on_top: bool) -> Self {
-    self.with(|config| config.always_on_top = always_on_top)
+  /// The reference cannot express this yet and drops it. Electron's
+  /// `window.create` takes `focusable`, so the mirror records it and the window
+  /// is created with it — the one builder attribute where the mirror is strictly
+  /// more capable than the reference.
+  fn focusable(mut self, focusable: bool) -> Self {
+    self.attrs.focusable = focusable;
+    self
   }
 
-  fn visible_on_all_workspaces(self, visible: bool) -> Self {
-    self.with(|config| config.visible_on_all_workspaces = visible)
+  fn maximized(mut self, maximized: bool) -> Self {
+    self.attrs.maximized = maximized;
+    self
   }
 
-  fn content_protected(self, protected: bool) -> Self {
-    self.with(|config| config.content_protected = protected)
+  fn visible(mut self, visible: bool) -> Self {
+    self.attrs.visible = visible;
+    self
   }
 
-  fn icon(self, icon: Icon<'_>) -> Result<Self> {
-    Ok(Self {
-      icon: Some(IconData {
-        rgba: icon.rgba.into_owned(),
-        width: icon.width,
-        height: icon.height,
-      }),
-      ..self
-    })
+  fn transparent(mut self, transparent: bool) -> Self {
+    self.attrs.transparent = transparent;
+    self
   }
 
-  fn skip_taskbar(self, skip: bool) -> Self {
-    self.with(|config| config.skip_taskbar = skip)
+  fn decorations(mut self, decorations: bool) -> Self {
+    self.attrs.decorations = decorations;
+    self
   }
 
-  fn window_classname<S: Into<String>>(self, classname: S) -> Self {
-    self.with(|config| config.window_classname = Some(classname.into()))
+  fn always_on_bottom(mut self, always_on_bottom: bool) -> Self {
+    self.attrs.always_on_bottom = always_on_bottom;
+    self
   }
 
-  fn no_redirection_bitmap(self, enable: bool) -> Self {
-    self.with(|config| config.no_redirection_bitmap = enable)
+  fn always_on_top(mut self, always_on_top: bool) -> Self {
+    self.attrs.always_on_top = always_on_top;
+    self
   }
 
-  fn shadow(self, enable: bool) -> Self {
-    self.with(|config| config.shadow = enable)
+  fn visible_on_all_workspaces(mut self, visible_on_all_workspaces: bool) -> Self {
+    self.attrs.visible_on_all_workspaces = visible_on_all_workspaces;
+    self
   }
 
+  fn content_protected(mut self, protected: bool) -> Self {
+    self.attrs.content_protected = protected;
+    self
+  }
+
+  fn icon(mut self, icon: Icon) -> Result<Self> {
+    if !tauri_icon_is_valid(&icon) {
+      return Err(Error::InvalidIcon(
+        "the icon buffer does not match its size".into(),
+      ));
+    }
+    self.attrs.icon = Some(icon.into_owned());
+    Ok(self)
+  }
+
+  fn skip_taskbar(mut self, skip: bool) -> Self {
+    self.attrs.skip_taskbar = skip;
+    self
+  }
+
+  fn background_color(mut self, color: Color) -> Self {
+    self.attrs.background_color = Some(color);
+    self
+  }
+
+  fn shadow(mut self, enable: bool) -> Self {
+    self.attrs.shadow = enable;
+    self
+  }
+
+  /// An owned window needs a native parent handle. Electron parents windows by
+  /// *window id* (`window.setParentWindow`), which a builder cannot name before
+  /// the window exists, so the handle is recorded and never applied.
   #[cfg(windows)]
   fn owner(mut self, owner: HWND) -> Self {
-    self.owner = Some(owner.0 as isize);
+    crate::unsupported::report("WindowBuilder::owner");
+    self.attrs.owner = Some(owner.0 as isize);
+    self
+  }
+
+  /// A child window is a native concept Electron's `BaseWindow` does not have.
+  #[cfg(windows)]
+  fn parent(mut self, parent: HWND) -> Self {
+    crate::unsupported::report("WindowBuilder::parent");
+    self.attrs.parent = Some(parent.0 as isize);
     self
   }
 
   #[cfg(windows)]
-  fn parent(mut self, parent: HWND) -> Self {
-    self.parent = Some(parent.0 as isize);
+  fn drag_and_drop(mut self, enabled: bool) -> Self {
+    crate::unsupported::report("WindowBuilder::drag_and_drop");
+    self.attrs.drag_and_drop = Some(enabled);
     self
   }
 
+  /// A macOS child window is added with `addChildWindow:`, which needs the parent
+  /// `NSWindow*`. Electron's equivalent parents by window id, which a builder
+  /// cannot name before the window exists.
+  ///
+  /// The reference adopts the parent `NSWindow` to read its content view; this
+  /// runtime does not adopt it, so the reference it was handed is released here
+  /// and the pointer is only recorded.
   #[cfg(target_os = "macos")]
   fn parent(mut self, parent: *mut std::ffi::c_void) -> Self {
-    // The pointer is one of our own windows: the runtime maps it back to a
-    // serial and Electron then calls `setParentWindow`.
-    self.macos_parent = Some(parent as isize);
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSWindow;
+
+    crate::unsupported::report("WindowBuilder::parent");
+    if let Some(nswindow) = std::ptr::NonNull::new(parent) {
+      // SAFETY: the caller transferred a reference to this `NSWindow`, as the
+      // reference implementation assumes when it adopts it.
+      let _ = unsafe { Retained::<NSWindow>::from_raw(nswindow.as_ptr() as _) };
+    }
+    self.attrs.macos_parent = Some(parent as isize);
     self
   }
 
+  /// `transient_for` receives the parent as transfer full, and the implementation
+  /// must release that reference even when it does not support transient windows.
+  /// The reference adopts it into the attribute; Electron parents by window id, so
+  /// the reference is released here instead and only the pointer is recorded.
   #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -281,80 +338,68 @@ impl WindowBuilder for ElectronWindowBuilder {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn transient_for(self, _parent: *mut std::ffi::c_void) -> Self {
-    // No Electron equivalent: GTK parent handles mean nothing to Electron.
-    // GTK parent handles mean nothing to Electron.
-    self.unsupported("transient_for")
-  }
+  fn transient_for(mut self, parent: *mut std::ffi::c_void) -> Self {
+    use gtk::glib::translate::FromGlibPtrFull;
 
-  #[cfg(windows)]
-  fn drag_and_drop(self, enabled: bool) -> Self {
-    self.with(|config| config.drag_drop_enabled = enabled)
-  }
-
-  #[cfg(target_os = "macos")]
-  fn title_bar_style(self, style: TitleBarStyle) -> Self {
-    self.with(|config| config.title_bar_style = style)
+    crate::unsupported::report("WindowBuilder::transient_for");
+    if !parent.is_null() {
+      // SAFETY: `transient_for` receives the parent as transfer full, so the
+      // wrapper adopts the reference and releases it when it is dropped here.
+      let _ = unsafe { gtk::Window::from_glib_full(parent as *mut gtk::ffi::GtkWindow) };
+    }
+    self.attrs.transient_for = Some(parent as isize);
+    self
   }
 
   #[cfg(target_os = "macos")]
-  fn traffic_light_position<P: Into<Position>>(self, position: P) -> Self {
-    self.with(|config| {
-      // `dpi::LogicalPosition` and the config's own type are unrelated structs.
-      let logical = position.into().to_logical::<f64>(1.0);
-      config.traffic_light_position = Some(tauri_utils::config::LogicalPosition {
-        x: logical.x,
-        y: logical.y,
-      })
-    })
+  fn title_bar_style(mut self, style: TitleBarStyle) -> Self {
+    self.attrs.title_bar_style = Some(style);
+    self
   }
 
   #[cfg(target_os = "macos")]
-  fn hidden_title(self, hidden: bool) -> Self {
-    self.with(|config| config.hidden_title = hidden)
+  fn traffic_light_position<P: Into<Position>>(mut self, position: P) -> Self {
+    self.attrs.traffic_light_position = Some(position.into());
+    self
   }
 
   #[cfg(target_os = "macos")]
-  fn tabbing_identifier(self, identifier: &str) -> Self {
-    self.with(|config| config.tabbing_identifier = Some(identifier.to_string()))
+  fn hidden_title(mut self, hidden: bool) -> Self {
+    self.attrs.hidden_title = hidden;
+    self
   }
 
-  fn theme(self, theme: Option<Theme>) -> Self {
-    self.with(|config| config.theme = theme)
+  #[cfg(target_os = "macos")]
+  fn tabbing_identifier(mut self, identifier: &str) -> Self {
+    self.attrs.tabbing_identifier = Some(identifier.to_string());
+    self
+  }
+
+  fn theme(mut self, theme: Option<Theme>) -> Self {
+    self.attrs.theme = theme;
+    self
+  }
+
+  /// Electron windows have no class name to set: the window is a `BaseWindow`
+  /// whose class belongs to the Electron binary.
+  fn window_classname<S: Into<String>>(mut self, window_classname: S) -> Self {
+    crate::unsupported::report("WindowBuilder::window_classname");
+    self.attrs.window_classname = Some(window_classname.into());
+    self
+  }
+
+  /// `WS_EX_NOREDIRECTIONBITMAP` is a Win32 style. Electron decides its own
+  /// redirection surface, so there is nothing to set.
+  fn no_redirection_bitmap(self, _enable: bool) -> Self {
+    crate::unsupported::report("WindowBuilder::no_redirection_bitmap");
+    self
   }
 
   fn has_icon(&self) -> bool {
-    self.icon.is_some()
+    self.attrs.icon.is_some()
   }
 
   fn get_theme(&self) -> Option<Theme> {
-    self.config.theme
-  }
-
-  fn background_color(self, color: tauri_utils::config::Color) -> Self {
-    self.with(|config| config.background_color = Some(color))
-  }
-
-  #[cfg(target_os = "android")]
-  fn activity_name<S: Into<String>>(self, class_name: S) -> Self {
-    self.with(|config| config.activity_name = Some(class_name.into()))
-  }
-
-  #[cfg(target_os = "android")]
-  fn created_by_activity_name<S: Into<String>>(self, class_name: S) -> Self {
-    self.with(|config| config.created_by_activity_name = Some(class_name.into()))
-  }
-
-  #[cfg(target_os = "ios")]
-  fn requested_by_scene_identifier<S: Into<String>>(self, identifier: S) -> Self {
-    self.with(|config| config.requested_by_scene_identifier = Some(identifier.into()))
-  }
-}
-
-/// Collapses a constraint unit to the logical pixels Electron works in.
-fn units(unit: PixelUnit) -> f64 {
-  match unit {
-    PixelUnit::Physical(value) => f64::from(value.0),
-    PixelUnit::Logical(value) => value.0,
+    self.attrs.theme
   }
 }

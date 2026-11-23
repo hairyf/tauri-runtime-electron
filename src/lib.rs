@@ -2,44 +2,55 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-#![allow(dead_code)]
-#![allow(missing_docs)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::too_many_arguments)]
 
-//! A Tauri runtime that delegates all window and webview work to an Electron main
-//! process spawned as a child of the Tauri (Rust) process.
-//!
-//! ```ignore
-//! tauri::Builder::default()
-//!   .runtime(tauri_runtime_electron::Electron::default())
-//!   .run(tauri::generate_context!())
-//!   .unwrap();
-//! ```
-//!
-//! The file layout mirrors `tauri-runtime-cef`; modules that exist only because
-//! CEF exposes native handles (`cef_impl`, `dialog`, `frame`, `popup`,
-//! `sandbox`) have no Electron counterpart and are replaced by the IPC bridge in
-//! [`electron_impl`].
-
-mod acquisition;
-mod app_icon;
 mod devtools;
-mod electron_impl;
+mod dialog;
+/// The `Last Version` breadcrumb in the root cache path, and what a rollback to an older runtime
+/// does with the profile a newer one left there.
+mod downgrade;
+/// The diagnostic environment variables Chromium reads, and the policy over them.
 mod environment;
+mod external_message_pump;
+mod frame;
+pub use dialog::{
+  NativeDialogKind, NativeDialogObservation, NativeDialogSnapshot, NativeDialogToken,
+};
+pub use environment::DebugEnvironment;
+mod frame_navigation;
+/// The languages the user asked their operating system for.
 mod locale;
+mod macros;
+mod offscreen;
+pub use offscreen::{CursorHandler, CursorInfo, CursorType, Offscreen, OffscreenView, RenderHandler};
 mod platform;
 mod popup;
 mod runtime;
+// `SandboxPolicy` itself is public API and lives in `runtime`; this module holds the
+// decision behind it.
+mod sandbox;
+/// Helpers for the Chromium command line the runtime hands to the Electron main process.
 mod switches;
 mod tauri_ext;
+/// Reports a capability Electron has no equivalent for, once per API.
 mod unsupported;
 mod webview;
+pub use devtools::{DevToolsMessageIdExhausted, allocate_devtools_message_id};
+pub use frame::{FrameEvent, FrameEventHandler, FrameEventKind};
+pub use frame_navigation::{FrameNavigationState, NativeDocumentToken};
 mod window;
 mod window_builder;
 mod window_handle;
+/// The Electron main process bridge: process ownership, the event stream and RPC.
+mod electron_impl;
 
-pub use environment::DebugEnvironment;
-pub use runtime::{Electron, ElectronRuntime, EventProxy, RuntimeContext};
-pub use webview::ElectronWebviewDispatcher;
-pub use window::ElectronWindowDispatcher;
-pub use window_builder::ElectronWindowBuilder;
-pub use window_handle::ElectronRuntimeHandle;
+#[cfg(target_os = "macos")]
+pub use platform::macos::setup_application as prepare_macos_application;
+pub use runtime::*;
+pub use tauri_ext::*;
+/// Marks the application entry point so Electron helper processes are handled.
+pub use macros::electron_entry_point;
+pub use webview::*;
+pub use window::{ElectronWindowDispatcher, NativeWindowToken};
+pub use window_builder::WindowBuilderWrapper;

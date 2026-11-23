@@ -1,17 +1,36 @@
 [package]
 name = "tauri-runtime-electron"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
-description = "Experimental Tauri runtime backend that drives an Electron main process over a local IPC socket."
+edition = "2024"
+rust-version = "1.95"
+description = "Tauri runtime backend that drives an Electron main process through the electron-rs bridge."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 exclude = ["CHANGELOG.md", "source/", "/target"]
 publish = false
+# lets `tauri-build` detect the Electron runtime through the `DEP_TAURI_RUNTIME_ELECTRON_RUNTIME` env var
+links = "tauri_runtime_electron"
+
+[features]
+default = []
+# also enables devtools on `tauri` so the feature only needs to be enabled on this crate
+devtools = ["tauri-runtime/devtools", "tauri/devtools"]
+# exposes the extension traits for `tauri::webview::WebviewBuilder`
+unstable = ["tauri/unstable"]
+
+[build-dependencies]
+electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "f9164d989c49d831a7562571db581dc782dd87db" }
+json-patch = { version = "4", default-features = false }
+serde_json = "1"
+tauri-utils = { version = "~3.0.0-alpha.4", features = ["config-json5", "config-toml"] }
 
 [dependencies]
-tauri-runtime = "3.0.0-alpha.4"
+tauri = { version = "3.0.0-alpha.6", default-features = false }
+tauri-runtime = "3.0.0-alpha.5"
 tauri-utils = { version = "~3.0.0-alpha.4", features = ["resources"] }
+electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "f9164d989c49d831a7562571db581dc782dd87db" }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process", "io-util"] }
+log = "0.4"
 http = "1"
 cookie = "0.18"
 base64 = "0.22"
@@ -19,6 +38,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
 raw-window-handle = "0.6"
+dirs = "6"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSRunningApplication", "NSEvent", "NSResponder", "NSMenu", "NSMenuItem", "NSCell"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSString", "NSRunLoop", "NSArray", "NSEnumerator", "NSObject", "NSLocale"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+gtk = "0.18"
+
+[[test]]
+name = "macos-application-bootstrap"
+harness = false
