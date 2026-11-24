@@ -10,7 +10,7 @@
 //! `window.progressBar`, `window.backgroundColor` and `window.visibleOnAllWorkspaces` are the
 //! RPCs the runtime uses, and `setSkipTaskbar` is a no-op on Linux in both.
 
-use std::os::raw::c_ulong;
+use std::os::raw::{c_long, c_ulong};
 
 use tauri_runtime::{ProgressBarState, dpi::PhysicalSize};
 use tauri_utils::config::Color;
@@ -123,11 +123,16 @@ impl NativeWindow {
   }
 
   pub(crate) fn set_skip_taskbar(&self, skip: bool) {
-    set_wm_state(self.xid(), skip, "_NET_WM_STATE_SKIP_TASKBAR", None);
+    set_wm_state(
+      self.xid() as c_long,
+      skip,
+      "_NET_WM_STATE_SKIP_TASKBAR",
+      None,
+    );
   }
 
   pub(crate) fn set_visible_on_all_workspaces(&self, visible: bool) {
-    set_wm_state(self.xid(), visible, "_NET_WM_STATE_STICKY", None);
+    set_wm_state(self.xid() as c_long, visible, "_NET_WM_STATE_STICKY", None);
   }
 
   pub(crate) fn set_progress_bar(&self, state: ProgressBarState) {

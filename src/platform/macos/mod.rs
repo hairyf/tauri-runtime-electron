@@ -28,9 +28,16 @@ mod webview;
 mod window;
 
 pub use application::setup_application;
+// The reference reaches these from its own event loop and AppKit subclass. Electron
+// owns both in another process, so nothing in this crate calls them yet — they keep
+// the reference's names so the module tree still lines up.
+#[allow(unused_imports)]
 pub(crate) use application::{
   AppDelegate, AppDelegateEvent, activate_application, set_application_event_handler,
 };
+#[allow(unused_imports)]
 pub(crate) use fullscreen::FullscreenTransition;
+#[allow(unused_imports)]
 pub(crate) use wake::MainThreadWake;
+#[allow(unused_imports)]
 pub(crate) use window::nswindow;

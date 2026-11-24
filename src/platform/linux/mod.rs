@@ -22,4 +22,8 @@ mod utils;
 mod webview;
 mod window;
 
+// The reference builds its own X11 host over GTK's content box. Electron owns the
+// window and composites its webviews, so nothing in this crate constructs one — the
+// name is kept so the module tree still lines up.
+#[allow(unused_imports)]
 pub(crate) use window::CefX11Host;

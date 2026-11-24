@@ -143,6 +143,14 @@ fn main() {
     custom_schemes: Vec::new(),
     #[cfg(windows)]
     msg_hook: None,
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    app_id: None,
     runtime_init_attrs: Electron::default()
       .root_cache_path(&cache)
       // Chromium's sandbox needs a session it can broker; a CI runner and a
