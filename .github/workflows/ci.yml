@@ -123,3 +123,65 @@ jobs:
 
       - name: Compare the crate against tauri-runtime-cef
         run: node tools/parity.mjs
+
+  # The smoke test proves the runtime; this proves the stack above it. `tauri`
+  # resolves `WebviewUrl::App` to this runtime's own scheme, registers the `tauri`
+  # and `ipc` protocols on every webview it builds, and routes a command back into
+  # Rust — none of which the runtime-level test can reach.
+  app:
+    name: app (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and Electron
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/app
+            ~/.cache/electron
+            ~/AppData/Local/electron/Cache
+          key: ${{ matrix.os }}-app-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-app-cargo-
+
+      - name: Linux window libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libgbm1 libxcomposite1 libxdamage1 libxrandr2 \
+            libpango-1.0-0 libcairo2 libgtk-3-0 libasound2t64
+
+      - name: Build the application
+        env:
+          CARGO_TARGET_DIR: target/app
+        run: cargo build --manifest-path examples/hello/Cargo.toml
+
+      # The app exits `0` whatever it concluded, so the verdict is the line it
+      # prints. `ELECTRON_HELLO_NO_SANDBOX` is there because a hosted runner
+      # cannot broker Chromium's sandbox.
+      - name: Run the application
+        shell: bash
+        env:
+          ELECTRON_HELLO_NO_SANDBOX: "1"
+          ELECTRON_HELLO_CACHE_DIR: ${{ github.workspace }}/target/app-profile
+        run: |
+          exe=target/app/debug/electron-hello
+          [ "$RUNNER_OS" = "Windows" ] && exe="$exe.exe"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run --auto-servernum "$exe" > app.log 2>&1 || true
+          else
+            "$exe" > app.log 2>&1 || true
+          fi
+          grep -v -E "disk_cache|cache_util|network_sandbox|gpu_disk_cache|WSALookup" app.log || true
+          grep -q "hello: passed" app.log

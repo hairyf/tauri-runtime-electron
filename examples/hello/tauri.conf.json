@@ -1,0 +1,15 @@
+{
+  "productName": "Electron Hello",
+  "version": "0.0.0",
+  "identifier": "com.tauri.electron-hello",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": []
+  },
+  "bundle": {
+    "active": false
+  }
+}

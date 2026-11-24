@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "the permissions the hello page needs",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

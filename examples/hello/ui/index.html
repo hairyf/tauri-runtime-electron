@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Electron Hello</title>
+  </head>
+  <body>
+    <h1 id="heading">hello from Electron</h1>
+    <script>
+      // `__TAURI_INTERNALS__` is what `tauri` injects as the IPC bootstrap. Its
+      // presence alone proves the initialization script ran, and the call proves
+      // the `ipc://` scheme answers.
+      ;(async () => {
+        const { invoke } = window.__TAURI_INTERNALS__
+        await invoke('loaded', {
+          url: location.href,
+          heading: document.getElementById('heading').textContent
+        })
+      })().catch((error) => {
+        document.title = `failed: ${error}`
+        console.error(error)
+      })
+    </script>
+  </body>
+</html>

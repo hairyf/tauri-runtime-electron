@@ -1,0 +1,16 @@
+[package]
+name = "electron-hello"
+version = "0.0.0"
+description = "A Tauri application on the Electron runtime: the whole stack, not just the runtime."
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "3.0.0-alpha.4", default-features = true }
+
+[dependencies]
+log = { version = "0.4", features = ["std"] }
+tauri = { version = "3.0.0-alpha.6", default-features = true }
+tauri-runtime-electron = { path = "../.." }

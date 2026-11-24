@@ -118,6 +118,8 @@ The reference's own gaps are reproduced, not papered over:
   partition name rather than an opaque data-store identifier.
 - `set_activate_ignoring_other_apps` is unimplemented in the reference; here it
   forwards to `app.focus({ steal })`, the closest Electron offers.
+- `Runtime::run_return` returns `0`, as the reference's does — its own comment says
+  the exit code is not available from the loop.
 
 Everything else either does the equivalent work or calls
 `crate::unsupported::report`.
@@ -129,5 +131,7 @@ Everything else either does the equivalent work or calls
 - **The smoke test covers the window and webview surface, not all 118 exports.**
   It proves handshake, displays, cursor, window creation, seven setters through
   their getters, `eval_script_with_callback`, `url`, `bounds`, `zoom`,
-  `can_go_back` and destroy. The rest is covered by the 139 unit tests against a
+  `can_go_back` and destroy. The rest is covered by the unit tests against a
   mocked RPC boundary.
+- **`examples/hello` covers one Tauri application, not the API.** It proves the
+  window, the asset protocol, the IPC bootstrap and one command round trip.

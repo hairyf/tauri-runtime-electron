@@ -125,17 +125,21 @@ ship Electron payloads itself will pick this crate up without a config entry.
 ## Verifying
 
 ```bash
-cargo test                      # 139 unit tests, RPC boundary mocked
-cargo test --test smoke -- --nocapture   # a real Electron process
-node tools/parity.mjs           # compares this crate against tauri-runtime-cef
+cargo test                                              # unit tests, RPC boundary mocked
+cargo test --test smoke -- --nocapture                  # a real Electron process
+cargo run --manifest-path examples/hello/Cargo.toml     # a real Tauri app
+node tools/parity.mjs                                   # against tauri-runtime-cef
 ```
 
 `tools/parity.mjs` is the contract check: every reference file, every exported item
 and every `tauri-runtime` trait member has to line up. CI runs it on every push.
 
-The smoke test is what proves the bridge — it launches Electron, creates a window
-with a live document, and reads every setter back through its getter. Linux needs a
-display server, so CI runs it under `xvfb-run`.
+The smoke test proves the bridge — it launches Electron, creates a window with a live
+document, and reads every setter back through its getter. `examples/hello` proves the
+stack above it: `tauri` resolving the app URL to this runtime's scheme, serving
+`frontendDist` over it, injecting the IPC bootstrap and routing a command back into
+Rust. It prints `hello: passed`. Linux needs a display server, so CI runs both under
+`xvfb-run`.
 
 ## Layout
 
