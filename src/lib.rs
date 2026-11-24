@@ -31,6 +31,7 @@ mod command_bridge;
 mod devtools;
 mod environment;
 mod guest;
+mod heap;
 mod locale;
 #[cfg(target_os = "macos")]
 mod macos_menu;
@@ -58,6 +59,7 @@ pub use command_bridge::ElectronClient;
 pub use electron_rs::{Command, CommandChunk, OutputStream};
 pub use environment::DebugEnvironment;
 pub use guest::with_guest;
+pub use heap::HeapSizeLimit;
 pub use setup::WebviewSetup;
 pub use browser::BrowserGuestReservation;
 #[cfg(feature = "tauri")]

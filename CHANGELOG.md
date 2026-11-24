@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this crate aims to
 follow [Semantic Versioning](https://semver.org/).
 
+## \[Unreleased]
+
+### New Features
+
+- `Electron::heap_size_limit(mib)` reports the V8 heap limit the bundled runtime
+  really enforces. The distribution is built with V8's pointer-compression cage,
+  so a `--max-old-space-size` above it is clamped without an error and without
+  telling the caller; `HeapSizeLimit` carries the measured limit and whether the
+  request was clamped, so an application that offers a memory limit can offer one
+  the runtime can honour.
+
 ## \[0.1.0] - 2026-10-22
 
 ### Notes
