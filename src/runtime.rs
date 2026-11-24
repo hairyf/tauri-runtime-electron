@@ -56,14 +56,6 @@ pub const ELECTRON_API_VERSION_LAST: &str = electron_rs::DEFAULT_VERSION;
 /// The switch that tells a helper process which API version the browser process runs.
 const API_VERSION_SWITCH: &str = "tauri-electron-api-version";
 
-/// Extra schemes [`register_custom_protocol_scheme`] named before the runtime started.
-static SCHEMES: std::sync::Mutex<std::collections::BTreeSet<String>> =
-  std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-/// The name and identifier [`set_app_details`] recorded before the runtime started.
-static APP_DETAILS: std::sync::Mutex<Option<(String, Option<String>)>> =
-  std::sync::Mutex::new(None);
-
 /// Handles a non-browser process of this application.
 ///
 /// CEF re-executes the application binary for its renderer, GPU and utility
@@ -75,40 +67,6 @@ static APP_DETAILS: std::sync::Mutex<Option<(String, Option<String>)>> =
 /// The function exists because `#[electron_entry_point]` expands to a call to it,
 /// which keeps an application's `main` identical to the CEF runtime's.
 pub fn run_electron_helper_process() {}
-
-/// Privileges a custom URL scheme before Electron starts.
-///
-/// Tauri 3 does not pass builder-registered protocols in its startup arguments, so
-/// a scheme a webview will serve has to be named here as well as registered with
-/// the webview. The reference needs no equivalent: CEF takes its scheme list from
-/// the same `RuntimeInitArgs` the application already fills in.
-///
-/// ```no_run
-/// # use tauri_runtime_electron::Electron;
-/// let runtime = Electron::default().custom_scheme("stream");
-/// ```
-pub fn register_custom_protocol_scheme(scheme: impl Into<String>) {
-  // The scheme list is read when the runtime starts, so this records into the
-  // process-wide set the next `Electron::default()` picks up.
-  SCHEMES
-    .lock()
-    .unwrap_or_else(|poisoned| poisoned.into_inner())
-    .insert(scheme.into().to_ascii_lowercase());
-}
-
-/// Sets the application name and identifier Electron reports to the operating
-/// system.
-///
-/// The reference has no equivalent: CEF takes both from the bundle. Electron needs
-/// them for the taskbar entry, notifications and the single-instance lock, and the
-/// build script already applies what `tauri.conf.json` declares — this is for an
-/// application that computes them at run time.
-pub fn set_app_details(name: impl Into<String>, identifier: Option<String>) {
-  let mut details = crate::runtime::APP_DETAILS
-    .lock()
-    .unwrap_or_else(|poisoned| poisoned.into_inner());
-  *details = Some((name.into(), identifier));
-}
 
 /// Observes a native window event before Tauri's own handling.
 ///
@@ -1818,17 +1776,10 @@ impl<T: UserEvent> ElectronRuntime<T> {
       .iter()
       .map(|scheme| (*scheme).to_owned())
       .collect();
-    // Schemes named through `register_custom_protocol_scheme` before the runtime
-    // started, then the ones Tauri and the deep-link config carry.
-    let registered: Vec<String> = SCHEMES
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner())
+    // The schemes the application named on the builder, then the ones Tauri and the
+    // deep-link config carry.
+    for scheme in custom_schemes
       .iter()
-      .cloned()
-      .collect();
-    for scheme in registered
-      .iter()
-      .chain(custom_schemes)
       .chain(&attrs.schemes)
       .chain(&attrs.deep_link_schemes)
     {

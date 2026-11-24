@@ -178,22 +178,6 @@ pub fn webview_version() -> tauri_runtime::Result<String> {
   Ok(crate::ELECTRON_API_VERSION_LAST.to_string())
 }
 
-/// Captures the webview's visible surface as a PNG data URL.
-///
-/// Electron's `webContents.capturePage` is the only way to read pixels back, and it
-/// has no CEF counterpart — the reference has no such function. The result is a
-/// `data:image/png;base64,…` URL, ready for an `<img>` or a file write.
-pub fn capture_webview<T: UserEvent>(
-  webview: &ElectronWebviewDispatcher<T>,
-) -> tauri_runtime::Result<String> {
-  call(
-    &webview.context,
-    electron_rs::rpc::webview::Capture {
-      webview_id: webview.webview_id,
-    },
-  )
-}
-
 /// The settings a webview is created with, as the bridge can honour them.
 ///
 /// The reference's `BrowserSettingsCallback` gets `cef::BrowserSettings`, a struct

@@ -99,17 +99,6 @@ tauri::Builder::<ElectronRuntime>::new()
 `init()` registers only Rust managed state: no renderer commands, no Tauri
 permissions. `current_client()` reads the same client from a runtime task.
 
-### Screenshots and the shell
-
-```rust
-let png = tauri_runtime_electron::capture_webview(&webview)?;   // "data:image/png;base64,…"
-tauri_runtime_electron::open_external(&client, "https://tauri.app").await?;
-tauri_runtime_electron::open_path(&client, "/tmp/report.pdf").await?;
-```
-
-Both shell calls go through the Electron main process, so the activation belongs to
-the shell rather than to a child process that cannot raise a window on Windows.
-
 ### Bundling
 
 The build script prepares the Electron distribution under

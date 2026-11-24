@@ -478,12 +478,9 @@ fn main() {
   );
 
   // ── the Electron-specific layer ─────────────────────────────────────────────
-  // Everything above mirrors `tauri-runtime-cef`. These are the things the mirror
-  // cannot express: the raw client, a Node script on the main thread, a screenshot,
-  // and the shell handoff.
-  //
-  // The client is reached the way an application reaches it — from a task the
-  // runtime runs on its own thread, which is what `init()` installs as managed
+  // Everything above mirrors `tauri-runtime-cef`. This is what the mirror cannot
+  // express: the raw client, reached the way an application reaches it — from a task
+  // the runtime runs on its own thread, which is what `init()` installs as managed
   // state.
   let slot = Arc::new(Mutex::new(None));
   let observed_client = Arc::clone(&slot);
@@ -508,41 +505,6 @@ fn main() {
   check(
     &format!("ElectronClient ran a Node script ({})", stdout.trim()),
     stdout.contains("smoke-command") && output.status.success(),
-  );
-
-  // `capturePage` asks the compositor for a frame, which is not there until the
-  // window has painted once, so the capture is retried rather than assumed.
-  let mut captured = Err(String::new());
-  for _ in 0..40 {
-    pump(&mut runtime);
-    match tauri_runtime_electron::capture_webview(&webview) {
-      Ok(png) => {
-        captured = Ok(png);
-        break;
-      }
-      Err(error) => {
-        captured = Err(error.to_string());
-        std::thread::sleep(Duration::from_millis(100));
-      }
-    }
-  }
-  match captured {
-    Ok(png) => check(
-      &format!("capture_webview returned {} bytes", png.len()),
-      png.starts_with("data:image/png;base64,"),
-    ),
-    // A compositor that never produced a frame is the environment's answer, not
-    // this runtime's: report it and keep the rest of the run meaningful.
-    Err(error) => println!("  ..  capture_webview: {error}"),
-  }
-
-  let refused = block_on(tauri_runtime_electron::open_path(
-    &client,
-    "Z:\\smoke-does-not-exist",
-  ));
-  check(
-    "open_path reports a refusal instead of succeeding",
-    refused.is_err(),
   );
 
   // ── teardown ────────────────────────────────────────────────────────────────
