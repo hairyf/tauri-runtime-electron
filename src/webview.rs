@@ -1076,6 +1076,19 @@ fn build_and_attach_webview<T: UserEvent>(
             .expect("a 500 response with no headers is always valid")
         })
       });
+    // Two steps, and both are required. `protocol.register` installs the handler in
+    // the Electron main process, which is what makes the scheme *served*; the
+    // startup `--tauri-schemes` list only makes it *privileged*, so a scheme that is
+    // privileged but unregistered falls through to the network stack and the
+    // navigation fails with `ERR_FAILED`. `register_protocol` then gives the runtime
+    // the handler that answers the `protocol.request` the main process sends.
+    if let Err(error) = context.ipc.call(
+      "protocol.register",
+      serde_json::json!({ "scheme": scheme }),
+      IPC_TIMEOUT,
+    ) {
+      log::warn!("[electron] registering the {scheme} scheme failed: {error}");
+    }
     context.register_protocol(scheme, handler);
   }
 

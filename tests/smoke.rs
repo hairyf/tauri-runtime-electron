@@ -101,20 +101,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     .block_on(future)
 }
 
-/// Percent-encodes a document for a `data:` URL.
-fn encode(document: &str) -> String {
-  let mut encoded = String::with_capacity(document.len() * 3);
-  for byte in document.bytes() {
-    match byte {
-      b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-        encoded.push(byte as char)
-      }
-      _ => encoded.push_str(&format!("%{byte:02X}")),
-    }
-  }
-  encoded
-}
-
 /// Prints the runtime's own diagnostics to stderr.
 ///
 /// Without a logger every `log::warn!` in the crate is dropped, which turns a
@@ -152,7 +138,7 @@ fn main() {
 
   let mut runtime = <ElectronRuntime<()> as Runtime<()>>::new(RuntimeInitArgs {
     identifier: "tauri-runtime-electron-smoke".into(),
-    custom_schemes: Vec::new(),
+    custom_schemes: vec!["smoke".into()],
     #[cfg(windows)]
     msg_hook: None,
     #[cfg(any(
@@ -207,13 +193,33 @@ fn main() {
   );
 
   // ── window + webview creation ───────────────────────────────────────────────
-  let url = format!("data:text/html;charset=utf-8,{}", encode(PAGE));
-  let webview_attributes = WebviewAttributes::new(tauri_utils::config::WebviewUrl::External(
-    url.parse().expect("the data URL parses"),
+  // The page is served from a custom scheme, which is what Tauri does for
+  // `tauri://localhost/index.html`. A scheme that is privileged but never
+  // registered with the main process falls through to the network stack and the
+  // navigation fails with `ERR_FAILED`, so this is the case worth guarding.
+  let webview_attributes = WebviewAttributes::new(tauri_utils::config::WebviewUrl::CustomProtocol(
+    "smoke://localhost/index.html"
+      .parse()
+      .expect("the custom-protocol URL parses"),
   ));
-  let pending_webview =
+  let mut pending_webview =
     PendingWebview::<(), ElectronRuntime<()>>::new(webview_attributes, Default::default(), "smoke")
       .expect("the webview label is valid");
+  pending_webview.register_uri_scheme_protocol("smoke", |_webview_id, request, responder| {
+    let path = request.uri().path();
+    let (status, body) = if path == "/index.html" {
+      (200, PAGE.to_owned())
+    } else {
+      (404, "<h1>not found</h1>".to_owned())
+    };
+    responder(
+      http::Response::builder()
+        .status(status)
+        .header("Content-Type", "text/html")
+        .body(std::borrow::Cow::Owned(body.into_bytes()))
+        .expect("a response with a status and a body is always valid"),
+    );
+  });
 
   let builder = WindowBuilderWrapper::new()
     .title("smoke window")
@@ -445,7 +451,7 @@ fn main() {
   let current_url = webview.url().expect("webview.url");
   check(
     "webview.url reports the document it loaded",
-    current_url.starts_with("data:text/html"),
+    current_url.starts_with("smoke://localhost/index.html"),
   );
 
   let bounds = webview.bounds().expect("webview.bounds");
