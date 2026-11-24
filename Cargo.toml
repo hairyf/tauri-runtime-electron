@@ -19,7 +19,7 @@ devtools = ["tauri-runtime/devtools", "tauri/devtools"]
 unstable = ["tauri/unstable"]
 
 [build-dependencies]
-electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "f9164d989c49d831a7562571db581dc782dd87db" }
+electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "adb0fef6027b347b25e0fd0ca959cba1797ae930" }
 json-patch = { version = "4", default-features = false }
 serde_json = "1"
 tauri-utils = { version = "~3.0.0-alpha.4", features = ["config-json5", "config-toml"] }
@@ -28,7 +28,7 @@ tauri-utils = { version = "~3.0.0-alpha.4", features = ["config-json5", "config-
 tauri = { version = "3.0.0-alpha.6", default-features = false }
 tauri-runtime = "3.0.0-alpha.5"
 tauri-utils = { version = "~3.0.0-alpha.4", features = ["resources"] }
-electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "f9164d989c49d831a7562571db581dc782dd87db" }
+electron-rs = { git = "https://github.com/hairyf/electron-rs.git", rev = "adb0fef6027b347b25e0fd0ca959cba1797ae930" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process", "io-util"] }
 log = "0.4"
 http = "1"
@@ -49,9 +49,15 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSRunningApplication", "NSEvent", "NSResponder", "NSMenu", "NSMenuItem", "NSCell"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSString", "NSRunLoop", "NSArray", "NSEnumerator", "NSObject", "NSLocale"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-gtk = "0.18"
+[dev-dependencies]
+# The smoke test installs a stderr logger so the runtime's own warnings are
+# visible; without one every `log::warn!` in the crate is dropped.
+log = { version = "0.4", features = ["std"] }
 
 [[test]]
 name = "macos-application-bootstrap"
+harness = false
+
+[[test]]
+name = "smoke"
 harness = false

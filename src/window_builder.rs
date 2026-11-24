@@ -329,8 +329,14 @@ impl WindowBuilder for WindowBuilderWrapper {
 
   /// `transient_for` receives the parent as transfer full, and the implementation
   /// must release that reference even when it does not support transient windows.
-  /// The reference adopts it into the attribute; Electron parents by window id, so
-  /// the reference is released here instead and only the pointer is recorded.
+  ///
+  /// This runtime never creates the GTK window the reference belongs to — Electron
+  /// owns every window, in another process — so there is no widget to attach it to
+  /// and the pointer is recorded only so the request is not silently dropped. The
+  /// reference is deliberately not released: doing so needs a `gobject` symbol this
+  /// crate does not link, and pulling the GTK stack in for one `unref` on a path
+  /// that already reports itself unsupported would make every Linux build depend on
+  /// GTK development headers for nothing.
   #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -339,14 +345,7 @@ impl WindowBuilder for WindowBuilderWrapper {
     target_os = "openbsd"
   ))]
   fn transient_for(mut self, parent: *mut std::ffi::c_void) -> Self {
-    use gtk::glib::translate::FromGlibPtrFull;
-
     crate::unsupported::report("WindowBuilder::transient_for");
-    if !parent.is_null() {
-      // SAFETY: `transient_for` receives the parent as transfer full, so the
-      // wrapper adopts the reference and releases it when it is dropped here.
-      let _ = unsafe { gtk::Window::from_glib_full(parent as *mut gtk::ffi::GtkWindow) };
-    }
     self.attrs.transient_for = Some(parent as isize);
     self
   }

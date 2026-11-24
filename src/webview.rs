@@ -1021,9 +1021,14 @@ fn build_and_attach_webview<T: UserEvent>(
     web_resource_request_handler,
     on_web_content_process_terminate_handler,
     ipc_handler,
-    url,
     ..
   } = pending;
+
+  // `PendingWebview::new` hardcodes its `url` field to `tauri://localhost`; the
+  // document the application asked for lives in the attributes. Resolving from
+  // there is what makes `WebviewUrl::External` and `WebviewUrl::App` mean what
+  // they say, and it is what the reference does.
+  let url = resolve_webview_url(&webview_attributes.url);
 
   let bounds_rate = compute_child_bounds_rate(
     webview_attributes.bounds.as_ref(),
@@ -1201,6 +1206,30 @@ fn build_and_attach_webview<T: UserEvent>(
   });
   layout_app_window(context, window_id);
   Ok(())
+}
+
+/// The URL a [`WebviewUrl`](tauri_utils::config::WebviewUrl) asks to load.
+///
+/// `App` paths live under the runtime's own custom scheme, which is
+/// `tauri://localhost` here — the same form the reference uses, and the one
+/// `convertFileSrc` and the IPC origin check expect.
+fn resolve_webview_url(url: &tauri_utils::config::WebviewUrl) -> String {
+  match url {
+    tauri_utils::config::WebviewUrl::External(url) => url.to_string(),
+    tauri_utils::config::WebviewUrl::CustomProtocol(url) => url.to_string(),
+    tauri_utils::config::WebviewUrl::App(path) => {
+      let path = path.to_string_lossy().replace('\\', "/");
+      let path = path.trim_start_matches('/');
+      if path.is_empty() {
+        "tauri://localhost".to_string()
+      } else {
+        format!("tauri://localhost/{path}")
+      }
+    }
+    // `WebviewUrl` is `#[non_exhaustive]`: a variant this build does not know
+    // about cannot be resolved, and the app root is the honest fallback.
+    _ => "tauri://localhost".to_string(),
+  }
 }
 
 /// Reports the per-webview configuration this runtime cannot honour.

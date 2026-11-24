@@ -58,6 +58,50 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --check
 
+  # Launches a real Electron process and asserts every setter through its getter.
+  # The unit tests mock the RPC boundary; this job is what proves the bridge.
+  smoke:
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and Electron
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.cache/electron
+            ~/AppData/Local/electron/Cache
+          key: ${{ matrix.os }}-smoke-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-smoke-cargo-
+
+      # Electron needs a display server and its own runtime libraries.
+      - name: Linux window libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libgbm1 libxcomposite1 libxdamage1 libxrandr2 \
+            libpango-1.0-0 libcairo2 libgtk-3-0 libasound2t64
+
+      - name: Smoke test (Windows, macOS)
+        if: runner.os != 'Linux'
+        run: cargo test --test smoke -- --nocapture
+
+      - name: Smoke test (Linux, headless)
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum cargo test --test smoke -- --nocapture
+
   # The reference crate is the contract: every file, every export and every
   # `tauri-runtime` trait member has to line up. This is the check that stops the
   # two crates drifting apart again.

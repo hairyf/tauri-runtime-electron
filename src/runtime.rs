@@ -891,6 +891,14 @@ impl Electron {
     if let Some(binary) = &self.binary {
       return binary.clone();
     }
+    // The build script prepared a distribution for this build and reported it here,
+    // which is the copy `cargo run` and `cargo test` must use.
+    if let Some(staged) = option_env!("ELECTRON_RS_STAGED_BINARY") {
+      let staged = PathBuf::from(staged);
+      if staged.is_file() {
+        return staged;
+      }
+    }
     if let Ok(binary) = electron_rs::electron_binary!(None::<&Path>) {
       return binary;
     }
@@ -1038,13 +1046,38 @@ impl<T: UserEvent> RuntimeContext<T> {
     rx.recv().map_err(|_| Error::FailedToReceiveMessage)
   }
 
+  /// Delivers `message` to the run loop, or runs it here when already on the
+  /// runtime's own thread.
+  ///
+  /// The reference gets this from winit: its event loop runs on the main thread, so
+  /// a getter called from the main thread is answered by the loop that is already
+  /// pumping. This runtime's loop is a drain the application drives, so a getter
+  /// called from the main thread would queue a message that only that same thread
+  /// could process, and block forever waiting for it. Window and webview messages
+  /// therefore run inline on the main thread; everything else keeps queueing, so
+  /// events still arrive in order through `run_iteration`.
   pub(crate) fn send_message(&self, message: Message<T>) -> Result<()> {
-    // Tasks run inline on the main thread; everything else goes to the loop.
-    if std::thread::current().id() == self.main_thread_id
-      && let Message::Task(task) = message
-    {
-      task();
-      return Ok(());
+    if std::thread::current().id() == self.main_thread_id {
+      match message {
+        Message::Task(task) => {
+          task();
+          return Ok(());
+        }
+        Message::Window(id, message) => {
+          crate::window::handle_window_message(self, id, message);
+          return Ok(());
+        }
+        Message::Webview(id, message) => {
+          crate::webview::handle_webview_message(self, id, message);
+          return Ok(());
+        }
+        message => {
+          return self
+            .run_tx
+            .send(message)
+            .map_err(|_| Error::FailedToSendMessage);
+        }
+      }
     }
     self
       .run_tx
@@ -1517,6 +1550,8 @@ pub struct ElectronRuntime<T: UserEvent = tauri::EventLoopMessage> {
   is_running: Arc<AtomicBool>,
   pub(crate) context: RuntimeContext<T>,
   run_rx: Receiver<Message<T>>,
+  /// Whether `RunEvent::Ready` has been delivered.
+  ready_sent: bool,
 }
 
 impl<T: UserEvent> fmt::Debug for ElectronRuntime<T> {
@@ -1554,6 +1589,7 @@ impl<T: UserEvent> ElectronRuntime<T> {
       is_running,
       context,
       run_rx,
+      ready_sent: false,
     }
   }
 
@@ -1785,6 +1821,15 @@ impl<T: UserEvent> ElectronRuntime<T> {
   fn pump<F: FnMut(RunEvent<T>)>(&mut self, callback: &mut F, block: bool) -> bool {
     let mut delivered = false;
 
+    // `Ready` is delivered once, on the first pump, whether the application drives
+    // the loop with `run` or with `run_iteration` — Tauri's setup code waits for it
+    // either way.
+    if !self.ready_sent {
+      self.ready_sent = true;
+      callback(RunEvent::Ready);
+      delivered = true;
+    }
+
     if block {
       // Wait for at least one message so `run_iteration` never spins.
       match self.run_rx.recv_timeout(Duration::from_millis(1)) {
@@ -1870,7 +1915,6 @@ impl<T: UserEvent> ElectronRuntime<T> {
   /// Runs the loop until Electron disconnects or the application exits.
   fn run_loop<F: FnMut(RunEvent<T>)>(&mut self, mut callback: F) {
     self.is_running.store(true, Ordering::Relaxed);
-    callback(RunEvent::Ready);
     loop {
       if !self.pump(&mut callback, true) {
         break;

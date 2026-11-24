@@ -1321,13 +1321,15 @@ pub(crate) fn handle_window_message<T: UserEvent>(
       }
     }
     WindowMessage::SetAlwaysOnTop(value) => {
-      let _ = window_call(
+      if let Err(error) = window_call(
         context,
         id,
         "window.alwaysOnTop",
         json!({ "alwaysOnTop": value }),
         IPC_TIMEOUT,
-      );
+      ) {
+        log::warn!("[electron] set_always_on_top({value}) failed: {error}");
+      }
     }
     WindowMessage::SetVisibleOnAllWorkspaces(value) => {
       #[cfg(any(
