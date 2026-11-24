@@ -41,7 +41,6 @@ pub(crate) fn on_title_changed<T: UserEvent>(_context: &RuntimeContext<T>, param
   let Some(title) = params["title"].as_str() else {
     return;
   };
-
   client::with_client::<T, _>(webview_id, |client| {
     if let Some(handler) = &client.handlers.document_title_changed_handler {
       (*handler)(title.to_owned());

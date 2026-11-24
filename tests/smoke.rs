@@ -205,6 +205,10 @@ fn main() {
   let mut pending_webview =
     PendingWebview::<(), ElectronRuntime<()>>::new(webview_attributes, Default::default(), "smoke")
       .expect("the webview label is valid");
+  // `PendingWebview::new` starts at `tauri://localhost`; `tauri` overwrites this
+  // field with the resolved document before handing the webview over, and the
+  // runtime loads whatever is here.
+  pending_webview.url = "smoke://localhost/index.html".to_owned();
   pending_webview.register_uri_scheme_protocol("smoke", |_webview_id, request, responder| {
     let path = request.uri().path();
     let (status, body) = if path == "/index.html" {
