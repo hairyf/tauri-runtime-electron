@@ -1858,32 +1858,30 @@ impl<T: UserEvent> ElectronRuntime<T> {
   }
 
   /// Drains Electron's event stream and Tauri's message queue once.
-  fn pump<F: FnMut(RunEvent<T>)>(&mut self, callback: &mut F, block: bool) -> bool {
-    let mut delivered = false;
-
+  /// One turn of the loop: deliver `Ready` once, drain the runtime's own messages and
+  /// then the Electron event stream, and report whether the loop should keep going.
+  ///
+  /// The turn waits up to a millisecond for its first message, which is what makes
+  /// `run_iteration` one turn rather than a spin. A quiet turn is not a reason to
+  /// stop — only a closed bridge is — so the answer is `false` for exactly the cases
+  /// that end the application.
+  fn pump<F: FnMut(RunEvent<T>)>(&mut self, callback: &mut F) -> bool {
     // `Ready` is delivered once, on the first pump, whether the application drives
     // the loop with `run` or with `run_iteration` — Tauri's setup code waits for it
     // either way.
     if !self.ready_sent {
       self.ready_sent = true;
       callback(RunEvent::Ready);
-      delivered = true;
     }
 
-    if block {
-      // Wait for at least one message so `run_iteration` never spins.
-      match self.run_rx.recv_timeout(Duration::from_millis(1)) {
-        Ok(message) => {
-          self.handle_message(message, callback);
-          delivered = true;
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Err(mpsc::RecvTimeoutError::Disconnected) => return false,
-      }
+    // Wait for at least one message so `run_iteration` never spins.
+    match self.run_rx.recv_timeout(Duration::from_millis(1)) {
+      Ok(message) => self.handle_message(message, callback),
+      Err(mpsc::RecvTimeoutError::Timeout) => {}
+      Err(mpsc::RecvTimeoutError::Disconnected) => return false,
     }
     while let Ok(message) = self.run_rx.try_recv() {
       self.handle_message(message, callback);
-      delivered = true;
     }
 
     // Electron events first, so a window that closed is gone before Tauri asks
@@ -1901,12 +1899,11 @@ impl<T: UserEvent> ElectronRuntime<T> {
       batch
     };
     for event in events {
-      delivered = true;
       if !self.handle_electron_event(event, callback) {
         return false;
       }
     }
-    delivered
+    true
   }
 
   /// Turns one Electron event into Tauri events. Returns `false` to stop the loop.
@@ -1955,14 +1952,7 @@ impl<T: UserEvent> ElectronRuntime<T> {
   /// Runs the loop until Electron disconnects or the application exits.
   fn run_loop<F: FnMut(RunEvent<T>)>(&mut self, mut callback: F) {
     self.is_running.store(true, Ordering::Relaxed);
-    loop {
-      if !self.pump(&mut callback, true) {
-        break;
-      }
-      if !self.is_running.load(Ordering::Relaxed) {
-        break;
-      }
-    }
+    while self.pump(&mut callback) && self.is_running.load(Ordering::Relaxed) {}
     self.is_running.store(false, Ordering::Relaxed);
   }
 }
@@ -2159,7 +2149,7 @@ impl<T: UserEvent> Runtime<T> for ElectronRuntime<T> {
   ))]
   fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, mut callback: F) {
     self.is_running.store(true, Ordering::Relaxed);
-    self.pump(&mut callback, true);
+    self.pump(&mut callback);
     self.is_running.store(false, Ordering::Relaxed);
   }
 
