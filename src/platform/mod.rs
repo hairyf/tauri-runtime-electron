@@ -78,11 +78,14 @@ impl NativeWindow {
   /// Returns `None` when the handle is not one of the window systems this crate
   /// can name, which is the same set `raw-window-handle` gives the reference.
   pub fn from_raw_handle(handle: RawWindowHandle) -> Option<Self> {
+    // `u64::from` where the source is already an integer: `c_ulong` is 64-bit on a
+    // 64-bit Linux and 32-bit elsewhere, and `as u64` would be a no-op cast on one
+    // of them.
     let handle = match handle {
       RawWindowHandle::Win32(handle) => handle.hwnd.get() as u64,
       RawWindowHandle::AppKit(handle) => handle.ns_view.as_ptr() as u64,
-      RawWindowHandle::Xlib(handle) => handle.window as u64,
-      RawWindowHandle::Xcb(handle) => handle.window.get() as u64,
+      RawWindowHandle::Xlib(handle) => u64::from(handle.window),
+      RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
       RawWindowHandle::Wayland(handle) => handle.surface.as_ptr() as u64,
       _ => return None,
     };
