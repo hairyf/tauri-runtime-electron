@@ -1008,7 +1008,7 @@ pub(crate) struct RuntimeContext<T: UserEvent> {
   pub(crate) events: Arc<Mutex<Receiver<electron_rs::Event>>>,
   /// Custom protocols registered by Tauri, served through Electron's
   /// `protocol.handle`.
-  pub(crate) protocol_handlers: Arc<Mutex<HashMap<String, request_handler::SchemeHandler>>>,
+  pub(crate) protocol_handlers: Arc<Mutex<HashMap<String, request_handler::RegisteredProtocol>>>,
   /// Page origin per webview label, injected as the `Origin` header on
   /// custom-protocol requests.
   pub(crate) webview_origins: Arc<Mutex<HashMap<String, String>>>,
@@ -1224,16 +1224,24 @@ impl<T: UserEvent> RuntimeContext<T> {
   }
 
   /// Registers a custom protocol handler.
-  pub(crate) fn register_protocol(&self, scheme: String, handler: request_handler::SchemeHandler) {
+  pub(crate) fn register_protocol(
+    &self,
+    scheme: String,
+    label: String,
+    handler: request_handler::SchemeHandler,
+  ) {
     self
       .protocol_handlers
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .insert(scheme, handler);
+      .insert(
+        scheme,
+        request_handler::RegisteredProtocol { label, handler },
+      );
   }
 
   /// The handler registered for `scheme`.
-  pub(crate) fn protocol(&self, scheme: &str) -> Option<request_handler::SchemeHandler> {
+  pub(crate) fn protocol(&self, scheme: &str) -> Option<request_handler::RegisteredProtocol> {
     self
       .protocol_handlers
       .lock()

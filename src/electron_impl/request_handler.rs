@@ -60,6 +60,16 @@ use tauri_runtime::{UserEvent, webview::WebContentProcessTerminationReason};
 
 use crate::runtime::{IPC_TIMEOUT, Message, RuntimeContext};
 
+/// A scheme's handler and the webview that registered it.
+///
+/// The label is the answer for a request that cannot name its own webview, which is every
+/// session-level one.
+#[derive(Clone)]
+pub(crate) struct RegisteredProtocol {
+  pub(crate) label: String,
+  pub(crate) handler: SchemeHandler,
+}
+
 /// The application's handler for one custom scheme.
 ///
 /// The reference's `UriSchemeProtocolHandler` takes a responder so it can answer later, and so
@@ -104,17 +114,21 @@ pub(crate) fn on_protocol_request<T: UserEvent>(context: &RuntimeContext<T>, par
   };
   let scheme = params["scheme"].as_str().unwrap_or_default();
 
-  let Some(handler) = context.protocol(scheme) else {
+  let Some(registered) = context.protocol(scheme) else {
     log::debug!("no protocol handler is registered for the `{scheme}` scheme");
     respond(&context.ipc, id, not_found(scheme));
     return;
   };
+  let handler = &registered.handler;
 
-  // The label the handler is called with belongs to the webview that asked, which in a
-  // multi-window application is not the one that registered the scheme.
+  // The label the handler is called with belongs to the webview that asked. A request that
+  // carries its identity (the authenticated IPC fetch) is answered for that webview; the
+  // session-level ones — every navigation and subresource — carry none, because Electron's
+  // `protocol.handle` has no sender to name, so they fall back to the webview that registered
+  // the scheme.
   let label = crate::electron_impl::client::webview_id(params)
     .and_then(|webview_id| crate::webview::with_app_webview(webview_id, |w| w.label.clone()))
-    .unwrap_or_default();
+    .unwrap_or_else(|| registered.label.clone());
 
   let uri = params["uri"].as_str().unwrap_or_default();
   let method = http::Method::from_bytes(params["method"].as_str().unwrap_or_default().as_bytes())

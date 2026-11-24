@@ -1073,7 +1073,7 @@ fn build_and_attach_webview<T: UserEvent>(
     ) {
       log::warn!("[electron] registering the {scheme} scheme failed: {error}");
     }
-    context.register_protocol(scheme, Arc::from(handler));
+    context.register_protocol(scheme, label.clone(), Arc::from(handler));
   }
 
   let frame_navigation_state = crate::FrameNavigationState::new();
