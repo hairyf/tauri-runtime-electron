@@ -48,8 +48,12 @@ jobs:
       - name: Check
         run: cargo check --all-targets
 
+      # The smoke test needs a display server, so it runs in its own job; this one
+      # covers the unit tests and the doctests.
       - name: Test
-        run: cargo test
+        run: |
+          cargo test --lib
+          cargo test --doc
 
       - name: Clippy
         run: cargo clippy --all-targets
