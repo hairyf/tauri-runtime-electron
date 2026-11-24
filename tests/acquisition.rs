@@ -81,6 +81,35 @@ fn node_preserves_raw_output_and_nonzero_exit() {
 }
 
 #[test]
+fn staged_electron_reports_the_heap_limit_it_enforces() {
+  let electron = Electron::new().binary(env!("ELECTRON_RS_STAGED_BINARY"));
+  let (honoured, clamped) = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .build()
+    .expect("heap limit runtime")
+    .block_on(async {
+      tokio::time::timeout(Duration::from_secs(30), async {
+        (
+          electron.heap_size_limit(1024).await.expect("measure 1024 MiB"),
+          electron.heap_size_limit(32768).await.expect("measure 32768 MiB"),
+        )
+      })
+      .await
+      .expect("heap limit probe timed out")
+    });
+  println!("staged Electron: {honoured}; {clamped}");
+  // V8 adds its young generation on top of the old space the switch names, so an
+  // honoured request reports more than it asked for: the number comes from V8,
+  // not from the request echoed back.
+  assert!(honoured.limit_mib() > 1024, "{honoured}");
+  assert!(!honoured.is_clamped(), "{honoured}");
+  // The bundled distribution is built with V8's pointer-compression cage, which is
+  // why the probe exists: a request above it is clamped instead of honoured.
+  assert!(clamped.is_clamped(), "{clamped}");
+  assert!(clamped.limit_bytes() >= honoured.limit_bytes(), "{honoured}; {clamped}");
+}
+
+#[test]
 fn node_streams_before_exit_and_supports_native_kill() {
   tokio::runtime::Builder::new_current_thread()
     .enable_all()

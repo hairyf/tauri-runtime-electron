@@ -792,8 +792,13 @@ impl<T: UserEvent> WindowDispatch<T> for ElectronWindowDispatcher {
   }
 
   fn set_badge_count(&self, count: Option<i64>, _desktop_filename: Option<String>) -> Result<()> {
-    let count = u32::try_from(count.unwrap_or(0).max(0))
-      .map_err(|_| create_window_err("badge count must fit an unsigned 32-bit integer".into()))?;
+    // An absent count clears the badge, which the RPC spells as no count at all.
+    let count = count
+      .map(|count| {
+        u32::try_from(count.max(0))
+          .map_err(|_| create_window_err("badge count must fit an unsigned 32-bit integer".into()))
+      })
+      .transpose()?;
     self.rpc_call(rpc::WindowBadgeCount { count })
   }
 

@@ -128,6 +128,7 @@ fn main() {
 - `node` spawns immediately — no `.await`, no `spawn_blocking` — and forwards CLI args; `-e` scripts read `process.argv.slice(1)`, files `slice(2)`. Use the native `Child` to read, wait, or kill.
 - `run` takes only the script and returns an awaitable `Command` with `.on_output(...)`, `.timeout(...)`, and `.max_output_bytes(...)` (16 MiB default). It is not an `electron(args)` launcher and exposes no generic renderer endpoint; wrap async work in `(async()=>{...})()`.
 - `Electron::node(args)` resolves the binary and spawns immediately; `Electron::electron(args)` stays synchronous. Neither starts an RPC bridge.
+- `Electron::heap_size_limit(mib).await` runs the resolved binary in Node mode once and reports the V8 heap limit it really enforces, as a `HeapSizeLimit` with `limit_bytes`, `limit_mib` and `is_clamped`. The bundled distribution is built with V8's pointer-compression cage, so a `--max-old-space-size` above it is clamped instead of honoured; probe the largest value you offer rather than promising one the runtime cannot give.
 
 ## Limits
 

@@ -1112,6 +1112,18 @@ impl Electron {
     Ok(electron_rs::electron(self.resolve_binary().map_err(std::io::Error::other)?))
   }
 
+  /// The V8 heap limit the runtime really enforces for `--max-old-space-size=<mib>`.
+  ///
+  /// The bundled runtime is built with V8's pointer-compression cage, so a
+  /// request above it is clamped without an error and without telling the
+  /// caller. This runs the resolved binary in Node mode once and reports what
+  /// V8 says it got, so a caller that offers a memory limit can offer one the
+  /// runtime can honour.
+  pub async fn heap_size_limit(&self, mib: u64) -> std::io::Result<crate::HeapSizeLimit> {
+    let binary = self.resolve_binary().map_err(std::io::Error::other)?;
+    crate::heap::measure(&binary, mib).await
+  }
+
   /// Appended to the Electron command line (after the main script).
   pub fn arg(mut self, arg: impl Into<String>) -> Self {
     self.args.push(arg.into());
