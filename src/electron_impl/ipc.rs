@@ -210,6 +210,12 @@ impl Ipc {
       })
   }
 
+  /// The client this bridge drives, for the Electron-specific work the Tauri API
+  /// does not wrap.
+  pub(crate) fn client(&self) -> Arc<Electron> {
+    Arc::clone(&self.electron)
+  }
+
   /// Closes the socket and terminates the Electron process.
   pub(crate) fn shutdown(&self) {
     self.electron.shutdown();

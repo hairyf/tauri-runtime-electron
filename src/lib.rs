@@ -52,6 +52,17 @@ mod window;
 mod window_builder;
 mod window_handle;
 
+// The Electron-specific layer. Everything above mirrors `tauri-runtime-cef`; this
+// is what the mirror cannot express, and it is additive — an application that only
+// uses the Tauri API never touches it.
+/// The running Electron client, for the work the CEF runtime has no equivalent of.
+mod command_bridge;
+/// Opening a URL or path through the Electron main process.
+mod shell_open;
+pub use command_bridge::{ElectronClient, current_client, init};
+pub use electron_rs::{Command, CommandChunk, OutputStream};
+pub use shell_open::{open_external, open_path};
+
 /// Marks the application entry point so Electron helper processes are handled.
 pub use macros::electron_entry_point;
 #[cfg(target_os = "macos")]

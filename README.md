@@ -68,6 +68,48 @@ Electron::default().custom_scheme("stream")
 `convertFileSrc` uses registered `http://<scheme>.localhost` aliases, because
 Chromium needs an HTTP-family URL to report the length of partial media responses.
 
+## Beyond the Tauri API
+
+The mirror covers everything `tauri-runtime-cef` exposes. Electron can do more, and
+that part is additive — an application that only uses the Tauri API never touches it.
+
+### The Electron client
+
+`ElectronClient` is the `electron-rs` client the runtime is already driving, not a
+second process. Run a Node script on the Electron main thread, or call an RPC the
+Tauri API does not wrap.
+
+```rust
+#[tauri::command]
+async fn disk_usage(electron: tauri::State<'_, ElectronClient>) -> Result<String, String> {
+  let output = electron
+    .inner()
+    .clone()
+    .run("const fs = require('node:fs'); console.log(fs.statfs('/').bfree);")
+    .await
+    .map_err(|error| error.to_string())?;
+  Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+tauri::Builder::<ElectronRuntime>::new()
+  .plugin(tauri_runtime_electron::init())
+  .invoke_handler(tauri::generate_handler![disk_usage]);
+```
+
+`init()` registers only Rust managed state: no renderer commands, no Tauri
+permissions. `current_client()` reads the same client from a runtime task.
+
+### Screenshots and the shell
+
+```rust
+let png = tauri_runtime_electron::capture_webview(&webview)?;   // "data:image/png;base64,…"
+tauri_runtime_electron::open_external(&client, "https://tauri.app").await?;
+tauri_runtime_electron::open_path(&client, "/tmp/report.pdf").await?;
+```
+
+Both shell calls go through the Electron main process, so the activation belongs to
+the shell rather than to a child process that cannot raise a window on Windows.
+
 ### Bundling
 
 The build script prepares the Electron distribution under

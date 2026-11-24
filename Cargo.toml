@@ -53,6 +53,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 # The smoke test installs a stderr logger so the runtime's own warnings are
 # visible; without one every `log::warn!` in the crate is dropped.
 log = { version = "0.4", features = ["std"] }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [[test]]
 name = "macos-application-bootstrap"

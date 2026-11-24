@@ -16,6 +16,15 @@ can do everything CEF exposes, so it never needs a place to record what it canno
 do. This runtime does, and the module is the honest answer — `report(api)` logs
 `[electron] unsupported, ignored: <api>` once instead of returning a fake success.
 
+Two more files are the Electron-specific layer, which the mirror cannot express and
+which is purely additive — an application that only uses the Tauri API never
+touches them:
+
+| file | what it adds |
+| --- | --- |
+| `src/command_bridge.rs` | `ElectronClient`, the running `electron-rs` client: run a Node script, call an RPC the Tauri API does not wrap. `init()` registers it as managed state; `current_client()` reads it from a runtime task. |
+| `src/shell_open.rs` | `open_external` / `open_path`, handing a URL or path to the OS from the Electron main process so the activation belongs to the shell rather than to a child process. |
+
 ## Rename map
 
 Only CEF-specific identifiers change.
@@ -49,22 +58,29 @@ Unchanged: `EventProxy`, `NewWindowOpener`, `NativeWindowEventHandler`,
 `NativeDialogSnapshot`, `NativeDialogToken`, `DevToolsMessageIdExhausted`,
 `allocate_devtools_message_id`.
 
-## The 15 extra exports
+## The 26 extra exports
 
-The reference reaches these through `pub use cef;` or through CEF's type system.
-This crate has no `cef`, so each is a same-shaped replacement.
+Eleven replace a CEF type the reference reaches through `pub use cef;` or through
+CEF's own type system. The rest are the Electron-specific layer: things CEF needs no
+equivalent of, because it is linked into the process and this runtime is not.
 
-| export | replaces |
+| export | why |
 | --- | --- |
-| `runtime::ELECTRON_API_VERSION_LAST` | `cef::sys::CEF_API_VERSION_LAST` |
-| `runtime::ElectronSettings` | `cef::Settings` |
-| `runtime::LogSeverity`, `runtime::LogItems` | `cef::LogSeverity`, `cef::LogItems` |
-| `runtime::ContentSettingType`, `runtime::ContentSettingValue` | `cef::ContentSettingTypes`, `cef::ContentSettingValues` |
-| `webview::ElectronBrowserSettings` | `cef::BrowserSettings` |
-| `webview::ElectronWebviewHandle` | `cef::Browser` |
-| `offscreen::RenderHandler`, `offscreen::CursorType`, `offscreen::CursorInfo` | `cef::RenderHandler`, `cef::CursorType`, `cef::CursorInfo` |
+| `runtime::ELECTRON_API_VERSION_LAST` | replaces `cef::sys::CEF_API_VERSION_LAST` |
+| `runtime::ElectronSettings` | replaces `cef::Settings` |
+| `runtime::LogSeverity`, `runtime::LogItems` | replace `cef::LogSeverity`, `cef::LogItems` |
+| `runtime::ContentSettingType`, `runtime::ContentSettingValue` | replace `cef::ContentSettingTypes`, `cef::ContentSettingValues` |
+| `webview::ElectronBrowserSettings` | replaces `cef::BrowserSettings` |
+| `webview::ElectronWebviewHandle` | replaces `cef::Browser` |
+| `offscreen::RenderHandler`, `offscreen::CursorType`, `offscreen::CursorInfo` | replace `cef::RenderHandler`, `cef::CursorType`, `cef::CursorInfo` |
 | `runtime::binary`, `runtime::identifier`, `runtime::startup_timeout` | no counterpart: CEF is linked into the process, Electron is a separate distribution to find and launch |
+| `runtime::register_custom_protocol_scheme` | no counterpart: CEF takes its scheme list from `RuntimeInitArgs`, Electron needs the schemes before it starts |
+| `runtime::set_app_details` | no counterpart: CEF takes the name and identifier from the bundle |
 | `webview::web_contents_id` | no counterpart: names the guest's `webContents.id` |
+| `webview::capture_webview` | no counterpart: `webContents.capturePage` is the only way to read pixels back |
+| `command_bridge::{ElectronClient, current_client, init}` | no counterpart: the raw client, for work no `tauri-runtime` call can express |
+| `shell_open::{open_external, open_path}` | no counterpart: the OS handoff belongs to the Electron main process |
+| `electron_rs::{Command, CommandChunk, OutputStream}` | re-exported so an application can name what `ElectronClient::run` returns |
 
 `pub use cef;` becomes `pub use electron_rs;`, so an application can still name the
 engine's own types.

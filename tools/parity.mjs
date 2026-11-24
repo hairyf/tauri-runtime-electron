@@ -109,6 +109,14 @@ const ALLOWED_EXTRA_FILES = new Map([
     'unsupported.rs',
     'the reference can do everything CEF exposes; this runtime needs one place to record what Electron cannot',
   ],
+  [
+    'command_bridge.rs',
+    'the running Electron client, for the work no tauri-runtime call can express',
+  ],
+  [
+    'shell_open.rs',
+    'handing a URL or path to the OS from the Electron main process',
+  ],
 ])
 
 /** CEF interface traits. An `impl` of one of these has no Electron counterpart. */
