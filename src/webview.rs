@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 use std::any::Any;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::{
@@ -1057,26 +1056,10 @@ fn build_and_attach_webview<T: UserEvent>(
 
   // Custom protocols are served by the runtime's own registry: the main process
   // reports `protocol.request` and the runtime answers it, so a webview's handlers
-  // are registered once per scheme rather than per browser. The reference's handler
-  // takes a responder so it can answer later; the registry stores the synchronous
-  // shape, because the answer has to travel back over the socket as one
-  // `protocol.respond` call anyway.
+  // are registered once per scheme rather than per browser. The handler keeps the
+  // responder Tauri hands it, so an `async` command can answer after the run loop
+  // has turned.
   for (scheme, handler) in uri_scheme_protocols {
-    let label = label.clone();
-    let handler: crate::electron_impl::request_handler::SchemeHandler =
-      Arc::new(move |request: http::Request<Vec<u8>>| {
-        let (tx, rx) = mpsc::channel();
-        let responder = Box::new(move |response: http::Response<Cow<'static, [u8]>>| {
-          let _ = tx.send(response);
-        });
-        handler(&label, request, responder);
-        rx.recv().unwrap_or_else(|_| {
-          http::Response::builder()
-            .status(500)
-            .body(Cow::Owned(Vec::new()))
-            .expect("a 500 response with no headers is always valid")
-        })
-      });
     // Two steps, and both are required. `protocol.register` installs the handler in
     // the Electron main process, which is what makes the scheme *served*; the
     // startup `--tauri-schemes` list only makes it *privileged*, so a scheme that is
@@ -1090,7 +1073,7 @@ fn build_and_attach_webview<T: UserEvent>(
     ) {
       log::warn!("[electron] registering the {scheme} scheme failed: {error}");
     }
-    context.register_protocol(scheme, handler);
+    context.register_protocol(scheme, Arc::from(handler));
   }
 
   let frame_navigation_state = crate::FrameNavigationState::new();
@@ -1218,7 +1201,7 @@ fn build_and_attach_webview<T: UserEvent>(
     url: Arc::new(Mutex::new(initial_url)),
     handlers: Some(Arc::new(Mutex::new(handlers))),
   });
-  layout_app_window(context, window_id);
+  layout_app_window(context, window_id, parent_size);
   Ok(())
 }
 
@@ -2282,10 +2265,16 @@ impl<T: UserEvent> WebviewDispatch<T> for ElectronWebviewDispatcher<T> {
 /// Children with a bounds rate (auto-resize / window-filling) are recomputed
 /// from the current window size; children with fixed bounds keep whatever bounds
 /// they were last given.
-pub(crate) fn layout_app_window<T: UserEvent>(context: &RuntimeContext<T>, window_id: WindowId) {
-  let Some((parent_size, _)) = window_metrics(context, window_id) else {
-    return;
-  };
+///
+/// The reference reads the size from its own window record, which a resize has
+/// already updated by the time it lays out. This runtime is told the size by the
+/// event that triggered the layout, so it takes it as an argument instead of
+/// asking Electron again.
+pub(crate) fn layout_app_window<T: UserEvent>(
+  context: &RuntimeContext<T>,
+  window_id: WindowId,
+  parent_size: PhysicalSize<u32>,
+) {
   let win_w = parent_size.width as f32;
   let win_h = parent_size.height as f32;
   for webview_id in webview_ids_for_window(window_id) {

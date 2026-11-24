@@ -303,6 +303,22 @@ fn main() {
     inner.width >= 700 && inner.height >= 500,
   );
 
+  // The webview has to follow the window. Electron keeps a child view at the
+  // bounds it was given, so a runtime that only forwards the event leaves the page
+  // at its creation size and the rest of the window unpainted.
+  let resized = webview.bounds().expect("webview.bounds");
+  let resized = match resized.size {
+    Size::Physical(size) => (size.width, size.height),
+    Size::Logical(size) => (size.width as u32, size.height as u32),
+  };
+  check(
+    &format!(
+      "the webview follows the window resize ({}x{} for a {}x{} window)",
+      resized.0, resized.1, inner.width, inner.height
+    ),
+    resized.0.abs_diff(inner.width) <= 2 && resized.1.abs_diff(inner.height) <= 2,
+  );
+
   window
     .set_position(Position::Logical(LogicalPosition::new(150.0, 160.0)))
     .expect("set_position");

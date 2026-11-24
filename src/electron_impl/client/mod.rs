@@ -377,6 +377,17 @@ fn physical_size(bounds: &Value) -> Option<PhysicalSize<u32>> {
   ))
 }
 
+/// The size of the area a window's webviews are laid out into.
+///
+/// The bridge reports both rectangles: `bounds` is the window including its frame, `contentBounds`
+/// is what the frame leaves. Tauri's `Resized` is the surface size the reference reads from its
+/// own window record, so the content rectangle is the one that means the same thing — a decorated
+/// window that reported the outer size would lay its webviews out under the title bar and past the
+/// bottom edge.
+fn content_size(params: &Value) -> Option<PhysicalSize<u32>> {
+  physical_size(&params["contentBounds"]).or_else(|| physical_size(&params["bounds"]))
+}
+
 /// A physical-pixel position from a `bounds` payload.
 fn physical_position(bounds: &Value) -> Option<PhysicalPosition<i32>> {
   let x = bounds["x"].as_i64()?;
@@ -414,9 +425,10 @@ fn observe_scale_factor<T: UserEvent>(
   if previous.is_none_or(|previous| (previous - scale_factor).abs() < f64::EPSILON) {
     return;
   }
-  let Some(size) = physical_size(&params["bounds"]) else {
+  let Some(size) = content_size(params) else {
     return;
   };
+  crate::webview::layout_app_window(context, window_id, size);
   send_window_event(
     context,
     window_id,
@@ -441,7 +453,11 @@ fn on_window_event<T: UserEvent>(context: &RuntimeContext<T>, params: &Value) {
 
   match name {
     "resize" => {
-      if let Some(size) = physical_size(&params["bounds"]) {
+      if let Some(size) = content_size(params) {
+        // The children follow the window before the application hears about the
+        // resize, which is the order the reference uses: a handler that reads a
+        // webview's bounds must see the new ones.
+        crate::webview::layout_app_window(context, window_id, size);
         send_window_event(context, window_id, WindowEvent::Resized(size));
       }
     }

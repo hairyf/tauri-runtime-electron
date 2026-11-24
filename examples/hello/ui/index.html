@@ -12,9 +12,24 @@
       // the `ipc://` scheme answers.
       ;(async () => {
         const { invoke } = window.__TAURI_INTERNALS__
+        const race = (promise, ms) =>
+          Promise.race([
+            promise.then(
+              (value) => `ok ${JSON.stringify(value)}`,
+              (error) => `err ${error}`
+            ),
+            new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), ms))
+          ])
+        const plugin = await race(
+          invoke('plugin:window|is_maximized', { label: 'main' }),
+          3000
+        )
+        const maximized = await invoke('window_state')
         await invoke('loaded', {
           url: location.href,
-          heading: document.getElementById('heading').textContent
+          heading: document.getElementById('heading').textContent,
+          plugin,
+          maximized
         })
       })().catch((error) => {
         document.title = `failed: ${error}`

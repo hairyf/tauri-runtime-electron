@@ -59,7 +59,7 @@ fn main() {
   tauri::Builder::default()
     // Selecting the runtime: `Electron` is this crate's `RuntimeInitAttrs`.
     .runtime(runtime)
-    .invoke_handler(tauri::generate_handler![loaded])
+    .invoke_handler(tauri::generate_handler![loaded, window_state])
     .setup(|app| {
       // `WebviewUrl::default()` is `App("index.html")`, which is the document a
       // `tauri dev` app opens.
@@ -81,17 +81,33 @@ fn main() {
     .expect("the application runs");
 }
 
+/// A window API reached from inside a Tauri command.
+///
+/// This is the path every `@tauri-apps/api/window` call takes: the renderer's
+/// `ipc://` request becomes a command, the command asks the runtime, the runtime
+/// asks Electron and waits for the answer, and the answer has to travel back out
+/// as one `protocol.respond`. A runtime that blocks the run loop waiting for that
+/// answer deadlocks here, because an `async` command only answers once the loop
+/// turns.
+#[tauri::command]
+fn window_state(window: tauri::WebviewWindow) -> Result<bool, String> {
+  window.is_maximized().map_err(|error| error.to_string())
+}
+
 /// The page loaded and reached the IPC bridge.
 #[tauri::command]
-fn loaded(app: AppHandle, url: String, heading: String) {
+fn loaded(app: AppHandle, url: String, heading: String, plugin: String, maximized: bool) {
   println!("hello: url={url}");
   println!("hello: heading={heading:?}");
+  println!("hello: plugin:window|is_maximized => {plugin}");
+  println!("hello: window.is_maximized() => {maximized}");
 
   // `http://tauri.localhost/` is the whole point: it is what this runtime's
   // `custom_scheme_url` answers with, so the document came from `frontendDist`
   // and `tauri` recognises the page as local.
   let served = url.starts_with("http://tauri.localhost/");
   let rendered = heading == HEADING;
+  let answered = plugin.starts_with("ok ") && !maximized;
 
   if !served {
     eprintln!("hello: FAIL the document was not served over this runtime's scheme");
@@ -99,9 +115,12 @@ fn loaded(app: AppHandle, url: String, heading: String) {
   if !rendered {
     eprintln!("hello: FAIL the page did not render `{HEADING}`");
   }
-  if served && rendered {
+  if !answered {
+    eprintln!("hello: FAIL a window API did not answer");
+  }
+  if served && rendered && answered {
     println!("hello: passed");
   }
 
-  app.exit(if served && rendered { 0 } else { 1 });
+  app.exit(if served && rendered && answered { 0 } else { 1 });
 }

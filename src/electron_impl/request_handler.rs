@@ -62,12 +62,15 @@ use crate::runtime::{IPC_TIMEOUT, Message, RuntimeContext};
 
 /// The application's handler for one custom scheme.
 ///
-/// The reference's `UriSchemeProtocolHandler` takes a responder so it can answer
-/// asynchronously; the runtime stores this synchronous shape instead, because the answer has
-/// to travel back over the socket as one `protocol.respond` call anyway. A handler that needs
-/// to answer later does so from a thread of its own, holding the response until it is ready.
-pub(crate) type SchemeHandler =
-  Arc<dyn Fn(http::Request<Vec<u8>>) -> http::Response<Cow<'static, [u8]>> + Send + Sync>;
+/// The reference's `UriSchemeProtocolHandler` takes a responder so it can answer later, and so
+/// does this one. A handler that blocked until the responder fired would deadlock the run loop:
+/// an `async` Tauri command answers from the async runtime, and reaching a window API from it
+/// needs the run loop to turn — which a blocked loop cannot do.
+pub(crate) type SchemeHandler = Arc<
+  dyn Fn(&str, http::Request<Vec<u8>>, Box<dyn FnOnce(http::Response<Cow<'static, [u8]>>) + Send>)
+    + Send
+    + Sync,
+>;
 
 /// Runs a closure on the runtime's main thread.
 ///
@@ -91,10 +94,9 @@ pub(crate) fn main_thread_dispatcher<T: UserEvent>(
 
 /// The bridge is asking the application to serve a custom-scheme request.
 ///
-/// `protocol.request` is one of the methods the bridge answers *synchronously* — the blocked
-/// main thread processes `protocol.respond` re-entrantly — so the answer has to be sent from
-/// here, and a handler that never answers leaves the request hanging until the bridge's own
-/// timeout.
+/// The answer travels back as one `protocol.respond` call, which may be sent from any thread:
+/// an `async` command answers after the run loop has turned, so this function hands the
+/// responder to the handler and returns without waiting for it.
 pub(crate) fn on_protocol_request<T: UserEvent>(context: &RuntimeContext<T>, params: &Value) {
   let Some(id) = params["id"].as_u64() else {
     log::debug!("ignoring a `protocol.request` without an id");
@@ -104,9 +106,15 @@ pub(crate) fn on_protocol_request<T: UserEvent>(context: &RuntimeContext<T>, par
 
   let Some(handler) = context.protocol(scheme) else {
     log::debug!("no protocol handler is registered for the `{scheme}` scheme");
-    respond(context, id, not_found(scheme));
+    respond(&context.ipc, id, not_found(scheme));
     return;
   };
+
+  // The label the handler is called with belongs to the webview that asked, which in a
+  // multi-window application is not the one that registered the scheme.
+  let label = crate::electron_impl::client::webview_id(params)
+    .and_then(|webview_id| crate::webview::with_app_webview(webview_id, |w| w.label.clone()))
+    .unwrap_or_default();
 
   let uri = params["uri"].as_str().unwrap_or_default();
   let method = http::Method::from_bytes(params["method"].as_str().unwrap_or_default().as_bytes())
@@ -121,17 +129,21 @@ pub(crate) fn on_protocol_request<T: UserEvent>(context: &RuntimeContext<T>, par
     // The reference drops a URL `http::Request` refuses rather than answering it: there is
     // no request to hand the application.
     log::debug!("dropping a custom-scheme request whose URI `http::Request` refused: {uri:?}");
-    respond(context, id, not_found(scheme));
+    respond(&context.ipc, id, not_found(scheme));
     return;
   };
 
-  let response = (*handler)(request);
-  respond(context, id, response);
+  let ipc = Arc::clone(&context.ipc);
+  handler(
+    &label,
+    request,
+    Box::new(move |response| respond(&ipc, id, response)),
+  );
 }
 
 /// Answers a custom-scheme request.
-fn respond<T: UserEvent>(
-  context: &RuntimeContext<T>,
+fn respond(
+  ipc: &crate::electron_impl::ipc::Ipc,
   id: u64,
   response: http::Response<Cow<'static, [u8]>>,
 ) {
@@ -142,7 +154,7 @@ fn respond<T: UserEvent>(
     "headers": response_headers(&parts.headers),
     "body": base64::engine::general_purpose::STANDARD.encode(body.as_ref()),
   });
-  if let Err(error) = context.ipc.call("protocol.respond", payload, IPC_TIMEOUT) {
+  if let Err(error) = ipc.call("protocol.respond", payload, IPC_TIMEOUT) {
     log::warn!("failed to answer the custom-scheme request {id}: {error}");
   }
 }
@@ -264,13 +276,28 @@ mod tests {
   use crate::CertificateErrorPolicy;
 
   fn handler(status: u16, body: &'static str) -> SchemeHandler {
-    Arc::new(move |_request| {
-      http::Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "text/html")
-        .body(Cow::Borrowed(body.as_bytes()))
-        .unwrap()
+    Arc::new(move |_label, _request, respond| {
+      respond(
+        http::Response::builder()
+          .status(status)
+          .header(CONTENT_TYPE, "text/html")
+          .body(Cow::Borrowed(body.as_bytes()))
+          .unwrap(),
+      );
     })
+  }
+
+  /// Runs a handler and returns the response it answered with.
+  fn answer(handler: &SchemeHandler) -> http::Response<Cow<'static, [u8]>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    handler(
+      "main",
+      http::Request::new(Vec::new()),
+      Box::new(move |response| {
+        let _ = tx.send(response);
+      }),
+    );
+    rx.recv().expect("the handler answered")
   }
 
   #[test]
@@ -327,7 +354,7 @@ mod tests {
 
   #[test]
   fn a_handler_answer_carries_its_status_headers_and_body() {
-    let response = handler(201, "created")(http::Request::new(Vec::new()));
+    let response = answer(&handler(201, "created"));
     let (parts, body) = response.into_parts();
     assert_eq!(parts.status.as_u16(), 201);
     assert_eq!(
