@@ -28,8 +28,8 @@ pub async fn open_external(client: &crate::ElectronClient, url: &str) -> Result<
 /// Opens `path` with its registered application from the Electron main process.
 ///
 /// Electron answers with an empty string on success and a message when the
-/// platform refused the request, so a refusal travels as an error here rather
-/// than as a silent no-op.
+/// platform refused the request; the bridge reports the empty string as no
+/// message, so a refusal travels as an error here rather than as a silent no-op.
 pub async fn open_path(client: &crate::ElectronClient, path: &str) -> Result<(), String> {
     let message = client
         .call(rpc::AppOpenPath {
@@ -37,9 +37,8 @@ pub async fn open_path(client: &crate::ElectronClient, path: &str) -> Result<(),
         })
         .await
         .map_err(|error| format!("OPEN_PATH_FAILED: {error}"))?;
-    if message.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("OPEN_PATH_FAILED: {message}"))
+    match message {
+        None => Ok(()),
+        Some(message) => Err(format!("OPEN_PATH_FAILED: {message}")),
     }
 }
