@@ -77,15 +77,16 @@ impl NativeWindow {
   ///
   /// Returns `None` when the handle is not one of the window systems this crate
   /// can name, which is the same set `raw-window-handle` gives the reference.
+  // `c_ulong` is `u64` on a 64-bit Linux and `u32` on Windows and a 32-bit Linux,
+  // so one of the two integer casts below is always a no-op — clippy only ever
+  // sees one width, so it cannot know that.
+  #[allow(clippy::unnecessary_cast)]
   pub fn from_raw_handle(handle: RawWindowHandle) -> Option<Self> {
-    // `u64::from` where the source is already an integer: `c_ulong` is 64-bit on a
-    // 64-bit Linux and 32-bit elsewhere, and `as u64` would be a no-op cast on one
-    // of them.
     let handle = match handle {
       RawWindowHandle::Win32(handle) => handle.hwnd.get() as u64,
       RawWindowHandle::AppKit(handle) => handle.ns_view.as_ptr() as u64,
-      RawWindowHandle::Xlib(handle) => u64::from(handle.window),
-      RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
+      RawWindowHandle::Xlib(handle) => handle.window as u64,
+      RawWindowHandle::Xcb(handle) => handle.window.get() as u64,
       RawWindowHandle::Wayland(handle) => handle.surface.as_ptr() as u64,
       _ => return None,
     };

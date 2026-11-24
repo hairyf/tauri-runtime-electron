@@ -902,16 +902,21 @@ impl Electron {
     if let Ok(binary) = electron_rs::electron_binary!(None::<&Path>) {
       return binary;
     }
-    // A packaged app keeps the distribution beside its executable, or under
-    // `resources/`. The bundler copies it to `resources/electron`, which on macOS
-    // is `Contents/Resources/electron` — one level up from `Contents/MacOS`.
+    // A packaged app keeps the distribution beside its executable or under
+    // `resources/`. `bundle.resources` maps `target/electron` to `runtime`, so the
+    // layout is `resources/runtime/<platform>-<arch>/`, which `electron-rs` accepts
+    // as a resource root. On macOS `resources/` is `Contents/Resources`, one level up
+    // from `Contents/MacOS`.
     if let Ok(executable) = std::env::current_exe()
       && let Some(dir) = executable.parent()
     {
       for candidate in [
         dir.join("electron"),
+        dir.join("runtime"),
         dir.join("resources").join("electron"),
+        dir.join("resources").join("runtime"),
         dir.join("..").join("Resources").join("electron"),
+        dir.join("..").join("Resources").join("runtime"),
       ] {
         if let Ok(binary) = electron_rs::electron_binary(&candidate) {
           return binary;

@@ -25,8 +25,7 @@ application built against the CEF runtime compiles against this one.
 - Every window and webview API works through Electron, not a stub
 - Anything Electron cannot do reports `[electron] unsupported, ignored: <api>` once
   instead of returning a success it did not earn
-- No `tauri.conf.json` changes: the crate's build script prepares the Electron
-  distribution and the bundler ships it
+- One `bundle.resources` entry ships the runtime; the build script prepares it
 - Real smoke test: launches Electron and proves every setter through its getter
 
 ## Install
@@ -71,16 +70,26 @@ Chromium needs an HTTP-family URL to report the length of partial media response
 
 ### Bundling
 
-Nothing to configure. The build script reports the prepared distribution with
-`cargo:runtime=electron` and `cargo:electron_dir=…`, the same contract
-`tauri-runtime-cef` uses, and the bundler copies it to `resources/electron`.
+The build script prepares the Electron distribution under
+`target/electron/<platform>-<arch>` and the runtime finds it there, so `cargo run`
+needs no setup. A packaged app has to ship that directory — one entry in
+`tauri.conf.json`:
 
-The bundler support is a patch against Tauri v3, kept in
-[`docs/tauri-electron-runtime-bundling.patch`](docs/tauri-electron-runtime-bundling.patch):
-
-```bash
-git -C source/tauri am ../docs/tauri-electron-runtime-bundling.patch
+```json
+{
+  "bundle": {
+    "resources": { "target/electron": "runtime" }
+  }
+}
 ```
+
+The bundler copies it into the bundle's resource directory, which is where the
+runtime looks at launch. Nothing is duplicated: the bundle carries one copy of the
+distribution, the same 368 MB either way.
+
+The build script also emits `cargo:runtime=electron` and `cargo:electron_dir=…`,
+the contract `tauri-runtime-cef` uses for its framework, so a Tauri that learns to
+ship Electron payloads itself will pick this crate up without a config entry.
 
 ## Verifying
 
